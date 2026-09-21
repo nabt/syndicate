@@ -1,12 +1,26 @@
 #!/usr/bin/env bash
 # Stop hook (Claude Code and Codex): if the orchestrator delegated work to
 # specialist roles during this session but never invoked code-reviewer, block
-# the stop and say so. Reads delegations from whichever transcript format it
-# is given: Claude Code Agent/Task tool calls, or Codex spawn_agent calls.
+# the stop and say so. Reads delegations from either transcript format
+# (Claude Agent/Task calls, Codex spawn_agent calls).
+#
+# Acts only inside a syndicate project (a .syndicate/ directory at or above
+# the session's cwd) whose config doesn't set 'review-gate = off', so a single
+# global registration is safe.
 set -uo pipefail
 
 input="$(cat)"
 [[ "$(jq -r '.stop_hook_active // false' <<<"$input")" == "true" ]] && exit 0
+
+dir="$(jq -r '.cwd // empty' <<<"$input")"
+project=""
+while [[ -n "$dir" && "$dir" != "/" ]]; do
+  [[ -d "$dir/.syndicate" ]] && { project="$dir"; break; }
+  dir="$(dirname "$dir")"
+done
+[[ -n "$project" ]] || exit 0
+grep -qE '^[[:space:]]*review-gate[[:space:]]*=[[:space:]]*off' "$project/.syndicate/config" 2>/dev/null && exit 0
+
 transcript="$(jq -r '.transcript_path // empty' <<<"$input")"
 [[ -f "$transcript" ]] || exit 0
 

@@ -1,47 +1,431 @@
-#!/usr/bin/env bash
-# Run the orchestrator as the main-session agent so it can delegate to the
-# specialist roles installed in the target project.
-#   syndicate [-x claude|codex] [-C <project-dir>] [-p] "<task>" [extra CLI args...]
-# -p runs headless (prints the result and exits); otherwise interactive.
-# The runtime defaults to $SYNDICATE_RUNTIME, else claude.
-set -euo pipefail
+#!/usr/bin/env python3
+"""syndicate: run a team of role-based coding agents on Claude Code and/or Codex CLI.
 
-REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
-RUNTIME="${SYNDICATE_RUNTIME:-claude}"
-DIR="$(pwd)"
-HEADLESS=0
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -x|--runtime) RUNTIME="$2"; shift 2 ;;
-    -C|--dir) DIR="$2"; shift 2 ;;
-    -p|--print) HEADLESS=1; shift ;;
-    -h|--help) sed -n '2,6p' "$0"; exit 0 ;;
-    *) break ;;
-  esac
-done
+Global roles live in <repo>/roles. Each project can override them, and choose
+which CLI runs each role, from an untracked <project>/.syndicate/ directory.
+Nothing is written anywhere else in the project. See README.md and
+docs/configuration.md.
+"""
+from __future__ import annotations
 
-case "$RUNTIME" in
-  claude)
-    if [[ ! -f "$DIR/.claude/agents/orchestrator.md" && ! -f "$HOME/.claude/agents/orchestrator.md" ]]; then
-      echo "orchestrator not installed for $DIR — run install.sh first" >&2; exit 1
-    fi
-    cd "$DIR"
-    if [[ $HEADLESS -eq 1 ]]; then exec claude --agent orchestrator -p "$@"; fi
-    exec claude --agent orchestrator "$@"
-    ;;
-  codex)
-    command -v jq >/dev/null || { echo "jq is required for the codex runtime" >&2; exit 1; }
-    if ! compgen -G "$DIR/.codex/agents/*.toml" >/dev/null && ! compgen -G "$HOME/.codex/agents/*.toml" >/dev/null; then
-      echo "specialist agents not installed for $DIR — run install.sh --runtime codex first" >&2; exit 1
-    fi
-    # Codex has no --agent flag, so the orchestrator identity is injected as developer instructions.
-    body="$(awk 'c>=2{print} /^---$/{c++}' "$REPO_DIR/roles/orchestrator.md")"
-    body+=$'\n\nThe specialist roles named above are available as custom agents with those exact names; spawn them to delegate.'
-    instr="developer_instructions=$(jq -Rn --arg v "$body" '$v')"
-    if [[ $HEADLESS -eq 1 ]]; then
-      exec codex exec -C "$DIR" -s workspace-write -c "$instr" "$@"
-    fi
-    exec codex -C "$DIR" -c "$instr" "$@"
-    ;;
-  *) echo "Unknown runtime: $RUNTIME (use claude or codex)" >&2; exit 1 ;;
-esac
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve()
+HOME_DIR = SCRIPT.parent.parent
+GLOBAL_ROLES = HOME_DIR / "roles"
+GATE_SCRIPT = HOME_DIR / "hooks" / "require-review.sh"
+CLIS = ("claude", "codex")
+LOCAL = ".syndicate"
+ROLE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+RELAY_SANDBOX = "workspace-write"
+
+CONFIG_TEMPLATE = """\
+# Local-only syndicate team config for this project (git-ignored).
+# One 'key = value' per line; '#' starts a comment.
+#
+# default = claude        # CLI for every role not listed below: claude | codex
+# orchestrator = claude   # CLI that hosts the session; other roles are delegated to from it
+# code-reviewer = codex   # any role name: a global role or one defined in .syndicate/roles/
+# review-gate = on        # on (default) | off: block finishing until code-reviewer has reviewed
+"""
+
+
+class SyndicateError(Exception):
+    pass
+
+
+def jstr(text: str) -> str:
+    """JSON string literal, which is also a valid TOML basic string."""
+    return json.dumps(text, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def split_frontmatter(text: str) -> tuple[dict, str]:
+    m = re.match(r"---\n(.*?)\n---\n?(.*)", text, re.S)
+    if not m:
+        return {}, text
+    fm = {}
+    for line in m.group(1).splitlines():
+        key, sep, value = line.partition(":")
+        if sep and not line.startswith((" ", "#")):
+            fm[key.strip()] = value.strip()
+    return fm, m.group(2)
+
+
+class Role:
+    def __init__(self, name: str, fm: dict, body: str, sources: list[str]):
+        self.name = name
+        self.description = fm.get("description") or f"The {name} role."
+        tools = fm.get("tools")
+        self.tools = [t.strip() for t in tools.split(",") if t.strip()] if tools else None
+        self.body = body.strip()
+        self.sources = sources
+        self.cli = "claude"
+
+    @property
+    def can_write(self) -> bool:
+        return self.tools is None or bool({"Write", "Edit"} & set(self.tools))
+
+    @property
+    def sandbox(self) -> str:
+        return "workspace-write" if self.can_write else "read-only"
+
+
+class Team:
+    def __init__(self, project: Path, roles: dict[str, Role], config: dict, warnings: list[str], host: str):
+        self.project = project
+        self.roles = roles
+        self.config = config
+        self.warnings = warnings
+        self.host = host
+
+    @property
+    def gate(self) -> bool:
+        return self.config["review-gate"] == "on"
+
+
+def load_roles(project: Path) -> tuple[dict[str, Role], list[str]]:
+    parsed: dict[str, dict] = {}
+    warnings: list[str] = []
+    for f in sorted(GLOBAL_ROLES.glob("*.md")):
+        fm, body = split_frontmatter(f.read_text())
+        parsed[f.stem] = {"fm": fm, "body": body, "sources": ["global"]}
+
+    local = project / LOCAL / "roles"
+    if local.is_dir():
+        for f in sorted(local.glob("*.md")):
+            if f.name.endswith(".append.md"):
+                continue
+            if not ROLE_NAME.match(f.stem):
+                warnings.append(f"ignoring {f}: role names are lowercase letters, digits and dashes")
+                continue
+            fm, body = split_frontmatter(f.read_text())
+            base = parsed.get(f.stem)
+            merged = dict(base["fm"]) if base else {}
+            merged.update(fm)
+            parsed[f.stem] = {"fm": merged, "body": body, "sources": ["project override" if base else "project"]}
+        for f in sorted(local.glob("*.append.md")):
+            name = f.name[: -len(".append.md")]
+            if name not in parsed:
+                warnings.append(f"ignoring {f}: no role named '{name}' to append to")
+                continue
+            _, extra = split_frontmatter(f.read_text())
+            parsed[name]["body"] = parsed[name]["body"].rstrip() + "\n\n## Project-Specific Guidance\n\n" + extra.strip()
+            parsed[name]["sources"].append("appended")
+
+    roles = {n: Role(n, p["fm"], p["body"], p["sources"]) for n, p in parsed.items()}
+    return roles, warnings
+
+
+def load_config(project: Path, roles: dict[str, Role]) -> dict:
+    config = {"default": os.environ.get("SYNDICATE_RUNTIME") or "claude", "review-gate": "on"}
+    if config["default"] not in CLIS:
+        raise SyndicateError(f"SYNDICATE_RUNTIME must be one of {', '.join(CLIS)}")
+    path = project / LOCAL / "config"
+    if path.is_file():
+        for n, raw in enumerate(path.read_text().splitlines(), 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            key, sep, value = (p.strip() for p in line.partition("="))
+            where = f"{path}:{n}"
+            if not sep or not key or not value:
+                raise SyndicateError(f"{where}: expected 'key = value'")
+            if key == "review-gate":
+                if value not in ("on", "off"):
+                    raise SyndicateError(f"{where}: review-gate must be on or off")
+            elif key == "default" or key in roles:
+                if value not in CLIS:
+                    raise SyndicateError(f"{where}: cli must be one of {', '.join(CLIS)}")
+            else:
+                raise SyndicateError(f"{where}: unknown role '{key}' (known: {', '.join(sorted(roles))})")
+            config[key] = value
+    return config
+
+
+def resolve_team(project: Path, host_override: str | None = None) -> Team:
+    roles, warnings = load_roles(project)
+    if "orchestrator" not in roles:
+        raise SyndicateError("no 'orchestrator' role found")
+    config = load_config(project, roles)
+    for name, role in roles.items():
+        role.cli = config.get(name, config["default"])
+    host = host_override or roles["orchestrator"].cli
+    if host not in CLIS:
+        raise SyndicateError(f"unknown runtime '{host}' (use {' or '.join(CLIS)})")
+    roles["orchestrator"].cli = host
+    return Team(project, roles, config, warnings, host)
+
+
+def git(project: Path, *args: str) -> str | None:
+    r = subprocess.run(["git", "-C", str(project), *args], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def ensure_excluded(project: Path) -> str | None:
+    """Keep .syndicate/ out of git via the repo's local-only exclude file (never .gitignore)."""
+    top = git(project, "rev-parse", "--show-toplevel")
+    exclude = git(project, "rev-parse", "--git-path", "info/exclude")
+    if not top or not exclude:
+        return "not a git repository: nothing to exclude"
+    exclude_path = Path(exclude) if os.path.isabs(exclude) else project / exclude
+    rel = project.resolve().relative_to(Path(top).resolve()).as_posix()
+    pattern = "/" + ("" if rel == "." else rel + "/") + LOCAL + "/"
+    text = exclude_path.read_text() if exclude_path.exists() else ""
+    if pattern not in text.splitlines():
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
+        with exclude_path.open("a") as f:
+            if text and not text.endswith("\n"):
+                f.write("\n")
+            f.write(f"# syndicate: local-only team config and generated agents\n{pattern}\n")
+    if git(project, "ls-files", LOCAL):
+        return f"warning: {LOCAL}/ has tracked files; run 'git rm -r --cached {LOCAL}' to keep it local-only"
+    return None
+
+
+def generated(project: Path) -> Path:
+    path = project / LOCAL / ".generated"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def relay_command(role: Role, project: Path) -> str:
+    return f"{shlex.quote(str(SCRIPT))} run-role {role.name} -C {shlex.quote(str(project))} -"
+
+
+def relay_prompt(role: Role, project: Path) -> str:
+    return f"""\
+You are a relay for the `{role.name}` role, which runs on the {role.cli} CLI in this project. You do not do the work yourself.
+
+1. Write a complete, self-contained brief for the role from the task you were given. The role cannot see this conversation, so include the goal, constraints, relevant file paths, and what to return.
+2. Run exactly this command with Bash, putting the brief in the heredoc:
+
+{relay_command(role, project)} <<'SYNDICATE_BRIEF'
+<the brief>
+SYNDICATE_BRIEF
+
+3. Reply with the command's output verbatim as your final answer. If the command fails, report the error verbatim. Do not retry a different way or do the work yourself.
+"""
+
+
+def claude_agent(role: Role) -> dict:
+    agent = {"description": role.description, "prompt": role.body}
+    if role.tools:
+        agent["tools"] = role.tools
+    return agent
+
+
+def build_claude(team: Team, headless: bool, rest: list[str]) -> list[str]:
+    agents, relays = {}, False
+    for name, role in team.roles.items():
+        if name == "orchestrator" or role.cli == "claude":
+            agents[name] = claude_agent(role)
+        else:
+            relays = True
+            agents[name] = {
+                "description": role.description,
+                "prompt": relay_prompt(role, team.project),
+                "tools": ["Bash"],
+            }
+    settings: dict = {}
+    if team.gate:
+        settings["hooks"] = {"Stop": [{"hooks": [{"type": "command", "command": shlex.quote(str(GATE_SCRIPT))}]}]}
+    if relays:
+        settings["permissions"] = {"allow": [f"Bash({SCRIPT} run-role *)"]}
+    argv = ["claude", "--agent", "orchestrator", "--agents", json.dumps(agents)]
+    if settings:
+        path = generated(team.project) / "claude-settings.json"
+        path.write_text(json.dumps(settings, indent=2) + "\n")
+        argv += ["--settings", str(path)]
+    if headless:
+        argv.append("-p")
+    return argv + rest
+
+
+def build_codex(team: Team, headless: bool, rest: list[str]) -> list[str]:
+    gen = generated(team.project) / "codex"
+    gen.mkdir(parents=True, exist_ok=True)
+    keep: set[str] = set()
+    overrides: list[str] = []
+    relays = False
+    for name, role in team.roles.items():
+        if name == "orchestrator":
+            continue
+        relays = relays or role.cli != "codex"
+        if role.cli == "codex":
+            instructions, sandbox = role.body, role.sandbox
+        else:
+            instructions, sandbox = relay_prompt(role, team.project), RELAY_SANDBOX
+        f = gen / f"{name}.toml"
+        f.write_text(f"developer_instructions = {jstr(instructions)}\nsandbox_mode = {jstr(sandbox)}\n")
+        keep.add(f.name)
+        overrides += [
+            "-c", f"agents.{name}.description={jstr(role.description)}",
+            "-c", f"agents.{name}.config_file={jstr(str(f))}",
+        ]
+    for old in gen.glob("*.toml"):
+        if old.name not in keep:
+            old.unlink()
+    names = ", ".join(n for n in team.roles if n != "orchestrator")
+    instructions = (
+        team.roles["orchestrator"].body
+        + f"\n\nSpecialist roles are available as custom agents with these exact names; spawn them to delegate: {names}."
+    )
+    if relays:
+        # Relay agents run another CLI, which must reach its API; the sandbox blocks network by default.
+        overrides += ["-c", "sandbox_workspace_write.network_access=true"]
+    argv = ["codex"]
+    if headless:
+        argv += ["exec", "-C", str(team.project), "-s", "workspace-write"]
+    else:
+        argv += ["-C", str(team.project)]
+    return argv + ["-c", f"developer_instructions={jstr(instructions)}"] + overrides + rest
+
+
+def require_clis(clis: set[str]) -> None:
+    for cli in sorted(clis):
+        if not shutil.which(cli):
+            raise SyndicateError(f"the '{cli}' CLI is not installed or not on PATH")
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    project = Path(args.dir).resolve()
+    team = resolve_team(project, args.runtime)
+    for w in team.warnings:
+        print(f"syndicate: {w}", file=sys.stderr)
+    require_clis({r.cli for r in team.roles.values()})
+    note = ensure_excluded(project)
+    if note:
+        print(f"syndicate: {note}", file=sys.stderr)
+    build = build_claude if team.host == "claude" else build_codex
+    argv = build(team, args.print, args.rest)
+    os.chdir(project)
+    os.execvp(argv[0], argv)
+
+
+def cmd_run_role(args: argparse.Namespace) -> int:
+    project = Path(args.dir).resolve()
+    team = resolve_team(project)
+    role = team.roles.get(args.role)
+    if not role or args.role == "orchestrator":
+        raise SyndicateError(f"unknown role '{args.role}'")
+    require_clis({role.cli})
+    brief = sys.stdin.read() if args.brief == "-" else args.brief
+    if role.cli == "claude":
+        argv = ["claude", "-p", "--agents", json.dumps({role.name: claude_agent(role)}), "--agent", role.name]
+        if role.can_write:
+            argv += ["--permission-mode", "acceptEdits"]
+        argv.append(brief)
+    else:
+        argv = ["codex", "exec", "-C", str(project), "-s", role.sandbox,
+                "-c", f"developer_instructions={jstr(role.body)}", brief]
+    return subprocess.run(argv, cwd=project, stdin=subprocess.DEVNULL).returncode
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    project = Path(args.dir).resolve()
+    local = project / LOCAL
+    (local / "roles").mkdir(parents=True, exist_ok=True)
+    config = local / "config"
+    if config.exists():
+        print(f"kept existing {config}")
+    else:
+        config.write_text(CONFIG_TEMPLATE)
+        print(f"created {config}")
+    print(f"created {local / 'roles'}/ (drop role overrides here; see docs/configuration.md)")
+    note = ensure_excluded(project)
+    print(note or f"{LOCAL}/ is excluded from git via .git/info/exclude")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    project = Path(args.dir).resolve()
+    team = resolve_team(project)
+    print(f"project: {project}")
+    print(f"host (orchestrator): {team.host}    review gate: {'on' if team.gate else 'off'}\n")
+    width = max(len(n) for n in team.roles)
+    for name, role in team.roles.items():
+        print(f"  {name:<{width}}  {role.cli:<7} {' + '.join(role.sources)}")
+    for w in team.warnings:
+        print(f"\nwarning: {w}")
+    return 0
+
+
+def cmd_setup_codex_gate(args: argparse.Namespace) -> int:
+    path = Path.home() / ".codex" / "hooks.json"
+    data = json.loads(path.read_text()) if path.is_file() else {}
+    command = shlex.quote(str(GATE_SCRIPT))
+    stop = [e for e in data.get("hooks", {}).get("Stop", [])
+            if not any(h.get("command") == command for h in e.get("hooks", []))]
+    if not args.remove:
+        stop.append({"hooks": [{"type": "command", "command": command}]})
+    hooks = data.setdefault("hooks", {})
+    if stop:
+        hooks["Stop"] = stop
+    else:
+        hooks.pop("Stop", None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    if args.remove:
+        print(f"removed the review-gate hook from {path}")
+    else:
+        print(f"installed the review-gate hook in {path}")
+        print("Codex runs it only after you approve it once: open 'codex' and accept the hook review prompt.")
+    return 0
+
+
+def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
+    run = argparse.ArgumentParser(
+        prog="syndicate",
+        usage="syndicate [-x claude|codex] [-C dir] [-p] [task] [extra CLI args...]",
+        description="Run the orchestrator with the project's team. Other commands: "
+                    "init, status, run-role, setup-codex-gate.",
+    )
+    run.add_argument("-x", "--runtime", choices=CLIS, help="CLI hosting the orchestrator (overrides project config)")
+    run.add_argument("-C", "--dir", default=".", help="project directory (default: current)")
+    run.add_argument("-p", "--print", action="store_true", help="run headless and print the result")
+    run.add_argument("rest", nargs=argparse.REMAINDER, help="the task, then any extra args for the CLI")
+
+    sub = argparse.ArgumentParser(prog="syndicate")
+    cmds = sub.add_subparsers(dest="cmd", required=True)
+    for name, fn, text in (
+        ("init", cmd_init, "create .syndicate/ in a project and exclude it from git"),
+        ("status", cmd_status, "show the resolved team: each role's CLI and where its definition comes from"),
+    ):
+        p = cmds.add_parser(name, help=text)
+        p.add_argument("-C", "--dir", default=".")
+        p.set_defaults(fn=fn)
+    p = cmds.add_parser("run-role", help="run one role headlessly on its configured CLI (used by relay agents)")
+    p.add_argument("role")
+    p.add_argument("brief", help="the task, or - to read it from stdin")
+    p.add_argument("-C", "--dir", default=".")
+    p.set_defaults(fn=cmd_run_role)
+    p = cmds.add_parser("setup-codex-gate", help="install the review-gate hook into ~/.codex/hooks.json (once)")
+    p.add_argument("--remove", action="store_true")
+    p.set_defaults(fn=cmd_setup_codex_gate)
+    return run, sub
+
+
+def main(argv: list[str]) -> int:
+    run, sub = build_parsers()
+    try:
+        if argv and argv[0] in ("init", "status", "run-role", "setup-codex-gate"):
+            args = sub.parse_args(argv)
+            return args.fn(args)
+        args = run.parse_args(argv)
+        args.fn = cmd_run
+        return cmd_run(args)
+    except SyndicateError as e:
+        print(f"syndicate: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

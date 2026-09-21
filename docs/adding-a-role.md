@@ -1,53 +1,41 @@
 # Adding or changing a role
 
-Every role is one file under `roles/`. There's no build step — edit the
-file, reinstall, done.
+Roles come in two scopes.
 
-## Adding a new role
+- **Global** roles live in this repo's `roles/` and apply to every project.
+- **Project** roles and overrides live in `<project>/.syndicate/roles/` and are
+  local-only. See [configuration.md](configuration.md).
 
-1. Copy an existing role file close in shape to what you need (e.g.
-   `roles/backend-engineer.md` for another build role, `roles/code-reviewer.md`
-   for another read-only review role) to `roles/<new-role>.md`.
-2. Update the frontmatter:
-   - `name`: kebab-case identifier, matches the filename.
-   - `description`: written for Claude Code's auto-invocation — state
-     plainly what situations should trigger this agent. Look at the other
-     roles' descriptions for the pattern.
-   - `tools`: the Claude Code tools this role actually needs. Keep it
-     minimal — a role that only reviews shouldn't get `Edit`/`Write`; a
-     role that never touches the network shouldn't get `WebFetch`/
-     `WebSearch`. Available tool names: `Read`, `Edit`, `Write`, `Bash`,
-     `Grep`, `Glob`, `WebFetch`, `WebSearch`, `Agent` (for a role that
-     delegates to other roles).
-3. Rewrite the body to match this repo's existing section structure, so
-   every role reads consistently:
-   - `## Mission` — one to two sentences.
-   - `## Core Responsibilities` — what it actually does.
-   - `## Operating Principles` — how it makes judgment calls.
-   - `## Stack Adaptation` — how it detects and matches the project's
-     existing language/framework/tooling instead of imposing a default.
-   - `## Definition of Done` — what "finished" means for this role.
-   - `## Anti-Goals` — what it explicitly stays out of, including where
-     it overlaps with another role.
-   - `## Handoff Protocol` — inputs expected, outputs produced, and which
-     roles it hands off to or receives from.
-4. If the new role delegates to or receives work from others, update the
-   relevant `Handoff Protocol` sections of those roles too (e.g. adding
-   an "architect" role that the orchestrator delegates to before build
-   roles start).
-5. Reinstall: `./install.sh --target <project>` (or `--global`).
+There is no build or install step for either: edit the file and the next
+`syndicate` run uses it.
 
-## Changing an existing role
+## Adding a global role
 
-Edit the file directly. If you only changed the body (mission,
-responsibilities, principles, etc.), nothing else needs updating. If you
-changed what tools the role needs, update the `tools:` frontmatter line to
-match. Reinstall to pick up the change in any project using a copied
-(non-symlinked) install.
+1. Copy a role close in shape to what you need (`roles/backend-engineer.md`
+   for a build role, `roles/code-reviewer.md` for a read-only one) to
+   `roles/<new-role>.md`. The name is lowercase letters, digits and dashes.
+2. Set the frontmatter:
+   - `name`: matches the filename.
+   - `description`: states plainly when the orchestrator should use this role.
+   - `tools`: the Claude Code tools it needs, kept minimal. A role that only
+     reviews shouldn't have `Edit`/`Write`; that also gives it a `read-only`
+     sandbox under Codex. Available: `Read`, `Edit`, `Write`, `Bash`, `Grep`,
+     `Glob`, `WebFetch`, `WebSearch`, `Agent`.
+3. Write the body using the same sections as the existing roles, so they read
+   consistently: Mission, Core Responsibilities, Operating Principles, Stack
+   Adaptation, Definition of Done, Anti-Goals, Handoff Protocol.
+4. If it delegates to or receives work from other roles, update their Handoff
+   Protocol sections too.
 
-## Removing a role
+## Changing or removing a global role
 
-Delete `roles/<role>.md`, and remove references to it from other roles'
-`Handoff Protocol` sections if any exist. Re-run `install.sh` on any
-project that had it installed to remove the stale copy, or delete
-`.claude/agents/<role>.md` there directly.
+Edit or delete `roles/<role>.md`. Remove references to a deleted role from other
+roles' Handoff Protocol sections, and from any project's `.syndicate/config`
+(an unknown role name there is an error).
+
+## Customizing a role for one project only
+
+Don't edit the global file. In the project, either add
+`.syndicate/roles/<role>.append.md` (guidance layered on the global role) or
+`.syndicate/roles/<role>.md` (a full replacement). See
+[configuration.md](configuration.md) for exactly how each behaves.
