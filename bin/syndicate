@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Run the orchestrator as the main-session agent so it can delegate to the
+# specialist roles installed in the target project.
+#   syndicate [-x claude|codex] [-C <project-dir>] [-p] "<task>" [extra CLI args...]
+# -p runs headless (prints the result and exits); otherwise interactive.
+# The runtime defaults to $SYNDICATE_RUNTIME, else claude.
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+RUNTIME="${SYNDICATE_RUNTIME:-claude}"
+DIR="$(pwd)"
+HEADLESS=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -x|--runtime) RUNTIME="$2"; shift 2 ;;
+    -C|--dir) DIR="$2"; shift 2 ;;
+    -p|--print) HEADLESS=1; shift ;;
+    -h|--help) sed -n '2,6p' "$0"; exit 0 ;;
+    *) break ;;
+  esac
+done
+
+case "$RUNTIME" in
+  claude)
+    if [[ ! -f "$DIR/.claude/agents/orchestrator.md" && ! -f "$HOME/.claude/agents/orchestrator.md" ]]; then
+      echo "orchestrator not installed for $DIR — run install.sh first" >&2; exit 1
+    fi
+    cd "$DIR"
+    if [[ $HEADLESS -eq 1 ]]; then exec claude --agent orchestrator -p "$@"; fi
+    exec claude --agent orchestrator "$@"
+    ;;
+  codex)
+    command -v jq >/dev/null || { echo "jq is required for the codex runtime" >&2; exit 1; }
+    if ! compgen -G "$DIR/.codex/agents/*.toml" >/dev/null && ! compgen -G "$HOME/.codex/agents/*.toml" >/dev/null; then
+      echo "specialist agents not installed for $DIR — run install.sh --runtime codex first" >&2; exit 1
+    fi
+    # Codex has no --agent flag, so the orchestrator identity is injected as developer instructions.
+    body="$(awk 'c>=2{print} /^---$/{c++}' "$REPO_DIR/roles/orchestrator.md")"
+    body+=$'\n\nThe specialist roles named above are available as custom agents with those exact names; spawn them to delegate.'
+    instr="developer_instructions=$(jq -Rn --arg v "$body" '$v')"
+    if [[ $HEADLESS -eq 1 ]]; then
+      exec codex exec -C "$DIR" -s workspace-write -c "$instr" "$@"
+    fi
+    exec codex -C "$DIR" -c "$instr" "$@"
+    ;;
+  *) echo "Unknown runtime: $RUNTIME (use claude or codex)" >&2; exit 1 ;;
+esac

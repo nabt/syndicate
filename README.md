@@ -39,12 +39,15 @@ without copying prompts by hand each time.
   A different framework can ignore those three lines, or map `tools:` to
   its own permission model; nothing about the identity itself depends on
   them.
-- **No generation step, no adapter layer.** Earlier drafts of this repo
-  split each role into a generic identity file plus a generated Claude
-  Code file, glued together by a build script. That's two files to keep
-  in sync per role — real drift risk if the generated file is ever
-  hand-edited or the generator forgotten. Collapsing to one file per role
-  removes that failure mode entirely: edit the file, you're done.
+- **No committed adapter layer.** Earlier drafts split each role into a
+  generic identity file plus a generated Claude Code file, glued together
+  by a build script — two files per role to keep in sync. Now `roles/*.md`
+  is the only copy. Claude Code uses it as-is; the Codex runtime needs
+  `.toml` agent files, which `install.sh` generates *into the target
+  project* at install time (never committed here), so there's nothing
+  to drift. Edit a role, reinstall, done.
+- **Two runtimes:** Claude Code and Codex CLI. Pick per install
+  (`--runtime`) and per run (`bin/syndicate -x`).
 
 ## Install
 
@@ -64,14 +67,65 @@ directory:
 # Install once, user-wide, so every project can use these roles
 ./install.sh --global
 
-# Symlink instead of copy, so edits to this repo show up immediately
+# Symlink instead of copy, so edits to this repo show up immediately (claude only)
 ./install.sh --target ~/code/some-project --symlink
+
+# Codex CLI instead of (or as well as) Claude Code: writes .codex/agents/*.toml
+./install.sh --target ~/code/some-project --runtime codex
+./install.sh --target ~/code/some-project --runtime both
 ```
+
+For Codex, roles without edit tools (the code reviewer) get a `read-only`
+sandbox; the rest get `workspace-write`. Codex needs `jq` at install time.
 
 Run `./install.sh --help` for the full option list.
 
 Once installed, invoke a role in Claude Code the same way as any subagent —
 by name, or let Claude Code auto-select one based on its `description`.
+
+## Running the team
+
+Run the orchestrator as the **main session agent**, not as a subagent —
+Claude Code subagents can't spawn other subagents, so an orchestrator
+invoked as one couldn't delegate to the specialists.
+
+```sh
+# Interactive
+bin/syndicate -C ~/code/some-project "add rate limiting to the public API"
+
+# Headless (prints the result and exits; suitable for scripts/CI)
+bin/syndicate -C ~/code/some-project -p "add rate limiting to the public API"
+```
+
+`bin/syndicate` is a thin wrapper over `claude --agent orchestrator`; put it
+on your `PATH` if you like. The orchestrator decides which roles the task
+needs and delegates to them.
+
+To drive Codex instead, use `-x codex` (or set `SYNDICATE_RUNTIME=codex`):
+
+```sh
+bin/syndicate -x codex -C ~/code/some-project -p "add rate limiting to the public API"
+```
+
+Codex has no `--agent` flag, so the launcher injects the orchestrator's
+identity as developer instructions and the installed specialists are spawned
+as Codex custom agents. Headless Codex runs use `workspace-write`. Extra
+arguments after the task are passed through to whichever CLI is running.
+
+### Review gate (optional)
+
+The role docs say work must pass through Code Reviewer, but that's only an
+instruction. Install the Stop hook to enforce it:
+
+```sh
+./install.sh --target ~/code/some-project --review-gate
+```
+
+If the orchestrator delegated work to any build role during a session and
+never invoked `code-reviewer`, the hook blocks the session from finishing and
+tells it to get a review first. It only triggers on delegation, so ordinary
+sessions in the same project are unaffected. Requires `jq`. Claude Code
+only — there's no equivalent gate for the Codex runtime yet.
 
 ## Using a role outside Claude Code
 
