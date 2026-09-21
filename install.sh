@@ -14,8 +14,9 @@ Options:
   -x, --runtime <name>  claude (default), codex, or both
   -s, --symlink           Symlink instead of copying (claude only; codex files are generated)
   -r, --roles <list>     Comma-separated role names to install (default: all)
-  -R, --review-gate       Also install the Claude Code Stop hook that blocks finishing until
-                          code-reviewer has reviewed delegated work (claude only; needs jq)
+  -R, --review-gate       Also install the Stop hook that blocks finishing until
+                          code-reviewer has reviewed delegated work (needs jq).
+                          Codex requires a one-time approval of the hook (see README).
   -h, --help              Show this help
 EOF
 }
@@ -44,10 +45,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$RUNTIME" in claude|codex|both) ;; *) echo "Unknown runtime: $RUNTIME" >&2; exit 1 ;; esac
-if [[ $GATE -eq 1 && "$RUNTIME" == "codex" ]]; then
-  echo "--review-gate is only supported for the claude runtime" >&2; exit 1
-fi
-
 if [[ -n "$ROLES" ]]; then
   IFS=',' read -ra ROLE_LIST <<< "$ROLES"
 else
@@ -64,6 +61,22 @@ fm() {
 
 # json_str <text>: JSON string literal, which is also a valid TOML basic string.
 json_str() { jq -Rn --arg v "$1" '$v'; }
+
+# install_gate <config-dir> <hook-command>: copy the hook script into
+# <config-dir>/hooks and merge a Stop entry into <config-dir>/<settings-file>.
+install_gate() {
+  local base="$1" hook_cmd="$2" settings_file="$3" settings tmp
+  command -v jq >/dev/null || { echo "jq is required for --review-gate" >&2; exit 1; }
+  mkdir -p "$base/hooks"
+  cp "$REPO_DIR/hooks/require-review.sh" "$base/hooks/require-review.sh"
+  settings="$base/$settings_file"
+  [[ -f "$settings" ]] || echo '{}' > "$settings"
+  tmp="$(mktemp)"
+  jq --arg cmd "$hook_cmd" '
+    .hooks.Stop = ((.hooks.Stop // []) | map(select(any(.hooks[]?; .command == $cmd) | not)))
+      + [{hooks: [{type: "command", command: $cmd}]}]' "$settings" > "$tmp" && mv "$tmp" "$settings"
+  echo "Installed review-gate Stop hook (config: $settings)"
+}
 
 install_claude() {
   local base dest role src count=0
@@ -83,29 +96,19 @@ install_claude() {
   echo "Installed $count Claude Code agent(s) into $dest"
 
   if [[ $GATE -eq 1 ]]; then
-    command -v jq >/dev/null || { echo "jq is required for --review-gate" >&2; exit 1; }
-    mkdir -p "$base/hooks"
-    cp "$REPO_DIR/hooks/require-review.sh" "$base/hooks/require-review.sh"
-    local hook_cmd settings tmp
     if [[ $GLOBAL -eq 1 ]]; then
-      hook_cmd="$base/hooks/require-review.sh"
+      install_gate "$base" "$base/hooks/require-review.sh" settings.json
     else
-      hook_cmd='"$CLAUDE_PROJECT_DIR"/.claude/hooks/require-review.sh'
+      install_gate "$base" '"$CLAUDE_PROJECT_DIR"/.claude/hooks/require-review.sh' settings.json
     fi
-    settings="$base/settings.json"
-    [[ -f "$settings" ]] || echo '{}' > "$settings"
-    tmp="$(mktemp)"
-    jq --arg cmd "$hook_cmd" '
-      .hooks.Stop = ((.hooks.Stop // []) | map(select(any(.hooks[]?; .command == $cmd) | not)))
-        + [{hooks: [{type: "command", command: $cmd}]}]' "$settings" > "$tmp" && mv "$tmp" "$settings"
-    echo "Installed review-gate Stop hook (settings: $settings)"
   fi
 }
 
 install_codex() {
   command -v jq >/dev/null || { echo "jq is required for the codex runtime" >&2; exit 1; }
-  local dest role src count=0 sandbox tools
-  if [[ $GLOBAL -eq 1 ]]; then dest="$HOME/.codex/agents"; else dest="${TARGET:-$(pwd)}/.codex/agents"; fi
+  local base dest role src count=0 sandbox tools
+  if [[ $GLOBAL -eq 1 ]]; then base="$HOME/.codex"; else base="$(cd "${TARGET:-$(pwd)}" && pwd)/.codex"; fi
+  dest="$base/agents"
   mkdir -p "$dest"
   for role in "${ROLE_LIST[@]}"; do
     src="$ROLES_SRC/$role.md"
@@ -123,6 +126,12 @@ install_codex() {
     count=$((count + 1))
   done
   echo "Installed $count Codex agent(s) into $dest"
+
+  if [[ $GATE -eq 1 ]]; then
+    install_gate "$base" "$base/hooks/require-review.sh" hooks.json
+    echo "NOTE: Codex won't run this hook until you approve it once. Open 'codex' in the"
+    echo "      project and accept the hook review prompt (or use its /hooks menu)."
+  fi
 }
 
 [[ "$RUNTIME" == "claude" || "$RUNTIME" == "both" ]] && install_claude

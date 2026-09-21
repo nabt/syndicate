@@ -124,8 +124,18 @@ instruction. Install the Stop hook to enforce it:
 If the orchestrator delegated work to any build role during a session and
 never invoked `code-reviewer`, the hook blocks the session from finishing and
 tells it to get a review first. It only triggers on delegation, so ordinary
-sessions in the same project are unaffected. Requires `jq`. Claude Code
-only — there's no equivalent gate for the Codex runtime yet.
+sessions in the same project are unaffected. Requires `jq`.
+
+It works for both runtimes: `--review-gate` writes the Claude Code hook to
+`.claude/settings.json` and, with `--runtime codex` or `both`, the Codex hook
+to `.codex/hooks.json`. The same script reads either transcript format (Claude
+`Agent` calls or Codex `spawn_agent` calls). The Codex hook command is an
+absolute path, so re-run `install.sh` if you move the project.
+
+**Codex asks you to approve hooks once.** Codex won't run a project hook until
+it's reviewed: open `codex` interactively in the project and accept the hook
+review prompt (or use its `/hooks` menu). Until then the gate is inert. This
+is Codex's own safety check, and the installer deliberately doesn't bypass it.
 
 ## Using a role outside Claude Code
 
