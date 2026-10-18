@@ -16,6 +16,9 @@ and framework the project uses.
   directory. Nothing is committed, and other teams' `.claude/` and `.codex/`
   setups are never touched, so several teams can work in the same repo without
   interfering.
+- **Monitorable.** The orchestrator keeps `.syndicate/status.json` up to date
+  as it works, so you can watch what every project's team is doing — and
+  whether it's stuck waiting on you — from a console or browser dashboard.
 
 ## Roster
 
@@ -95,6 +98,28 @@ at launch (Claude via `--agents`, Codex via `-c`), so no agent files are written
 into the project. Note that a Codex host with a Claude-backed role enables
 network access in Codex's sandbox for the session; see
 [`docs/configuration.md`](docs/configuration.md#mixed-cli-teams).
+
+## Monitoring
+
+Every run registers its project in `~/.syndicate/projects.json` and keeps
+`.syndicate/status.json` updated: current state (`running`,
+`waiting_on_user`, or `done`), which role is active and what it's doing, and
+a running history of past rounds. Two ways to watch it, across every
+registered project at once:
+
+```sh
+# Console: refreshes every 2s, ctrl-c to stop. --once renders a single frame.
+syndicate dashboard
+
+# Browser: starts a local server and prints the URL (http://127.0.0.1:8765/ by default)
+syndicate web
+```
+
+A project whose status still says `running` but whose process has died shows
+up as `stale` rather than silently looking active forever — the dashboard
+checks the recorded PID is actually still alive. This is also why you should
+trust the dashboard over a status file you read by hand: a crashed or killed
+session leaves no other signal that it stopped.
 
 ## Review gate
 

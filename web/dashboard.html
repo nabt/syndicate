@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>syndicate dashboard</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+    margin: 0; padding: 1.5rem 2rem 3rem;
+    background: #0b0d12; color: #d8dae2;
+  }
+  h1 { font-size: 1.05rem; font-weight: 600; color: #8b93a8; margin: 0 0 1.1rem; letter-spacing: .02em; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1rem; }
+  .card { background: #151822; border: 1px solid #262b3a; border-radius: 12px; padding: 1rem 1.1rem; }
+  .card h2 { margin: .5rem 0 .15rem; font-size: 1rem; font-weight: 600; color: #eef; word-break: break-word; }
+  .path { font-size: .74rem; color: #5b6376; word-break: break-all; }
+  .badge {
+    display: inline-block; padding: .18rem .6rem; border-radius: 999px;
+    font-size: .7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  }
+  .state-running      { background: #123420; color: #6fe39a; }
+  .state-waiting_on_user { background: #3a2a10; color: #e8b35f; }
+  .state-done          { background: #1c2030; color: #93a0c0; }
+  .state-stale         { background: #3a1414; color: #f08080; }
+  .state-unknown       { background: #1c1f26; color: #6b7280; }
+  .summary { margin: .7rem 0 .4rem; font-size: .9rem; color: #c7cbe0; line-height: 1.4; }
+  .role { color: #7fa8e8; font-weight: 600; }
+  .meta { font-size: .76rem; color: #5b6376; }
+  details { margin-top: .7rem; }
+  summary { cursor: pointer; font-size: .78rem; color: #7f8aa8; outline: none; }
+  summary:hover { color: #a9b4d0; }
+  ul.hist { margin: .5rem 0 0; padding-left: 1.05rem; font-size: .8rem; color: #aab0c4; max-height: 240px; overflow-y: auto; }
+  ul.hist li { margin-bottom: .45rem; }
+  .outcome { font-weight: 600; color: #cfd4e8; }
+  .empty { color: #5b6376; font-style: italic; }
+  #updated { font-size: .72rem; color: #4a5066; margin-top: 1.6rem; }
+</style>
+</head>
+<body>
+<h1>syndicate &middot; dashboard</h1>
+<div id="grid" class="grid"><p class="empty">loading&hellip;</p></div>
+<div id="updated"></div>
+<script>
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+
+function card(r) {
+  const cur = r.current || {};
+  let role = cur.role;
+  if (Array.isArray(role)) role = role.join(", ");
+  const hist = (r.history || []).slice().reverse().map(h => `
+    <li>
+      <span class="outcome">${esc(h.round || "")} ${esc(h.outcome || h.event || "")}</span><br>
+      ${esc(h.summary || "")} <span class="meta">${esc(h.at || "")}</span>
+    </li>`).join("");
+  return `
+    <div class="card">
+      <span class="badge state-${esc(r.state)}">${esc(r.state)}</span>
+      <h2>${esc(r.name)}</h2>
+      <div class="path">${esc(r.path)}</div>
+      <div class="summary">${role ? `<span class="role">${esc(role)}:</span> ` : ""}${esc(cur.summary) || '<span class="empty">no current activity</span>'}</div>
+      <div class="meta">round: ${esc(cur.round || "—")} &middot; updated: ${esc(r.updated_at || "—")}</div>
+      <details><summary>history (${(r.history || []).length})</summary>
+        <ul class="hist">${hist || '<li class="empty">none yet</li>'}</ul>
+      </details>
+    </div>`;
+}
+
+async function tick() {
+  let rows;
+  try {
+    rows = await (await fetch("/api/status", { cache: "no-store" })).json();
+  } catch (e) {
+    return; // keep showing the last good render rather than flash an error
+  }
+  const grid = document.getElementById("grid");
+  grid.innerHTML = rows.length
+    ? rows.map(card).join("")
+    : '<p class="empty">no registered projects — run `syndicate init` (or any run) in a project first</p>';
+  document.getElementById("updated").textContent = "refreshed " + new Date().toLocaleTimeString();
+}
+
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>

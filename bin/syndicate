@@ -9,6 +9,7 @@ docs/configuration.md.
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import os
 import re
@@ -16,16 +17,22 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve()
 HOME_DIR = SCRIPT.parent.parent
 GLOBAL_ROLES = HOME_DIR / "roles"
 GATE_SCRIPT = HOME_DIR / "hooks" / "require-review.sh"
+WEB_DIR = HOME_DIR / "web"
+REGISTRY_PATH = Path.home() / ".syndicate" / "projects.json"
 CLIS = ("claude", "codex")
 LOCAL = ".syndicate"
 ROLE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 RELAY_SANDBOX = "workspace-write"
+STATUS_STATES = ("running", "waiting_on_user", "done")
+MAX_STATUS_HISTORY = 200
 
 CONFIG_TEMPLATE = """\
 # Local-only syndicate team config for this project (git-ignored).
@@ -295,6 +302,193 @@ def require_clis(clis: set[str]) -> None:
             raise SyndicateError(f"the '{cli}' CLI is not installed or not on PATH")
 
 
+# --- status & registry (bin/syndicate instruments; roles/orchestrator.md is the other writer) ---
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def mtime_iso(path: Path) -> str | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except OSError:
+        return None
+
+
+def load_registry() -> list[dict]:
+    if not REGISTRY_PATH.is_file():
+        return []
+    try:
+        data = json.loads(REGISTRY_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    return data.get("projects", []) if isinstance(data, dict) else []
+
+
+def register_project(project: Path) -> None:
+    """Record this project in the user-wide registry so dashboard/web can find it
+    without being pointed at it explicitly."""
+    path_str = str(project)
+    projects = [p for p in load_registry() if p.get("path") != path_str]
+    projects.insert(0, {"path": path_str, "name": project.name, "last_seen": now_iso()})
+    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    REGISTRY_PATH.write_text(json.dumps({"projects": projects}, indent=2) + "\n")
+
+
+def status_path(project: Path) -> Path:
+    return project / LOCAL / "status.json"
+
+
+def write_status_stub(project: Path, pid: int, summary: str) -> None:
+    """Written by the launcher, before it execs into the CLI, so a dashboard can
+    see a session starting immediately and detect a stale 'running' status left
+    by a process that died without updating it. Preserves history across runs —
+    a project is typically launched many times over its life."""
+    path = status_path(project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    history = []
+    if path.is_file():
+        try:
+            prior = json.loads(path.read_text()).get("history")
+            if isinstance(prior, list):
+                history = prior[-MAX_STATUS_HISTORY:]
+        except (json.JSONDecodeError, OSError):
+            pass
+    data = {
+        "pid": pid,
+        "state": "running",
+        "current": {"round": None, "role": "orchestrator", "summary": summary},
+        "history": history,
+    }
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def is_pid_alive(pid) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just owned by someone else
+    except OSError:
+        return False
+    return True
+
+
+def read_status(project_path: str) -> dict | None:
+    path = Path(project_path) / LOCAL / "status.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    data["_mtime"] = mtime_iso(path)
+    return data
+
+
+def gather_statuses() -> list[dict]:
+    """One row per registered project. A project whose status file says 'running'
+    but whose pid is no longer alive is reported as 'stale', not 'running' — this
+    is what catches a session that died without reporting back."""
+    rows = []
+    for entry in load_registry():
+        status = read_status(entry.get("path", ""))
+        row = {"path": entry.get("path"), "name": entry.get("name") or Path(entry.get("path", "?")).name}
+        if status is None:
+            row.update(state="unknown", current=None, history=[], updated_at=None)
+        else:
+            state = status.get("state") if status.get("state") in STATUS_STATES else "unknown"
+            if state == "running" and not is_pid_alive(status.get("pid")):
+                state = "stale"
+            row.update(
+                state=state,
+                current=status.get("current"),
+                history=status.get("history") if isinstance(status.get("history"), list) else [],
+                updated_at=status.get("_mtime"),
+            )
+        rows.append(row)
+    return rows
+
+
+def render_dashboard(rows: list[dict]) -> str:
+    lines = [f"syndicate dashboard  ({now_iso()})", ""]
+    if not rows:
+        lines.append("no registered projects — run 'syndicate init' (or any run) in a project first")
+        return "\n".join(lines)
+    name_w = max(len(r["name"]) for r in rows)
+    for r in rows:
+        cur = r.get("current") or {}
+        role = cur.get("role") or ""
+        if isinstance(role, list):
+            role = ", ".join(role)
+        summary = cur.get("summary") or ("(no status reported yet)" if r["state"] == "unknown" else "")
+        lines.append(f"[{r['state']:<14}] {r['name']:<{name_w}}  {role:<28} {summary}")
+    return "\n".join(lines)
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    try:
+        while True:
+            rows = gather_statuses()
+            if not args.once:
+                print("\x1b[2J\x1b[H", end="")  # clear screen, home cursor
+            print(render_dashboard(rows))
+            if args.once:
+                return 0
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 0
+
+
+class _DashboardHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *a):  # keep stdout quiet
+        pass
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._serve_file(WEB_DIR / "dashboard.html", "text/html; charset=utf-8")
+        elif self.path == "/api/status":
+            body = json.dumps(gather_statuses()).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _serve_file(self, path: Path, content_type: str) -> None:
+        if not path.is_file():
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def cmd_web(args: argparse.Namespace) -> int:
+    server = http.server.HTTPServer(("127.0.0.1", args.port), _DashboardHandler)
+    print(f"syndicate web dashboard: http://127.0.0.1:{server.server_address[1]}/  (ctrl-c to stop)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     project = Path(args.dir).resolve()
     team = resolve_team(project, args.runtime)
@@ -306,6 +500,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"syndicate: {note}", file=sys.stderr)
     build = build_claude if team.host == "claude" else build_codex
     argv = build(team, args.print, args.rest)
+    if team.host == "claude" and args.print:
+        # Headless Claude gives up on still-running subagents after 600s; a team run is longer.
+        os.environ.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "0")
+    register_project(project)
+    write_status_stub(project, os.getpid(), args.rest[0][:140] if args.rest else "(interactive session)")
     os.chdir(project)
     os.execvp(argv[0], argv)
 
@@ -331,6 +530,7 @@ def cmd_run_role(args: argparse.Namespace) -> int:
 
 def cmd_init(args: argparse.Namespace) -> int:
     project = Path(args.dir).resolve()
+    register_project(project)
     local = project / LOCAL
     (local / "roles").mkdir(parents=True, exist_ok=True)
     config = local / "config"
@@ -386,7 +586,7 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
         prog="syndicate",
         usage="syndicate [-x claude|codex] [-C dir] [-p] [task] [extra CLI args...]",
         description="Run the orchestrator with the project's team. Other commands: "
-                    "init, status, run-role, setup-codex-gate.",
+                    "init, status, run-role, setup-codex-gate, dashboard, web.",
     )
     run.add_argument("-x", "--runtime", choices=CLIS, help="CLI hosting the orchestrator (overrides project config)")
     run.add_argument("-C", "--dir", default=".", help="project directory (default: current)")
@@ -410,13 +610,20 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p = cmds.add_parser("setup-codex-gate", help="install the review-gate hook into ~/.codex/hooks.json (once)")
     p.add_argument("--remove", action="store_true")
     p.set_defaults(fn=cmd_setup_codex_gate)
+    p = cmds.add_parser("dashboard", help="live console view of every registered project's status")
+    p.add_argument("--interval", type=float, default=2.0, help="seconds between refreshes (default: 2)")
+    p.add_argument("--once", action="store_true", help="render once and exit (for scripting)")
+    p.set_defaults(fn=cmd_dashboard)
+    p = cmds.add_parser("web", help="local browser dashboard (http://127.0.0.1:<port>/)")
+    p.add_argument("--port", type=int, default=8765)
+    p.set_defaults(fn=cmd_web)
     return run, sub
 
 
 def main(argv: list[str]) -> int:
     run, sub = build_parsers()
     try:
-        if argv and argv[0] in ("init", "status", "run-role", "setup-codex-gate"):
+        if argv and argv[0] in ("init", "status", "run-role", "setup-codex-gate", "dashboard", "web"):
             args = sub.parse_args(argv)
             return args.fn(args)
         args = run.parse_args(argv)

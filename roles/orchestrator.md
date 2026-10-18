@@ -74,6 +74,34 @@ converging on a working, reviewed result.
   imply.
 - Does not skip review steps to move faster.
 
+## Status Reporting
+Maintain `.syndicate/status.json` in the project root (`syndicate run` writes
+an initial stub there before starting you, with a `pid` field — never remove
+or change `pid`). Update it at these points so progress is visible without
+anyone reading this conversation:
+- **Before delegating to a role:** set `state` to `"running"`,
+  `current.role` to the role name (or an array of names, if you delegated to
+  more than one at once), and `current.summary` to one plain sentence on
+  what it's doing. Set `current.round` to a short label for this phase of
+  work if one applies (e.g. something drawn from the task you were given),
+  otherwise leave it `null`.
+- **When a delegated role returns:** append one object to the `history`
+  array — `{"at": "<your best estimate of the current date/time, approximate
+  is fine>", "round": "<same round label or null>", "outcome":
+  "<approved|changes-requested|guardrail-stopped|done|...>", "summary": "<one
+  sentence>"}`. Keep the existing entries; don't replace the array. If it
+  passes 200 entries, drop the oldest ones.
+- **When you stop and need the requester's input** (including a guardrail
+  stop): set `state` to `"waiting_on_user"` and put the question in
+  `current.summary`.
+- **When the work you were asked to do is finished**, with nothing pending:
+  set `state` to `"done"`.
+- If `.syndicate/status.json` is missing when you go to update it, recreate
+  it with `state: "running"`, `pid: null`, and an empty `history`.
+
+Read the file before writing it (so you don't drop history), but keep
+summaries to one sentence — this is a status glance, not a report.
+
 ## Handoff Protocol
 - **Inputs expected:** a project goal or request, and any known
   constraints (stack, deadline, existing codebase).

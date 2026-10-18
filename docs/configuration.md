@@ -12,8 +12,17 @@ the project is created or modified.
     ├── roles/
     │   ├── <role>.md           replaces (or adds) a role for this project
     │   └── <role>.append.md    adds project-specific guidance to a role
+    ├── status.json             current state + history, for dashboard/web; never edit
     └── .generated/             written by syndicate on every run; never edit
 ```
+
+`status.json` is written by `bin/syndicate` (an initial stub, before it launches
+the CLI) and then kept current by the orchestrator role itself as it works. It's
+how `syndicate dashboard`/`syndicate web` know what's happening — see the
+[README's Monitoring section](../README.md#monitoring). The one piece of state
+that lives outside the project entirely is `~/.syndicate/projects.json`, a
+user-wide registry of every project syndicate has touched, so the dashboard can
+find them all without you listing them.
 
 Run `syndicate init` inside a project to create `config` and `roles/` and the
 git exclusion. Every file below is optional: with no `.syndicate/` at all, the
