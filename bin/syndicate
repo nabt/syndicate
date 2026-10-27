@@ -22,10 +22,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve()
+sys.path.insert(0, str(SCRIPT.parent))
+import syndicate_runtime as runtime
 HOME_DIR = SCRIPT.parent.parent
 GLOBAL_ROLES = HOME_DIR / "roles"
 GATE_SCRIPT = HOME_DIR / "hooks" / "require-review.sh"
 WEB_DIR = HOME_DIR / "web"
+HANDOFF_SKILL = HOME_DIR / "skills" / "syndicate-handoff" / "SKILL.md"
 REGISTRY_PATH = Path.home() / ".syndicate" / "projects.json"
 CLIS = ("claude", "codex")
 LOCAL = ".syndicate"
@@ -41,6 +44,8 @@ CONFIG_TEMPLATE = """\
 # default = claude        # CLI for every role not listed below: claude | codex
 # orchestrator = claude   # CLI that hosts the session; other roles are delegated to from it
 # code-reviewer = codex   # any role name: a global role or one defined in .syndicate/roles/
+# handoff = on            # monitor quotas and checkpoint before switching providers
+# handoff-reserve = 10    # percentage of account usage remaining at which to stop
 # review-gate = on        # on (default) | off: block finishing until code-reviewer has reviewed
 """
 
@@ -132,7 +137,7 @@ def load_roles(project: Path) -> tuple[dict[str, Role], list[str]]:
 
 
 def load_config(project: Path, roles: dict[str, Role]) -> dict:
-    config = {"default": os.environ.get("SYNDICATE_RUNTIME") or "claude", "review-gate": "on"}
+    config = {"default": os.environ.get("SYNDICATE_RUNTIME") or "claude", "review-gate": "on", "handoff": "on", "handoff-reserve": "10"}
     if config["default"] not in CLIS:
         raise SyndicateError(f"SYNDICATE_RUNTIME must be one of {', '.join(CLIS)}")
     path = project / LOCAL / "config"
@@ -145,9 +150,16 @@ def load_config(project: Path, roles: dict[str, Role]) -> dict:
             where = f"{path}:{n}"
             if not sep or not key or not value:
                 raise SyndicateError(f"{where}: expected 'key = value'")
-            if key == "review-gate":
+            if key == "handoff-reserve":
+                try:
+                    valid = 0 < float(value) < 100
+                except ValueError:
+                    valid = False
+                if not valid:
+                    raise SyndicateError(f"{where}: handoff-reserve must be between 0 and 100 (exclusive)")
+            elif key in ("review-gate", "handoff"):
                 if value not in ("on", "off"):
-                    raise SyndicateError(f"{where}: review-gate must be on or off")
+                    raise SyndicateError(f"{where}: {key} must be on or off")
             elif key == "default" or key in roles:
                 if value not in CLIS:
                     raise SyndicateError(f"{where}: cli must be one of {', '.join(CLIS)}")
@@ -204,7 +216,7 @@ def generated(project: Path) -> Path:
 
 
 def relay_command(role: Role, project: Path) -> str:
-    return f"{shlex.quote(str(SCRIPT))} run-role {role.name} -C {shlex.quote(str(project))} -"
+    return f"{shlex.quote(str(SCRIPT))} run-role {role.name} -C {shlex.quote(str(project))} --runtime {role.cli} -"
 
 
 def relay_prompt(role: Role, project: Path) -> str:
@@ -222,6 +234,13 @@ SYNDICATE_BRIEF
 """
 
 
+def orchestrator_body(team: Team) -> str:
+    body = team.roles["orchestrator"].body
+    if team.config["handoff"] == "on":
+        body += "\n\n" + split_frontmatter(HANDOFF_SKILL.read_text())[1]
+    return body
+
+
 def claude_agent(role: Role) -> dict:
     agent = {"description": role.description, "prompt": role.body}
     if role.tools:
@@ -234,6 +253,8 @@ def build_claude(team: Team, headless: bool, rest: list[str]) -> list[str]:
     for name, role in team.roles.items():
         if name == "orchestrator" or role.cli == "claude":
             agents[name] = claude_agent(role)
+            if name == "orchestrator":
+                agents[name]["prompt"] = orchestrator_body(team)
         else:
             relays = True
             agents[name] = {
@@ -242,6 +263,9 @@ def build_claude(team: Team, headless: bool, rest: list[str]) -> list[str]:
                 "tools": ["Bash"],
             }
     settings: dict = {}
+    if team.config["handoff"] == "on":
+        settings["statusLine"] = {"type": "command", "command":
+            shlex.join([sys.executable, str(SCRIPT), "_claude-usage"])}
     if team.gate:
         settings["hooks"] = {"Stop": [{"hooks": [{"type": "command", "command": shlex.quote(str(GATE_SCRIPT))}]}]}
     if relays:
@@ -282,7 +306,7 @@ def build_codex(team: Team, headless: bool, rest: list[str]) -> list[str]:
             old.unlink()
     names = ", ".join(n for n in team.roles if n != "orchestrator")
     instructions = (
-        team.roles["orchestrator"].body
+        orchestrator_body(team)
         + f"\n\nSpecialist roles are available as custom agents with these exact names; spawn them to delegate: {names}."
     )
     if relays:
@@ -438,6 +462,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             if not args.once:
                 print("\x1b[2J\x1b[H", end="")  # clear screen, home cursor
             print(render_dashboard(rows))
+            print("\n" + runtime.describe_limits())
             if args.once:
                 return 0
             time.sleep(args.interval)
@@ -452,6 +477,15 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self._serve_file(WEB_DIR / "dashboard.html", "text/html; charset=utf-8")
+        elif self.path == "/api/limits":
+            body = json.dumps({"summary": runtime.describe_limits(),
+                               "monitor": runtime.read_json(runtime.STATE / "monitor.json")}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path == "/api/status":
             body = json.dumps(gather_statuses()).encode()
             self.send_response(200)
@@ -490,8 +524,38 @@ def cmd_web(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    # A project lock covers the entire confirmation/switch cycle, preventing
+    # another orchestrator from racing snapshots or changing the worktree.
+    import fcntl
+    project = Path(args.dir).resolve()
+    (project / LOCAL).mkdir(parents=True, exist_ok=True)
+    with (project / LOCAL / "session.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SyndicateError("another Syndicate orchestrator already owns this project")
+        while True:
+            result = run_session(args)
+            if result is not None:
+                return result
+
+
+def run_session(args: argparse.Namespace) -> int | None:
     project = Path(args.dir).resolve()
     team = resolve_team(project, args.runtime)
+    if getattr(args, "all_runtime", None):
+        for role in team.roles.values():
+            role.cli = args.all_runtime
+        team.roles["orchestrator"].cli = team.host
+    reserve = getattr(args, "reserve", None)
+    reserve = float(team.config["handoff-reserve"]) if reserve is None else reserve
+    if not 0 < reserve < 100:
+        raise SyndicateError("reserve must be between 0 and 100 (exclusive)")
+    if getattr(args, "handoff_path", None):
+        path = Path(args.handoff_path).resolve()
+        if not (path / "handoff.md").is_file():
+            raise SyndicateError(f"no handoff.md in {path}")
+        args.rest = [f"Continue the interrupted work from {path / 'handoff.md'}. Read its checkpoint and status, verify the live worktree, then complete outstanding work, testing, and review."]
     for w in team.warnings:
         print(f"syndicate: {w}", file=sys.stderr)
     require_clis({r.cli for r in team.roles.values()})
@@ -505,8 +569,30 @@ def cmd_run(args: argparse.Namespace) -> int:
         os.environ.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "0")
     register_project(project)
     write_status_stub(project, os.getpid(), args.rest[0][:140] if args.rest else "(interactive session)")
-    os.chdir(project)
-    os.execvp(argv[0], argv)
+    if team.config["handoff"] == "off":
+        os.chdir(project)
+        os.execvp(argv[0], argv)
+    runtime.start_monitor(SCRIPT)
+    providers = {r.cli for r in team.roles.values()}
+    task = args.rest[0] if args.rest else "Interactive session; see checkpoint and session output for requests."
+    print(f"syndicate: monitoring account limits; handoff at {reserve:g}% remaining. "
+          "Unavailable telemetry pauses work after 60s.", file=sys.stderr)
+    result, handoff = runtime.supervise(argv, project, providers, reserve, task, team.host, headless=args.print)
+    if handoff is None:
+        return result
+    print(f"\nHandoff: {handoff}")
+    target = runtime.choose_target(team.host, not args.print and sys.stdin.isatty())
+    if target is None:
+        return 75  # resumable temporary interruption; not successful completion
+    require_clis({target})
+    state, remaining = runtime.availability(runtime.read_json(runtime.STATE / f"{target}.json"))
+    if remaining is not None and remaining <= reserve:
+        print(f"syndicate: {target} also has only {remaining:g}% remaining; leaving work stopped.", file=sys.stderr)
+        return 75
+    args.runtime = target
+    args.all_runtime = target
+    args.handoff_path = str(handoff)
+    return None  # cmd_run retains the project lock while starting the confirmed target
 
 
 def cmd_run_role(args: argparse.Namespace) -> int:
@@ -515,6 +601,8 @@ def cmd_run_role(args: argparse.Namespace) -> int:
     role = team.roles.get(args.role)
     if not role or args.role == "orchestrator":
         raise SyndicateError(f"unknown role '{args.role}'")
+    if getattr(args, "runtime", None):
+        role.cli = args.runtime
     require_clis({role.cli})
     brief = sys.stdin.read() if args.brief == "-" else args.brief
     if role.cli == "claude":
@@ -526,6 +614,30 @@ def cmd_run_role(args: argparse.Namespace) -> int:
         argv = ["codex", "exec", "-C", str(project), "-s", role.sandbox,
                 "-c", f"developer_instructions={jstr(role.body)}", brief]
     return subprocess.run(argv, cwd=project, stdin=subprocess.DEVNULL).returncode
+
+
+def cmd_limits(args: argparse.Namespace) -> int:
+    if args.stop:
+        runtime.STATE.mkdir(parents=True, exist_ok=True)
+        (runtime.STATE / "stop").touch()
+        print("Limit monitor stop requested; agent sessions are unaffected.")
+        return 0
+    runtime.start_monitor(SCRIPT)
+    offset = 0
+    try:
+        while True:
+            print(runtime.describe_limits())
+            notices = runtime.STATE / "notifications.log"
+            if notices.exists():
+                with notices.open() as f:
+                    f.seek(offset)
+                    print(f.read(), end="")
+                    offset = f.tell()
+            if not args.watch:
+                return 0
+            time.sleep(5)
+    except KeyboardInterrupt:
+        return 0
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -586,11 +698,14 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
         prog="syndicate",
         usage="syndicate [-x claude|codex] [-C dir] [-p] [task] [extra CLI args...]",
         description="Run the orchestrator with the project's team. Other commands: "
-                    "init, status, run-role, setup-codex-gate, dashboard, web.",
+                    "init, status, run-role, setup-codex-gate, dashboard, web, limits.",
     )
     run.add_argument("-x", "--runtime", choices=CLIS, help="CLI hosting the orchestrator (overrides project config)")
     run.add_argument("-C", "--dir", default=".", help="project directory (default: current)")
     run.add_argument("-p", "--print", action="store_true", help="run headless and print the result")
+    run.add_argument("--reserve", type=float, help="handoff when this percentage of account usage remains (default: 10)")
+    run.add_argument("--handoff", dest="handoff_path", help="continue from a saved handoff directory")
+    run.add_argument("--all-runtime", choices=CLIS, help="use this CLI for every specialist in this run (combine with -x)")
     run.add_argument("rest", nargs=argparse.REMAINDER, help="the task, then any extra args for the CLI")
 
     sub = argparse.ArgumentParser(prog="syndicate")
@@ -604,6 +719,7 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
         p.set_defaults(fn=fn)
     p = cmds.add_parser("run-role", help="run one role headlessly on its configured CLI (used by relay agents)")
     p.add_argument("role")
+    p.add_argument("--runtime", choices=CLIS, help="use the runtime resolved by the parent session")
     p.add_argument("brief", help="the task, or - to read it from stdin")
     p.add_argument("-C", "--dir", default=".")
     p.set_defaults(fn=cmd_run_role)
@@ -617,13 +733,28 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p = cmds.add_parser("web", help="local browser dashboard (http://127.0.0.1:<port>/)")
     p.add_argument("--port", type=int, default=8765)
     p.set_defaults(fn=cmd_web)
+    p = cmds.add_parser("limits", help="show account limits and reset notifications; starts the background monitor")
+    p.add_argument("--watch", action="store_true", help="keep displaying limits and reset notices")
+    p.add_argument("--stop", action="store_true", help="stop the background monitor")
+    p.set_defaults(fn=cmd_limits)
     return run, sub
 
 
 def main(argv: list[str]) -> int:
+    if argv == ["_claude-usage"]:
+        try:
+            observation = runtime.save_observation("claude", json.load(sys.stdin))
+            state, remaining = runtime.availability(observation)
+            print(f"Syndicate: Claude {remaining:g}% account usage remaining" if remaining is not None else f"Syndicate: Claude usage {state}")
+            return 0
+        except (OSError, ValueError, TypeError, AttributeError):
+            print("Syndicate: Claude usage unknown")
+            return 0
+    if argv == ["_limits-monitor"]:
+        return runtime.monitor_forever()
     run, sub = build_parsers()
     try:
-        if argv and argv[0] in ("init", "status", "run-role", "setup-codex-gate", "dashboard", "web"):
+        if argv and argv[0] in ("init", "status", "run-role", "setup-codex-gate", "dashboard", "web", "limits"):
             args = sub.parse_args(argv)
             return args.fn(args)
         args = run.parse_args(argv)

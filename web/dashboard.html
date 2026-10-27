@@ -41,6 +41,7 @@
 </head>
 <body>
 <h1>syndicate &middot; dashboard</h1>
+<pre id="limits" style="white-space:pre-wrap" aria-live="polite"></pre>
 <div id="grid" class="grid"><p class="empty">loading&hellip;</p></div>
 <div id="updated"></div>
 <script>
@@ -77,6 +78,10 @@ async function tick() {
   } catch (e) {
     return; // keep showing the last good render rather than flash an error
   }
+  try {
+    const limits = await (await fetch("/api/limits", { cache: "no-store" })).json();
+    document.getElementById("limits").textContent = limits.summary;
+  } catch (e) { /* keep the last observation */ }
   const grid = document.getElementById("grid");
   grid.innerHTML = rows.length
     ? rows.map(card).join("")

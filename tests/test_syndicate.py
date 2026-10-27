@@ -110,7 +110,7 @@ class ConfigParsing(ProjectCase):
                 sy.resolve_team(self.project)
 
     def test_review_gate_off(self):
-        self.config("review-gate = off\n")
+        self.config("review-gate = off\nhandoff = off\n")
         self.assertFalse(sy.resolve_team(self.project).gate)
 
 
@@ -171,7 +171,7 @@ class LaunchCommands(ProjectCase):
         self.assertEqual(settings["permissions"]["allow"], [f"Bash({sy.SCRIPT} run-role *)"])
 
     def test_gate_off_removes_hook(self):
-        self.config("review-gate = off\n")
+        self.config("review-gate = off\nhandoff = off\n")
         argv = sy.build_claude(sy.resolve_team(self.project), False, [])
         self.assertNotIn("--settings", argv)
 
@@ -307,6 +307,7 @@ class StatusAndRegistry(ProjectCase):
         self.assertIn("reviewing", out)
 
     def test_cmd_run_registers_and_writes_stub_before_exec(self):
+        self.config("handoff = off\n")
         with unittest.mock.patch.object(sy, "require_clis"), \
              unittest.mock.patch.object(sy, "os") as mock_os, \
              unittest.mock.patch.object(sy.shutil, "which", return_value="/bin/true"):

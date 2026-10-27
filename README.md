@@ -99,6 +99,23 @@ into the project. Note that a Codex host with a Claude-backed role enables
 network access in Codex's sandbox for the session; see
 [`docs/configuration.md`](docs/configuration.md#mixed-cli-teams).
 
+## Usage-aware handoffs
+
+Syndicate monitors account usage and saves a handoff at **10% remaining** by
+default. It stops the managed team, then asks whether to continue with the
+other CLI. A confirmed switch moves every role for that run. The bundled
+handoff skill keeps a checkpoint so decisions and pending work survive.
+
+```sh
+syndicate --reserve 20 -C ~/code/some-project "your task"
+syndicate limits --watch
+```
+
+Unknown usage pauses work after a grace period. Claude telemetry depends on
+an interactive status line; headless Claude cannot supply it on its own.
+Read [Usage-aware handoffs](docs/handoff.md) for setup, recovery commands,
+provider limitations, and reset notifications.
+
 ## Monitoring
 
 Every run registers its project in `~/.syndicate/projects.json` and keeps

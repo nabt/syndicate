@@ -40,6 +40,8 @@ One `key = value` per line. `#` starts a comment.
 
 | Key | Values | Meaning |
 |---|---|---|
+| `handoff` | `on` \| `off` | Managed quota monitoring and automatic handoff (default `on`). |
+| `handoff-reserve` | number between 0 and 100, exclusive | Account usage remaining at which to stop (default `10`). |
 | `default` | `claude` \| `codex` | CLI for every role not listed individually. |
 | `orchestrator` | `claude` \| `codex` | CLI that **hosts the session**. Every other role is delegated to from here. |
 | `<role name>` | `claude` \| `codex` | CLI for that one role: any global role, or a project-only role you defined. |
@@ -179,3 +181,14 @@ Check `git status` first so you only remove files syndicate created.
   `.syndicate/roles/`. Check spelling with `status`.
 - Generated files are in `.syndicate/.generated/`: `claude-settings.json` and
   `codex/*.toml`. They are rewritten on every run, so edit the sources instead.
+
+## Usage-aware handoffs
+
+Managed runs inject the bundled handoff skill and maintain a durable checkpoint
+and session-output log. `--reserve` overrides `handoff-reserve` for one run.
+`--handoff <directory>` loads an interrupted task; pair `-x codex` with
+`--all-runtime codex` (or Claude equivalents) to move all roles together.
+
+Account observations and a single background reset monitor live under
+`~/.syndicate/limits/`. See [Usage-aware handoffs](handoff.md) for the lifecycle,
+telemetry limitations, notification behavior, and monitor shutdown command.
