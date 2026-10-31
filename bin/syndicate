@@ -539,39 +539,155 @@ def gather_statuses() -> list[dict]:
     return sorted(rows, key=lambda r: (priority[r["project_status"]], r["name"].lower(), r["path"]))
 
 
-def render_dashboard(rows: list[dict]) -> str:
-    lines = [f"syndicate dashboard  ({now_iso()})", ""]
+def dashboard_color(mode: str = "auto") -> bool:
+    return mode == "always" or (mode == "auto" and sys.stdout.isatty()
+                               and "NO_COLOR" not in os.environ
+                               and os.environ.get("TERM") != "dumb")
+
+
+def render_dashboard(rows: list[dict], *, width: int = 100, color: bool = False,
+                     details: bool = False) -> str:
+    import textwrap
+    width = max(24, width)
+
+    def clean(value):
+        # Task text must not inject terminal escape sequences or extra rows.
+        return re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(value or ""))
+
+    def paint(text, code):
+        return f"\x1b[{code}m{text}\x1b[0m" if color else text
+
+    def wrapped(text, indent=""):
+        return textwrap.wrap(clean(text), width=width, initial_indent=indent,
+                             subsequent_indent=indent) or [indent]
+
+    styles = {"Needs attention": ("!", "33"), "Working": (">", "36"),
+              "Queued": ("~", "35"), "Complete": ("+", "32"), "No tasks": ("-", "90")}
+
+    def status(row):
+        return row.get("project_status") or {"running": "Working", "done": "Complete",
+                "queued": "Queued"}.get(row.get("state"), "Needs attention")
+
+    def current(row):
+        return next(iter(row.get("tasks", [])), None) or row.get("last_completed") or (
+            row.get("current") if "tasks" not in row else {}) or {}
+
+    lines = [paint("SYNDICATE / PROJECTS", "1"), *wrapped(now_iso()), ""]
     if not rows:
-        lines.append("no registered projects — run 'syndicate init' (or any run) in a project first")
+        lines.extend(wrapped("no registered projects — run 'syndicate init' (or any run) in a project first"))
         return "\n".join(lines)
-    name_w = max(len(r["name"]) for r in rows)
-    for r in rows:
-        cur = next(iter(r.get("tasks", [])), None) or r.get("last_completed") or (r.get("current") if "tasks" not in r else {}) or {}
-        role = cur.get("role") or ""
-        if isinstance(role, list):
-            role = ", ".join(role)
-        summary = cur.get("summary") or ("(no status reported yet)" if r["state"] == "unknown" else "")
-        lines.append(f"[{r.get('project_status', r['state']):<15}] {r['name']:<{name_w}}  {role} {summary}  ({r.get('unfinished_count', 0)} unfinished)")
-        if r.get("path"):
-            lines.append(f"  {r['path']}")
-        for task in r.get("tasks", [])[1:]:
-            lines.append(f"  [{task.get('state', 'unknown')}] {task.get('summary', '')}")
+    counts = [f"{sum(status(r) == label for r in rows)} {label.lower()}" for label in styles]
+    lines.extend(wrapped(f"{len(rows)} projects | " + " | ".join(counts)))
+    lines.append("")
+    # Keep the overview compact; --details adds full paths and task text.
+    compact = width < 70
+    sizes = [max(5, width - 26), 17, 3] if compact else [min(24, max(12, width // 5)), 17, 5]
+    if not compact:
+        sizes.append(width - sum(sizes) - 9)
+
+    def table_row(cells, style=None):
+        parts = []
+        for i, (cell, size) in enumerate(zip(cells, sizes)):
+            text = clean(cell)
+            text = text if len(text) <= size else text[:size - 1] + "…"
+            text = text.ljust(size)
+            parts.append(paint(text, style) if i == 1 and style else text)
+        return " | ".join(parts)
+
+    if width >= 32:
+        lines.append(paint(table_row(["PROJECT", "STATUS", "OPEN"] + ([] if compact else ["CURRENT / LATEST TASK"])), "1"))
+        lines.append("-+-".join("-" * size for size in sizes))
+        for row in rows:
+            label = status(row)
+            icon, code = styles[label]
+            cells = [row["name"], f"{icon} {label}", str(row.get("unfinished_count", len(row.get("tasks", []))))]
+            if not compact:
+                cells.append(current(row).get("summary") or "No tasks reported")
+            lines.append(table_row(cells, code))
+        lines.append("")
+    if width < 32 and not details:
+        for row in rows:
+            icon, code = styles[status(row)]
+            lines.extend(paint(line, code) for line in wrapped(f"{icon} {row['name']} / {status(row)}"))
+        lines.append("")
+    if details:
+        for row in rows:
+            label = status(row)
+            icon, code = styles[label]
+            lines.extend(paint(line, "1;" + code) for line in wrapped(f"{icon} {row['name']} / {label}"))
+            if row.get("path"):
+                lines.extend(paint(line, "90") for line in wrapped(row["path"], "  "))
+            tasks = row.get("tasks") or ([current(row)] if current(row) else [])
+            for task in tasks:
+                prefix = "Last completed" if not row.get("tasks") and row.get("last_completed") else task.get("state", "Current")
+                lines.extend(wrapped(f"{prefix}: {task.get('summary') or 'No task details reported'}", "  "))
+                if task.get("progress") and task["progress"] != task.get("summary"):
+                    lines.extend(wrapped(task["progress"], "    "))
+                role = task.get("role")
+                if role:
+                    lines.extend(wrapped(", ".join(role) if isinstance(role, list) else role, "    "))
+            if not tasks:
+                lines.extend(wrapped("No tasks reported", "  "))
+            lines.append("")
+    lines.extend(wrapped("! needs attention   > working   ~ queued   + complete   - no tasks"))
     return "\n".join(lines)
+
+
+@contextmanager
+def dashboard_keyboard(enabled: bool):
+    """Read single keys while live, restoring terminal settings on every exit."""
+    if not enabled or not sys.stdin.isatty():
+        yield None
+        return
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    previous = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        yield fd
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+
+
+def dashboard_wait(interval: float, keyboard: int | None) -> bool:
+    """Return True when the user asks to quit, without waiting for a refresh."""
+    if keyboard is None:
+        time.sleep(interval)
+        return False
+    import select
+    deadline = time.monotonic() + interval
+    while True:
+        ready, _, _ = select.select([keyboard], [], [], max(0, deadline - time.monotonic()))
+        if not ready:
+            return False
+        key = os.read(keyboard, 1)
+        if key in (b"q", b"Q", b""):
+            return True
+        if time.monotonic() >= deadline:
+            return False
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
     try:
-        while True:
-            rows = gather_statuses()
-            if args.project:
-                selected = REGISTRY_PATH.parent / "generic-tasks" if args.project == "generic" else Path(args.project).expanduser().resolve()
-                rows = [r for r in rows if r["name"] == args.project or r["path"] == str(selected)]
-            if not args.once and not args.list:
-                print("\x1b[2J\x1b[H", end="")  # clear screen, home cursor
-            print("\n".join(f"{r['name']}  {r['path']}" for r in rows) if args.list else render_dashboard(rows))
-            if args.once or args.list:
-                return 0
-            time.sleep(args.interval)
+        with dashboard_keyboard(not args.once and not args.list and sys.stdout.isatty()) as keyboard:
+            while True:
+                rows = gather_statuses()
+                if args.project:
+                    selected = REGISTRY_PATH.parent / "generic-tasks" if args.project == "generic" else Path(args.project).expanduser().resolve()
+                    rows = [r for r in rows if r["name"] == args.project or r["path"] == str(selected)]
+                if not args.once and not args.list and sys.stdout.isatty() and os.environ.get("TERM") != "dumb":
+                    print("\x1b[2J\x1b[H", end="")  # clear screen, home cursor
+                print("\n".join(f"{r['name']}  {r['path']}" for r in rows) if args.list else render_dashboard(
+                    rows, width=shutil.get_terminal_size((100, 24)).columns,
+                    color=dashboard_color(getattr(args, "color", "auto")),
+                    details=getattr(args, "details", False)))
+                if args.once or args.list:
+                    return 0
+                if keyboard is not None:
+                    print("\nq quit · Ctrl-C quit", flush=True)
+                if dashboard_wait(args.interval, keyboard):
+                    return 0
     except KeyboardInterrupt:
         return 0
 
@@ -930,6 +1046,9 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p.add_argument("--once", action="store_true", help="render once and exit (for scripting)")
     p.add_argument("--project", help="show a project by exact name or repo path")
     p.add_argument("--list", action="store_true", help="list registered project names and paths")
+    p.add_argument("--color", choices=("auto", "always", "never"), default="auto",
+                   help="terminal colors (default: auto; respects NO_COLOR)")
+    p.add_argument("--details", action="store_true", help="show full project paths and task details")
     p.set_defaults(fn=cmd_dashboard)
     p = cmds.add_parser("web", help="local browser dashboard (http://127.0.0.1:<port>/)")
     p.add_argument("--port", type=int, default=8765)

@@ -1,4 +1,5 @@
 import argparse
+import io
 import http.client
 import http.server
 import importlib.machinery
@@ -439,10 +440,83 @@ class StatusAndRegistry(ProjectCase):
         self.assertIn("no registered projects", sy.render_dashboard([]))
         rows = [{"name": "proj", "state": "running",
                  "current": {"role": ["security-engineer", "code-reviewer"], "summary": "reviewing"}}]
-        out = sy.render_dashboard(rows)
+        out = sy.render_dashboard(rows, details=True)
         self.assertIn("proj", out)
         self.assertIn("security-engineer, code-reviewer", out)
         self.assertIn("reviewing", out)
+
+    def test_dashboard_width_color_and_task_details(self):
+        rows = [{"name": "a-very-long-project-name", "path": "/tmp/" + "long/" * 25,
+                 "project_status": "Needs attention", "unfinished_count": 2,
+                 "tasks": [{"state": "blocked", "summary": "First task " * 20,
+                            "progress": "Waiting for input"},
+                           {"state": "queued", "summary": "Second task"}]}]
+        for width in (24, 32, 40, 69, 70, 80, 120):
+            plain = sy.render_dashboard(rows, width=width, details=True)
+            self.assertTrue(all(len(line) <= width for line in plain.splitlines()), width)
+            self.assertNotIn("\x1b", plain)
+            self.assertIn("Second task", plain)
+        self.assertIn("\x1b[", sy.render_dashboard(rows, color=True))
+        rows[0]["tasks"][0]["summary"] = "unsafe\x1b[2J\ntext"
+        self.assertNotIn("\x1b", sy.render_dashboard(rows))
+
+    def test_dashboard_details_are_opt_in(self):
+        rows = [{"name": "proj", "path": "/tmp/project-path", "project_status": "Working",
+                 "tasks": [{"summary": "Main task", "progress": "Extended progress"},
+                           {"summary": "Extra task"}]}]
+        for enabled in (False, True):
+            args = sy.build_parsers()[1].parse_args(
+                ["dashboard", "--once"] + (["--details"] if enabled else []))
+            with unittest.mock.patch.object(sy, "gather_statuses", return_value=rows), \
+                 unittest.mock.patch("sys.stdout", new=io.StringIO()) as output:
+                sy.cmd_dashboard(args)
+            text = output.getvalue()
+            self.assertIn("proj", text)
+            for detail in ("/tmp/project-path", "Extended progress", "Extra task"):
+                self.assertEqual(detail in text, enabled)
+
+    def test_dashboard_quit_key_and_timeout(self):
+        import select
+        for key in (b"q", b"Q"):
+            with unittest.mock.patch.object(select, "select", return_value=([7], [], [])), \
+                 unittest.mock.patch.object(sy.os, "read", return_value=key):
+                self.assertTrue(sy.dashboard_wait(30, 7))
+        with unittest.mock.patch.object(select, "select", return_value=([], [], [])):
+            self.assertFalse(sy.dashboard_wait(0.01, 7))
+        with unittest.mock.patch.object(sy.time, "sleep") as sleep:
+            self.assertFalse(sy.dashboard_wait(2, None))
+            sleep.assert_called_once_with(2)
+
+    def test_dashboard_restores_terminal_on_exit(self):
+        import termios
+        import tty
+        for failure in (False, True):
+            with unittest.mock.patch.object(sy.sys, "stdin") as stdin, \
+                 unittest.mock.patch.object(termios, "tcgetattr", return_value=["original"]), \
+                 unittest.mock.patch.object(termios, "tcsetattr") as restore, \
+                 unittest.mock.patch.object(tty, "setcbreak") as cbreak:
+                stdin.isatty.return_value = True
+                stdin.fileno.return_value = 7
+                try:
+                    with sy.dashboard_keyboard(True) as fd:
+                        self.assertEqual(fd, 7)
+                        if failure:
+                            raise KeyboardInterrupt
+                except KeyboardInterrupt:
+                    pass
+                cbreak.assert_called_once_with(7)
+                restore.assert_called_once_with(7, termios.TCSADRAIN, ["original"])
+
+    def test_dashboard_color_policy(self):
+        with unittest.mock.patch.object(sy.sys.stdout, "isatty", return_value=True), \
+             unittest.mock.patch.dict(sy.os.environ, {"TERM": "xterm"}, clear=True):
+            self.assertTrue(sy.dashboard_color())
+            with unittest.mock.patch.dict(sy.os.environ, {"NO_COLOR": ""}):
+                self.assertFalse(sy.dashboard_color())
+                self.assertTrue(sy.dashboard_color("always"))
+            self.assertFalse(sy.dashboard_color("never"))
+        with unittest.mock.patch.object(sy.sys.stdout, "isatty", return_value=False):
+            self.assertFalse(sy.dashboard_color())
 
     def test_cmd_run_registers_and_writes_stub_before_exec(self):
         self.config("handoff = off\n")

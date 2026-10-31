@@ -125,14 +125,21 @@ a running history of past rounds. Two ways to watch it, across every
 registered project at once:
 
 ```sh
-# Console: refreshes every 2s, ctrl-c to stop. --once renders a single frame.
+# Console: refreshes every 2s, q or Ctrl-C to stop. --once renders a single frame.
 syndicate dashboard
 syndicate dashboard --project graphcue --once  # name or full repo path
 syndicate dashboard --list                    # registered repos and paths
+syndicate dashboard --details                 # include full paths and task details
+syndicate dashboard --once --color always     # force ANSI colors
 
 # Browser: starts a local server and prints the URL (http://127.0.0.1:8765/ by default)
 syndicate web
 ```
+
+The console dashboard shows a table of projects and status counts. Add
+`--details` to show full paths and task details below the overview. It adapts to terminal width and uses colored status
+indicators in supported terminals. Redirected output stays plain; `NO_COLOR`
+disables automatic color, and `--color auto|always|never` controls it explicitly.
 
 The browser dashboard shows a compact project overview with working and
 needs-attention counts, repo search, and All / Unfinished / Needs attention
