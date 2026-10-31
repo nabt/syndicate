@@ -19,10 +19,11 @@ the project is created or modified.
 `status.json` is written by `bin/syndicate` (an initial stub, before it launches
 the CLI) and then kept current by the orchestrator role itself as it works. It's
 how `syndicate dashboard`/`syndicate web` know what's happening — see the
-[README's Monitoring section](../README.md#monitoring). The one piece of state
-that lives outside the project entirely is `~/.syndicate/projects.json`, a
-user-wide registry of every project syndicate has touched, so the dashboard can
-find them all without you listing them.
+[README's Monitoring section](../README.md#monitoring). Shared state also lives under `~/.syndicate/`: `projects.json` discovers
+registered projects, `task-edits.json` stores task-management overrides, and
+`portfolio/` holds decisions, project briefs, ownership, team requests, and the
+isolated Chief of Staff workspace. See the [Chief of Staff guide](chief-of-staff.md)
+for its separate launch path; project role/runtime settings do not configure it.
 
 Run `syndicate init` inside a project to create `config` and `roles/` and the
 git exclusion. Every file below is optional: with no `.syndicate/` at all, the
@@ -192,3 +193,9 @@ and session-output log. `--reserve` overrides `handoff-reserve` for one run.
 Account observations and a single background reset monitor live under
 `~/.syndicate/limits/`. See [Usage-aware handoffs](handoff.md) for the lifecycle,
 telemetry limitations, notification behavior, and monitor shutdown command.
+
+Project Codex launches add `~/.syndicate/portfolio` as a writable directory so
+orchestrators can record shared decisions, briefs, and request receipts while
+keeping their project workspace sandbox. Claude orchestrators include Bash for
+these supported CLI workflows. Project role overrides that explicitly restrict
+tools must retain Bash when using coordination commands.

@@ -22,6 +22,13 @@ and framework the project uses.
 
 ## Roster
 
+The cross-project coordination layer is **Chief of Staff**. Its first
+phase provides cross-project briefings, shared decisions, durable project briefs,
+session ownership, and team requests; see the
+[role and delivery plan](docs/chief-of-staff.md). Project orchestrators retain
+ownership of delivery within their own repos. Launch the separate coordination
+agent with `syndicate chief-of-staff -x claude` or `-x codex`.
+
 | Role | File | Summary |
 |---|---|---|
 | Orchestrator (Tech Lead) | [`roles/orchestrator.md`](roles/orchestrator.md) | Plans a project, decides which roles it needs, delegates, and integrates the result. |
@@ -49,6 +56,9 @@ setup-codex-gate` once and approve the hook in Codex (see
 ## Use
 
 ```sh
+# Coordinate across projects (independent portfolio session)
+syndicate chief-of-staff -x codex
+
 # Run the orchestrator on a project (interactive)
 syndicate -C ~/code/some-project "add rate limiting to the public API"
 
@@ -129,6 +139,11 @@ registered project at once:
 syndicate dashboard
 syndicate dashboard --project graphcue --once  # name or full repo path
 syndicate dashboard --list                    # registered repos and paths
+syndicate briefing                            # cross-project briefing and decision inbox
+syndicate decisions list                      # questions and answers awaiting acknowledgment
+syndicate briefs show --project graphcue      # durable project context
+syndicate sessions                           # project session ownership
+syndicate requests list                      # pending and failed requests to teams
 syndicate dashboard --details                 # include full paths and task details
 syndicate dashboard --once --color always     # force ANSI colors
 

@@ -27,6 +27,9 @@ class ProjectCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.project = Path(self._tmp.name).resolve()
+        registry = unittest.mock.patch.object(sy, "REGISTRY_PATH", self.project / "registry" / "projects.json")
+        registry.start()
+        self.addCleanup(registry.stop)
         (self.project / ".syndicate" / "roles").mkdir(parents=True)
 
     def config(self, text):
@@ -175,6 +178,22 @@ class LaunchCommands(ProjectCase):
         self.config("review-gate = off\nhandoff = off\n")
         argv = sy.build_claude(sy.resolve_team(self.project), False, [])
         self.assertNotIn("--settings", argv)
+
+    def test_claude_orchestrator_can_run_portfolio_commands(self):
+        argv = sy.build_claude(sy.resolve_team(self.project), False, [])
+        agents = json.loads(argv[argv.index("--agents") + 1])
+        self.assertIn("Bash", agents["orchestrator"]["tools"])
+        self.assertIn("decisions acknowledge", agents["orchestrator"]["prompt"])
+
+    def test_project_codex_portfolio_root_is_writable_in_both_modes(self):
+        self.config("default = codex\n")
+        for headless in (False, True):
+            argv = sy.build_codex(sy.resolve_team(self.project), headless, ["task"])
+            roots = [argv[index + 1] for index, flag in enumerate(argv) if flag == "--add-dir"]
+            self.assertEqual(roots, [str(sy.REGISTRY_PATH.parent / "portfolio")])
+            self.assertTrue(Path(roots[0]).is_dir())
+            self.assertNotIn(str(sy.REGISTRY_PATH.parent), roots)
+            self.assertNotIn("danger-full-access", argv)
 
     def test_codex_host_with_claude_role_gets_a_relay(self):
         self.config("orchestrator = codex\ndefault = codex\ncode-reviewer = claude\n")
@@ -567,6 +586,47 @@ assert.ok($('content').innerHTML.includes('Unfinished tasks (1)'));
 assert.ok(!$('content').innerHTML.includes('Finished &lt;script&gt;'));
 location.hash='';$('filter').value='all';list=true;render();
 assert.ok(!$('content').innerHTML.includes('Current / latest task'));
+portfolioData={next_action:'Answer <question>',decisions:[{id:'abc',project_path:'/tmp/a',
+ question:'Question <script>',state:'answered',context:'Context <script>',options:['A','B'],
+ recommendation:'A',answer:'Use <A>',updated_at:'2026-01-01'}]};
+render();
+assert.ok($('briefing').innerHTML.includes('Awaiting team acknowledgment'));
+assert.ok($('briefing').innerHTML.includes('Question &lt;script&gt;'));
+assert.ok($('briefing').innerHTML.includes('Use &lt;A&gt;'));
+assert.ok(!$('briefing').innerHTML.includes('<script>'));
+location.hash='#'+encodeURIComponent('/tmp/other');render();
+assert.ok(!$('briefing').innerHTML.includes('Question &lt;script&gt;'));
+location.hash='';
+portfolioData.requests=[{id:'request',task_id:'task',project_path:'/tmp/a',message:'Please <review>',
+ state:'failed',delivery_state:'failed',note:'Needs <approval>',updated_at:'2026-01-01'}];
+portfolioData.sessions=[{id:'owner',task_id:'task',source_path:'/tmp/a',provider:'codex',pid:123,live:false}];
+portfolioData.projects=[{name:'repo',path:'/tmp/a',sessions:portfolioData.sessions,brief:{goal:'Ship <it>',priority:'high',
+ revision:1,constraints:['Offline'],decisions:[],dependencies:['Other <repo>'],next_steps:['Review'],updated_at:'2026-01-01'}}];
+render();
+assert.ok($('coordination').innerHTML.includes('Please &lt;review&gt;'));
+assert.ok($('coordination').innerHTML.includes('Needs &lt;approval&gt;'));
+assert.ok($('coordination').innerHTML.includes('Ship &lt;it&gt;'));
+assert.ok($('coordination').innerHTML.includes('Other &lt;repo&gt;'));
+assert.ok($('coordination').innerHTML.includes('inactive'));
+location.hash='#'+encodeURIComponent('/tmp/other');render();
+assert.ok(!$('coordination').innerHTML.includes('Please &lt;review&gt;'));
+// Reassigned projects can have one current task per source; attention order is not current ownership.
+location.hash='';list=false;
+rows=[{name:'grouped',path:'/assigned',project_status:'Needs attention',unfinished_count:2,history:[],tasks:[
+ {id:'same-id',source_path:'/old',is_current:true,state:'stale',summary:'Old source interrupted'},
+ {id:'same-id',source_path:'/live',is_current:true,state:'running',summary:'Live Codex task'}]}];
+portfolioData={next_action:'Review',decisions:[],requests:[],sessions:[],projects:[
+ {path:'/assigned',task_id:'same-id',source_path:'/live'}]};
+render();
+assert.ok($('content').innerHTML.includes('Live Codex task'));
+assert.ok(!$('content').innerHTML.includes('Old source interrupted'));
+assert.equal(currentTask(rows[0]).source_path,'/live');
+// If briefing data is unavailable, prefer running work among multiple reported-current tasks.
+portfolioData=null;render();
+assert.ok($('content').innerHTML.includes('Live Codex task'));
+
+
+
 """
         subprocess.run(["node"], input=harness + script + checks, text=True, check=True, capture_output=True)
 
@@ -589,6 +649,55 @@ assert.ok(!$('content').innerHTML.includes('Current / latest task'));
         self.assertEqual(resp.getheader("Content-Type"), "application/json")
         rows = json.loads(resp.read())
         self.assertEqual(rows[0]["current"]["summary"], "hello from the web test")
+        conn.close()
+
+    def test_briefing_endpoint_and_corrupt_inbox(self):
+        port = self._start_server()
+        source = str(self.project)
+        record = sy.decision_store().request(source_path=source, project_path=source,
+                    task_id="task", key="database", question="Which database?", options=["SQLite"])
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/api/briefing")
+        response = conn.getresponse()
+        self.assertEqual(response.status, 200)
+        data = json.loads(response.read())
+        self.assertEqual(data["decisions"][0]["id"], record["id"])
+        self.assertIn("Answer decision", data["next_action"])
+        conn.close()
+        sy.decision_store().path.write_text("corrupt")
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/api/briefing")
+        response = conn.getresponse()
+        self.assertEqual(response.status, 503)
+        self.assertIn("error", json.loads(response.read()))
+        conn.close()
+
+    def test_coordination_in_briefing_endpoint(self):
+        sy.register_project(self.project)
+        sy.write_status_stub(self.project, os.getpid(), "Project work")
+        task_id = json.loads(sy.status_path(self.project).read_text())["current"]["task_id"]
+        store = sy.coordination_store()
+        store.update_brief(str(self.project), {"goal": "Ship", "priority": "high"})
+        owner = store.start_session(str(self.project), task_id, "codex", os.getpid())
+        request = store.send_request(source_path=str(self.project), project_path=str(self.project),
+                                    task_id=task_id, key="review", message="Review release")
+        port = self._start_server()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/api/briefing")
+        response = conn.getresponse()
+        self.assertEqual(response.status, 200)
+        data = json.loads(response.read())
+        self.assertEqual(data["projects"][0]["brief"]["goal"], "Ship")
+        self.assertEqual(data["sessions"][0]["id"], owner["id"])
+        self.assertTrue(data["sessions"][0]["live"])
+        self.assertEqual(data["requests"][0]["id"], request["id"])
+        self.assertEqual(data["requests"][0]["delivery_state"], "awaiting_acknowledgment")
+        conn.close()
+        store.path.write_text("corrupt")
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/api/briefing")
+        response = conn.getresponse()
+        self.assertEqual(response.status, 503)
         conn.close()
 
     def test_limits_endpoint_starts_monitor_and_returns_latest_observation(self):

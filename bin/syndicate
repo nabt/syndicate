@@ -26,11 +26,13 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve()
 sys.path.insert(0, str(SCRIPT.parent))
 import syndicate_runtime as runtime
+import syndicate_portfolio as portfolio
 HOME_DIR = SCRIPT.parent.parent
 GLOBAL_ROLES = HOME_DIR / "roles"
 GATE_SCRIPT = HOME_DIR / "hooks" / "require-review.sh"
 WEB_DIR = HOME_DIR / "web"
 HANDOFF_SKILL = HOME_DIR / "skills" / "syndicate-handoff" / "SKILL.md"
+CHIEF_ROLE = HOME_DIR / "portfolio" / "chief-of-staff.md"
 PROJECT_SKILL = HOME_DIR / "skills" / "syndicate-project" / "SKILL.md"
 REGISTRY_PATH = Path.home() / ".syndicate" / "projects.json"
 CLIS = ("claude", "codex")
@@ -284,6 +286,7 @@ def build_claude(team: Team, headless: bool, rest: list[str]) -> list[str]:
 
 
 def build_codex(team: Team, headless: bool, rest: list[str]) -> list[str]:
+    (REGISTRY_PATH.parent / "portfolio").mkdir(parents=True, exist_ok=True, mode=0o700)
     gen = generated(team.project) / "codex"
     gen.mkdir(parents=True, exist_ok=True)
     keep: set[str] = set()
@@ -320,7 +323,8 @@ def build_codex(team: Team, headless: bool, rest: list[str]) -> list[str]:
         argv += ["exec", "-C", str(team.project), "-s", "workspace-write"]
     else:
         argv += ["-C", str(team.project)]
-    return argv + ["-c", f"developer_instructions={jstr(instructions)}"] + overrides + rest
+    return argv + ["--add-dir", str(REGISTRY_PATH.parent / "portfolio"),
+                   "-c", f"developer_instructions={jstr(instructions)}"] + overrides + rest
 
 
 def require_clis(clis: set[str]) -> None:
@@ -462,7 +466,9 @@ def project_tasks(status: dict) -> list[dict]:
     current = status.get("current") or {}
     if not isinstance(current, dict):
         current = {}
-    active = next((t for t in tasks if t.get("id") == current.get("task_id")), None)
+    for task in tasks:
+        task["is_current"] = task.get("id") == current.get("task_id")
+    active = next((t for t in tasks if t["is_current"]), None)
     if active is not None:
         active.update(state=status.get("state", active.get("state")),
                       progress=current.get("summary"), pid=status.get("pid"),
@@ -470,7 +476,7 @@ def project_tasks(status: dict) -> list[dict]:
         if active.get("state") in ("done", "completed") and not active.get("completed_at"):
             active["completed_at"] = active.get("updated_at")
     elif not tasks and current.get("summary"):
-        tasks.append({"id": "legacy", "summary": current["summary"],
+        tasks.append({"id": "legacy", "is_current": True, "summary": current["summary"],
                       "state": status.get("state", "unknown"), "pid": status.get("pid"),
                       "updated_at": status.get("_mtime")})
     return tasks
@@ -539,6 +545,353 @@ def gather_statuses() -> list[dict]:
     return sorted(rows, key=lambda r: (priority[r["project_status"]], r["name"].lower(), r["path"]))
 
 
+def decision_store():
+    return portfolio.DecisionStore(REGISTRY_PATH.parent / "portfolio")
+
+
+def coordination_store():
+    return portfolio.CoordinationStore(REGISTRY_PATH.parent / "portfolio")
+
+
+def project_briefing():
+    return portfolio.briefing(gather_statuses(), decision_store().read(), coordination_store().snapshot())
+
+
+def task_project(source, task_id):
+    for row in gather_statuses():
+        if any(t.get("id") == task_id and t.get("source_path") == str(source)
+               for t in row["tasks"] + row["completed_tasks"]):
+            return row["path"]
+    return str(source)
+
+
+def cmd_briefs(args):
+    store = coordination_store()
+    if args.action == "list":
+        records = list(store.read()["briefs"].values())
+    else:
+        project = str(resolve_project(args.project))
+        if args.action == "show":
+            records = [store.read()["briefs"].get(project)]
+            records = [record for record in records if record]
+        else:
+            changes = {}
+            for field in ("goal", "priority", *portfolio.BRIEF_LIST_FIELDS):
+                value = getattr(args, field, None)
+                if value is not None:
+                    changes[field] = value
+            for field in args.clear:
+                if field in changes:
+                    raise SyndicateError(f"Cannot set and clear {field} together")
+                changes[field] = [] if field in portfolio.BRIEF_LIST_FIELDS else None if field == "priority" else ""
+            records = [store.update_brief(project, changes, args.revision)]
+    if args.json or args.action == "update":
+        portfolio_print(json.dumps(records[0] if args.action != "list" and records else records, indent=2))
+    elif not records:
+        portfolio_print("No project brief recorded.")
+    else:
+        for brief in records:
+            portfolio_print(f"{brief['project_path']} / revision {brief['revision']} / priority {brief['priority'] or 'unset'}")
+            portfolio_print("  Goal: " + brief["goal"])
+            for field in portfolio.BRIEF_LIST_FIELDS:
+                for value in brief[field]:
+                    portfolio_print(f"  {field.replace('_', ' ').title()}: {value}")
+    return 0
+
+
+def cmd_sessions(args):
+    records = coordination_store().snapshot()["sessions"]
+    if args.project:
+        target = str(resolve_project(args.project))
+        records = [record for record in records if record["source_path"] == target
+                   or task_project(Path(record["source_path"]), record["task_id"]) == target]
+    if not args.all:
+        latest = {}
+        for record in records:
+            latest[record["source_path"]] = record
+        records = list(latest.values())
+    if args.json:
+        portfolio_print(json.dumps(records, indent=2))
+    else:
+        for record in records:
+            portfolio_print(f"{record['id']} [{('active' if record['live'] else 'inactive')}] {record['provider']} / PID {record['pid']}")
+            portfolio_print(f"  {record['source_path']} / task {record['task_id']}")
+        if not records:
+            portfolio_print("No sessions recorded.")
+    return 0
+
+
+def cmd_requests(args):
+    store = coordination_store()
+    if args.action == "list":
+        records = store.snapshot()["requests"]
+        if not args.all:
+            records = [r for r in records if r["state"] in ("queued", "failed")]
+        if args.project:
+            project = str(resolve_project(args.project))
+            records = [r for r in records if r["project_path"] == project]
+        if args.dir:
+            source = Path(args.dir).expanduser().resolve()
+            source = Path(git(source, "rev-parse", "--show-toplevel") or source).resolve()
+            records = [r for r in records if r["source_path"] == str(source)]
+        if args.task:
+            records = [r for r in records if r["task_id"] == args.task]
+        if args.json:
+            portfolio_print(json.dumps(records, indent=2))
+        else:
+            for record in records:
+                portfolio_print(f"{record['id']} [{record['delivery_state']}] {Path(record['project_path']).name}: {record['message']}")
+                if record.get("reason") or record.get("note"):
+                    portfolio_print("  " + (record.get("reason") or record["note"]))
+            if not records:
+                portfolio_print("No requests.")
+        return 0
+    if args.action == "send":
+        source, task_id = decision_owner(args)
+        result = store.send_request(source_path=str(source), project_path=task_project(source, task_id),
+                                    task_id=task_id, key=args.key, message=args.message)
+    elif args.action == "retry":
+        result = store.retry_request(args.request_id)
+    elif args.action == "cancel":
+        result = store.transition_request(args.request_id, "cancel")
+    else:
+        source, task_id = decision_owner(args)
+        result = store.transition_request(args.request_id, args.action, source_path=str(source),
+                                          task_id=task_id, session_id=args.session, note=args.note)
+    portfolio_print(json.dumps(result, indent=2))
+    return 0
+
+
+@contextmanager
+def project_session(project, provider):
+    status = read_status(str(project)) or {}
+    task_id = (status.get("current") or {}).get("task_id")
+    if not task_id:
+        yield None
+        return
+    store = coordination_store()
+    session = store.start_session(str(project), task_id, provider, os.getpid())
+    try:
+        status["current"]["session_id"] = session["id"]
+        for task in status.get("tasks", []):
+            if task.get("id") == task_id:
+                task.update(provider=provider, session_id=session["id"])
+        status.pop("_mtime", None)
+        runtime.atomic_json(status_path(project), status)
+        yield session
+    finally:
+        store.end_session(session["id"])
+
+
+def chief_instructions(workspace):
+    _, body = split_frontmatter(CHIEF_ROLE.read_text())
+    prefix = shlex.join([sys.executable, str(SCRIPT)])
+    return (body.strip() + f"\n\n## Launch context\nPortfolio workspace: {workspace}\n"
+            f"Portfolio store: {REGISTRY_PATH.parent / 'portfolio'}\n"
+            f"Use this exact executable prefix for every Syndicate command: {prefix}\n"
+            "This is a portfolio session, not a project orchestrator or specialist.\n")
+
+
+def build_chief_of_staff(provider, workspace, headless, task):
+    instructions = chief_instructions(workspace)
+    if provider == "claude":
+        agent = dict(description="Chief of Staff for cross-project coordination", prompt=instructions,
+                     tools=["Read", "Bash"])
+        settings = {"statusLine": {"type": "command", "command":
+                    shlex.join([sys.executable, str(SCRIPT), "_claude-usage"])}}
+        argv = ["claude", "--agent", "chief-of-staff", "--agents", json.dumps({"chief-of-staff": agent}),
+                "--tools", "Read,Bash", "--settings", json.dumps(settings)]
+        if headless:
+            argv.append("-p")
+    else:
+        argv = ["codex"] + (["exec", "--skip-git-repo-check"] if headless else [])
+        argv += ["-C", str(workspace), "-s", "workspace-write", "--add-dir", str(REGISTRY_PATH.parent / "portfolio"),
+                 "--disable", "multi_agent", "--disable", "multi_agent_v2",
+                 "-c", "sandbox_workspace_write.network_access=false",
+                 "-c", f"developer_instructions={jstr(instructions)}"]
+    return argv + ["--", task]
+
+
+def cmd_chief_of_staff(args):
+    import fcntl
+    import math
+    if not math.isfinite(args.reserve) or not 0 < args.reserve < 100:
+        raise SyndicateError("reserve must be between 0 and 100 (exclusive)")
+    workspace = REGISTRY_PATH.parent / "portfolio" / "workspace"
+    snapshot = None
+    snapshot_status = {}
+    if args.handoff_path:
+        snapshot = Path(args.handoff_path).expanduser().resolve()
+        snapshot_status = runtime.read_json(snapshot / "status.json")
+        current = snapshot_status.get("current")
+        if (not (snapshot / "handoff.md").is_file() or not (snapshot / "checkpoint.md").is_file()
+                or not isinstance(current, dict) or current.get("role") != "chief-of-staff"
+                or snapshot_status.get("provider") not in CLIS):
+            raise SyndicateError("Not a Chief of Staff handoff with a checkpoint and valid status")
+    provider = args.runtime or snapshot_status.get("provider") or os.environ.get("SYNDICATE_RUNTIME") or "claude"
+    if provider not in CLIS:
+        raise SyndicateError("Chief of Staff runtime must be claude or codex")
+    task = args.task or ("Give a concise current cross-project briefing and recommend the next action."
+                         if args.print else "Open the Chief of Staff session. Refresh portfolio context and give a short greeting with the next useful action.")
+    if snapshot:
+        task += (f"\nContinue the Chief of Staff handoff at {snapshot}. Read its handoff.md, checkpoint.md and status.json, "
+                 "then reconcile with fresh portfolio records. Preserve unresolved user requests. No project worktree belongs to this session.")
+    argv = build_chief_of_staff(provider, workspace, args.print, task)
+    if args.dry_run:
+        print(json.dumps(dict(provider=provider, cwd=str(workspace), argv=argv), indent=2))
+        return 0
+    require_clis({provider})
+    workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (workspace.parent / "chief-of-staff.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SyndicateError("another Chief of Staff session is already running")
+        local = workspace / LOCAL
+        local.mkdir(parents=True, exist_ok=True, mode=0o700)
+        status_file = local / "status.json"
+        previous = runtime.read_json(status_file)
+        session_id = uuid.uuid4().hex
+        history = previous.get("history") if isinstance(previous.get("history"), list) else []
+        status = dict(pid=os.getpid(), provider=provider, state="running", session_id=session_id,
+                      current=dict(role="chief-of-staff", round=None, summary=task),
+                      history=history[-200:])
+        runtime.atomic_json(status_file, status)
+        checkpoint = local / "checkpoint.md"
+        if not checkpoint.exists():
+            checkpoint.write_text("Chief of Staff session. Read fresh portfolio records; no prior coordination checkpoint is available.\n")
+        try:
+            runtime.start_monitor(SCRIPT)
+            print(f"syndicate: Chief of Staff on {provider}; monitoring at {args.reserve:g}% reserve.", file=sys.stderr)
+            result, handoff = runtime.supervise(argv, workspace, {provider}, args.reserve, task, provider,
+                                                headless=args.print)
+            final = runtime.read_json(status_file) or status
+            if not isinstance(final.get("current"), dict):
+                final["current"] = dict(status["current"])
+            final["current"]["role"] = "chief-of-staff"
+            if handoff is not None:
+                final["state"] = "waiting_on_user"
+                runtime.atomic_json(status_file, final)
+                print(f"Chief of Staff stopped. Handoff saved: {handoff}")
+                print("Resume with 'syndicate chief-of-staff --handoff PATH'; use -x only when choosing a provider.")
+                return 75
+            if result != 0:
+                final["state"] = "failed"
+            elif final.get("state") == "running":
+                final["state"] = "done"
+            runtime.atomic_json(status_file, final)
+            return result
+        except BaseException:
+            final = runtime.read_json(status_file) or status
+            final["state"] = "failed"
+            runtime.atomic_json(status_file, final)
+            raise
+
+
+def decision_owner(args):
+    source = Path(args.dir).expanduser().resolve()
+    root = git(source, "rev-parse", "--show-toplevel")
+    source = Path(root).resolve() if root else source
+    status = read_status(str(source)) or {}
+    task_id = args.task or (status.get("current") or {}).get("task_id")
+    task = next((t for t in project_tasks(status) if t.get("id") == task_id), None)
+    if task is None:
+        raise SyndicateError("Owning task not found; supply -C and --task for its source status file")
+    return source, task_id
+
+
+def portfolio_print(text):
+    # Human-facing records can contain text supplied by a project or requester.
+    print(re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", " ", str(text)))
+
+
+def cmd_decisions(args):
+    store = decision_store()
+    if args.action == "list":
+        records = store.read()
+        if not args.all:
+            records = portfolio.pending(records)
+        if args.project:
+            target = str(resolve_project(args.project))
+            records = [d for d in records if d["project_path"] == target]
+        if args.json:
+            portfolio_print(json.dumps(records, indent=2))
+        else:
+            for d in records:
+                portfolio_print(f"{d['id']} [{d['state']}] {Path(d['project_path']).name}: {d['question']}")
+                for field in ("context", "recommendation", "deadline"):
+                    if d.get(field):
+                        portfolio_print(f"  {field.title()}: {d[field]}")
+                if d.get("options"):
+                    portfolio_print("  Options: " + " | ".join(d["options"]))
+                if d.get("blocking"):
+                    portfolio_print("  Blocks work")
+                if d.get("answer"):
+                    portfolio_print(f"  Answer revision: {d['answer_revision']}")
+                    portfolio_print(f"  Answer (awaiting acknowledgment): {d['answer']}" if d['state'] == 'answered'
+                          else f"  Answer: {d['answer']}")
+            if not records:
+                portfolio_print("No decisions.")
+        return 0
+    if args.action == "request":
+        source, task_id = decision_owner(args)
+        target = source
+        # Respect dashboard assignments without changing the task's source identity.
+        for row in gather_statuses():
+            if any(t.get("id") == task_id and t.get("source_path") == str(source)
+                   for t in row["tasks"] + row["completed_tasks"]):
+                target = Path(row["path"])
+        result = store.request(source_path=str(source), project_path=str(target), task_id=task_id,
+                               key=args.key, question=args.question, context=args.context,
+                               options=args.option, recommendation=args.recommendation,
+                               blocking=args.blocking, deadline=args.deadline)
+    elif args.action == "acknowledge":
+        source, task_id = decision_owner(args)
+        result = store.transition(args.decision_id, args.action, source_path=str(source), task_id=task_id,
+                                  answer_revision=args.answer_revision)
+    else:
+        result = store.transition(args.decision_id, args.action, answer=getattr(args, "answer", None))
+    portfolio_print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_briefing(args):
+    data = project_briefing()
+    if args.json:
+        portfolio_print(json.dumps(data, indent=2))
+        return 0
+    portfolio_print("CHIEF OF STAFF / BRIEFING\n")
+    portfolio_print(data["next_action"] + "\n")
+    for project in data["projects"]:
+        portfolio_print(f"{project['name']} [{project['status']}] / {project['provider']} / report: {project['report_state']}")
+        portfolio_print(f"  {project['progress'] or project['task'] or 'No task reported'}")
+        portfolio_print(f"  Updated: {project['updated_at'] or 'unknown'}")
+        if project.get("brief"):
+            brief = project["brief"]
+            portfolio_print(f"  Goal: {brief['goal']} / priority: {brief['priority'] or 'unset'} / revision: {brief['revision']}")
+            for field in portfolio.BRIEF_LIST_FIELDS:
+                for value in brief[field]:
+                    portfolio_print(f"  {field.replace('_', ' ').title()}: {value}")
+        for session in project.get("sessions", [])[-1:]:
+            portfolio_print(f"  Session: {session['id']} / {'active' if session['live'] else 'inactive'}")
+    portfolio_print("\nDECISION INBOX")
+    for decision in data["decisions"]:
+        portfolio_print(f"{decision['id']} [{decision['state']}] {Path(decision['project_path']).name}: {decision['question']}")
+        for field in ("context", "recommendation", "answer"):
+            if decision.get(field):
+                portfolio_print(f"  {field.title()}: {decision[field]}")
+    if not data["decisions"]:
+        portfolio_print("No pending decisions.")
+    portfolio_print("\nTEAM REQUESTS")
+    for request in data["requests"]:
+        portfolio_print(f"{request['id']} [{request['delivery_state']}] {Path(request['project_path']).name}: {request['message']}")
+        if request.get("reason"):
+            portfolio_print("  " + request["reason"])
+    if not data["requests"]:
+        portfolio_print("No pending or failed requests.")
+    return 0
+
+
 def dashboard_color(mode: str = "auto") -> bool:
     return mode == "always" or (mode == "auto" and sys.stdout.isatty()
                                and "NO_COLOR" not in os.environ
@@ -546,7 +899,8 @@ def dashboard_color(mode: str = "auto") -> bool:
 
 
 def render_dashboard(rows: list[dict], *, width: int = 100, color: bool = False,
-                     details: bool = False) -> str:
+                     details: bool = False, decisions: list[dict] | None = None,
+                     coordination: dict | None = None) -> str:
     import textwrap
     width = max(24, width)
 
@@ -569,10 +923,34 @@ def render_dashboard(rows: list[dict], *, width: int = 100, color: bool = False,
                 "queued": "Queued"}.get(row.get("state"), "Needs attention")
 
     def current(row):
-        return next(iter(row.get("tasks", [])), None) or row.get("last_completed") or (
-            row.get("current") if "tasks" not in row else {}) or {}
+        return portfolio.current_task(row, coordination.get("sessions", []) if coordination else [])
 
     lines = [paint("SYNDICATE / PROJECTS", "1"), *wrapped(now_iso()), ""]
+    coordination = coordination or dict(briefs={}, sessions=[], requests=[])
+    inbox = portfolio.pending(decisions or [])
+    if inbox:
+        lines.append(paint("DECISION INBOX", "1;33"))
+        for decision in inbox:
+            owner = Path(decision["project_path"]).name
+            state = "answer needed" if decision["state"] == "open" else "awaiting team acknowledgment"
+            lines.extend(wrapped(f"{owner} / {state}"))
+            lines.extend(wrapped(f"{decision['id']}: {decision['question']}", "  "))
+            if details:
+                if decision.get("options"):
+                    lines.extend(wrapped("Options: " + " | ".join(decision["options"]), "  "))
+                for field in ("context", "recommendation", "answer", "deadline"):
+                    if decision.get(field):
+                        lines.extend(wrapped(f"{field.title()}: {decision[field]}", "  "))
+        lines.append("")
+    requests = [r for r in coordination["requests"] if r["state"] in ("queued", "failed")]
+    if requests:
+        lines.append(paint("TEAM REQUESTS", "1;36"))
+        for request in requests:
+            lines.extend(wrapped(f"{Path(request['project_path']).name} / {request['delivery_state']}"))
+            lines.extend(wrapped(f"{request['id']}: {request['message']}", "  "))
+            if request.get("reason") or request.get("note"):
+                lines.extend(wrapped(request.get("reason") or request["note"], "  "))
+        lines.append("")
     if not rows:
         lines.extend(wrapped("no registered projects — run 'syndicate init' (or any run) in a project first"))
         return "\n".join(lines)
@@ -617,6 +995,17 @@ def render_dashboard(rows: list[dict], *, width: int = 100, color: bool = False,
             lines.extend(paint(line, "1;" + code) for line in wrapped(f"{icon} {row['name']} / {label}"))
             if row.get("path"):
                 lines.extend(paint(line, "90") for line in wrapped(row["path"], "  "))
+            brief = coordination["briefs"].get(row.get("path"))
+            if brief:
+                lines.extend(wrapped(f"Goal: {brief['goal']} / priority: {brief['priority'] or 'unset'} / revision: {brief['revision']}", "  "))
+                for field in portfolio.BRIEF_LIST_FIELDS:
+                    for value in brief[field]:
+                        lines.extend(wrapped(f"{field.replace('_', ' ').title()}: {value}", "  "))
+            for session in coordination["sessions"]:
+                if session["source_path"] == row.get("path"):
+                    lines.extend(wrapped(f"Session: {session['id']} / {'active' if session['live'] else 'inactive'} / {session['provider']}", "  "))
+            report = current(row)
+            lines.extend(wrapped(f"Provider: {report.get('provider') or 'unknown'} / report: {report.get('state') or row.get('state', 'unknown')} / updated: {report.get('updated_at') or row.get('updated_at') or 'unknown'}", "  "))
             tasks = row.get("tasks") or ([current(row)] if current(row) else [])
             for task in tasks:
                 prefix = "Last completed" if not row.get("tasks") and row.get("last_completed") else task.get("state", "Current")
@@ -676,12 +1065,18 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                 if args.project:
                     selected = REGISTRY_PATH.parent / "generic-tasks" if args.project == "generic" else Path(args.project).expanduser().resolve()
                     rows = [r for r in rows if r["name"] == args.project or r["path"] == str(selected)]
+                decisions = [] if args.list else decision_store().read()
+                coordination = dict(briefs={}, sessions=[], requests=[]) if args.list else coordination_store().snapshot()
+                if args.project:
+                    paths = {row["path"] for row in rows}
+                    decisions = [d for d in decisions if d["project_path"] in paths]
+                    coordination["requests"] = [r for r in coordination["requests"] if r["project_path"] in paths]
                 if not args.once and not args.list and sys.stdout.isatty() and os.environ.get("TERM") != "dumb":
                     print("\x1b[2J\x1b[H", end="")  # clear screen, home cursor
                 print("\n".join(f"{r['name']}  {r['path']}" for r in rows) if args.list else render_dashboard(
                     rows, width=shutil.get_terminal_size((100, 24)).columns,
                     color=dashboard_color(getattr(args, "color", "auto")),
-                    details=getattr(args, "details", False)))
+                    details=getattr(args, "details", False), decisions=decisions, coordination=coordination))
                 if args.once or args.list:
                     return 0
                 if keyboard is not None:
@@ -704,6 +1099,19 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             body = json.dumps({"summary": runtime.describe_limits(),
                                "monitor": runtime.read_json(runtime.STATE / "monitor.json")}).encode()
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/briefing":
+            try:
+                body = json.dumps(project_briefing()).encode()
+                code = 200
+            except portfolio.PortfolioError as error:
+                body = json.dumps({"error": str(error)}).encode()
+                code = 503
+            self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
@@ -765,6 +1173,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SyndicateError("another Syndicate orchestrator already owns this project")
+        if any(session["source_path"] == str(project) and session["live"]
+               for session in coordination_store().snapshot()["sessions"]):
+            raise SyndicateError("another active session already owns this project")
         prior = read_status(str(project)) or {}
         resume = getattr(args, "handoff_path", None)
         snapshot = runtime.read_json(Path(resume) / "status.json") if resume else {}
@@ -814,43 +1225,48 @@ def run_session(args: argparse.Namespace) -> int | None:
     for w in team.warnings:
         print(f"syndicate: {w}", file=sys.stderr)
     require_clis({r.cli for r in team.roles.values()})
-    status = read_status(str(project)) or {}
-    if status:
-        status.update(state="running", pid=os.getpid())
-        status.pop("_mtime", None)
-        runtime.atomic_json(status_path(project), status)
-    note = ensure_excluded(project)
-    if note:
-        print(f"syndicate: {note}", file=sys.stderr)
-    build = build_claude if team.host == "claude" else build_codex
-    argv = build(team, args.print, args.rest)
-    if team.host == "claude" and args.print:
-        # Headless Claude gives up on still-running subagents after 600s; a team run is longer.
-        os.environ.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "0")
-    if team.config["handoff"] == "off":
-        os.chdir(project)
-        os.execvp(argv[0], argv)
-    runtime.start_monitor(SCRIPT)
-    providers = {r.cli for r in team.roles.values()}
-    task = args.rest[0] if args.rest else "Interactive session; see checkpoint and session output for requests."
-    print(f"syndicate: monitoring account limits; handoff at {reserve:g}% remaining. "
-          "Unavailable telemetry pauses work after 60s.", file=sys.stderr)
-    result, handoff = runtime.supervise(argv, project, providers, reserve, task, team.host, headless=args.print)
-    if handoff is None:
-        return result
-    print(f"\nHandoff: {handoff}")
-    target = runtime.choose_target(team.host, not args.print and sys.stdin.isatty())
-    if target is None:
-        return 75  # resumable temporary interruption; not successful completion
-    require_clis({target})
-    state, remaining = runtime.availability(runtime.read_json(runtime.STATE / f"{target}.json"))
-    if remaining is not None and remaining <= reserve:
-        print(f"syndicate: {target} also has only {remaining:g}% remaining; leaving work stopped.", file=sys.stderr)
-        return 75
-    args.runtime = target
-    args.all_runtime = target
-    args.handoff_path = str(handoff)
-    return None  # cmd_run retains the project lock while starting the confirmed target
+    with project_session(project, team.host):
+        status = read_status(str(project)) or {}
+        if status:
+            status.update(state="running", pid=os.getpid())
+            task_id = (status.get("current") or {}).get("task_id")
+            for task in status.get("tasks", []):
+                if task.get("id") == task_id:
+                    task["provider"] = team.host
+            status.pop("_mtime", None)
+            runtime.atomic_json(status_path(project), status)
+        note = ensure_excluded(project)
+        if note:
+            print(f"syndicate: {note}", file=sys.stderr)
+        build = build_claude if team.host == "claude" else build_codex
+        argv = build(team, args.print, args.rest)
+        if team.host == "claude" and args.print:
+            # Headless Claude gives up on still-running subagents after 600s; a team run is longer.
+            os.environ.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "0")
+        if team.config["handoff"] == "off":
+            os.chdir(project)
+            os.execvp(argv[0], argv)
+        runtime.start_monitor(SCRIPT)
+        providers = {r.cli for r in team.roles.values()}
+        task = args.rest[0] if args.rest else "Interactive session; see checkpoint and session output for requests."
+        print(f"syndicate: monitoring account limits; handoff at {reserve:g}% remaining. "
+              "Unavailable telemetry pauses work after 60s.", file=sys.stderr)
+        result, handoff = runtime.supervise(argv, project, providers, reserve, task, team.host, headless=args.print)
+        if handoff is None:
+            return result
+        print(f"\nHandoff: {handoff}")
+        target = runtime.choose_target(team.host, not args.print and sys.stdin.isatty())
+        if target is None:
+            return 75  # resumable temporary interruption; not successful completion
+        require_clis({target})
+        state, remaining = runtime.availability(runtime.read_json(runtime.STATE / f"{target}.json"))
+        if remaining is not None and remaining <= reserve:
+            print(f"syndicate: {target} also has only {remaining:g}% remaining; leaving work stopped.", file=sys.stderr)
+            return 75
+        args.runtime = target
+        args.all_runtime = target
+        args.handoff_path = str(handoff)
+        return None  # cmd_run retains the project lock while starting the confirmed target
 
 
 def cmd_run_role(args: argparse.Namespace) -> int:
@@ -999,7 +1415,7 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
         prog="syndicate",
         usage="syndicate [-x claude|codex] [-C dir] [--project repo|generic] [-p] [task] [extra CLI args...]",
         description="Run the orchestrator with the project's team. Other commands: "
-                    "init, status, run-role, setup-codex-gate, dashboard, web, limits, tasks.",
+                    "init, status, run-role, setup-codex-gate, dashboard, web, limits, tasks, decisions, briefing, briefs, sessions, requests, chief-of-staff.",
     )
     run.add_argument("-x", "--runtime", choices=CLIS, help="CLI hosting the orchestrator (overrides project config)")
     run.add_argument("-C", "--dir", default=".", help="project directory (default: current)")
@@ -1012,6 +1428,92 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
 
     sub = argparse.ArgumentParser(prog="syndicate")
     cmds = sub.add_subparsers(dest="cmd", required=True)
+    p = cmds.add_parser("chief-of-staff", help="run the cross-project Chief of Staff separately from project teams")
+    p.add_argument("-x", "--runtime", choices=CLIS)
+    p.add_argument("-p", "--print", action="store_true", help="run headless and print the result")
+    p.add_argument("--reserve", type=float, default=10, help="account usage reserve percentage (default: 10)")
+    p.add_argument("--handoff", dest="handoff_path", help="resume a saved Chief of Staff handoff")
+    p.add_argument("--dry-run", action="store_true", help="print launch arguments without starting a CLI or writing state")
+    p.add_argument("task", nargs="?")
+    p.set_defaults(fn=cmd_chief_of_staff)
+    p = cmds.add_parser("briefs", help="durable project goals, priorities and context")
+    actions = p.add_subparsers(dest="action", required=True)
+    for action in ("list", "show", "update"):
+        command = actions.add_parser(action)
+        command.add_argument("--json", action="store_true")
+        if action != "list":
+            command.add_argument("--project", required=True)
+        if action == "update":
+            command.add_argument("--goal")
+            command.add_argument("--priority", choices=("low", "normal", "high", "critical"))
+            for flag, field in (("constraint", "constraints"), ("decision", "decisions"),
+                                ("dependency", "dependencies"), ("next-step", "next_steps")):
+                command.add_argument("--" + flag, dest=field, action="append")
+            command.add_argument("--clear", action="append", default=[],
+                                 choices=("goal", "priority", *portfolio.BRIEF_LIST_FIELDS))
+            command.add_argument("--revision", type=int, help="require this brief revision (0 for new)")
+        command.set_defaults(fn=cmd_briefs)
+    p = cmds.add_parser("sessions", help="inspect project orchestrator ownership")
+    p.add_argument("--project")
+    p.add_argument("--all", action="store_true", help="include earlier sessions")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_sessions)
+    p = cmds.add_parser("requests", help="durable task-scoped requests to project orchestrators")
+    actions = p.add_subparsers(dest="action", required=True)
+    listing = actions.add_parser("list")
+    listing.add_argument("--project")
+    listing.add_argument("-C", "--dir")
+    listing.add_argument("--task")
+    listing.add_argument("--all", action="store_true")
+    listing.add_argument("--json", action="store_true")
+    listing.set_defaults(fn=cmd_requests)
+    send = actions.add_parser("send")
+    send.add_argument("message")
+    send.add_argument("--key", required=True)
+    send.add_argument("-C", "--dir", default=".")
+    send.add_argument("--task")
+    send.set_defaults(fn=cmd_requests)
+    for action in ("acknowledge", "fail", "cancel", "retry"):
+        command = actions.add_parser(action)
+        command.add_argument("request_id")
+        if action not in ("cancel", "retry"):
+            command.add_argument("-C", "--dir", default=".")
+            command.add_argument("--task")
+            command.add_argument("--session", required=True, help="owning session token from launch status")
+            command.add_argument("--note", required=True)
+        command.set_defaults(fn=cmd_requests)
+    p = cmds.add_parser("briefing", help="Chief of Staff cross-project briefing")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_briefing)
+    p = cmds.add_parser("decisions", help="shared cross-project decision inbox")
+    actions = p.add_subparsers(dest="action", required=True)
+    listing = actions.add_parser("list")
+    listing.add_argument("--all", action="store_true", help="include resolved and withdrawn decisions")
+    listing.add_argument("--project")
+    listing.add_argument("--json", action="store_true")
+    listing.set_defaults(fn=cmd_decisions)
+    request = actions.add_parser("request")
+    request.add_argument("question")
+    request.add_argument("--key", required=True, help="stable question key within the owning task")
+    request.add_argument("-C", "--dir", default=".")
+    request.add_argument("--task", help="owning task ID; defaults to current task")
+    request.add_argument("--context", default="")
+    request.add_argument("--option", action="append", default=[])
+    request.add_argument("--recommendation", default="")
+    request.add_argument("--blocking", action="store_true")
+    request.add_argument("--deadline", help="explicit deadline, if supplied by the requester")
+    request.set_defaults(fn=cmd_decisions)
+    for action in ("answer", "acknowledge", "withdraw"):
+        command = actions.add_parser(action)
+        command.add_argument("decision_id")
+        if action == "answer":
+            command.add_argument("answer")
+        if action == "acknowledge":
+            command.add_argument("-C", "--dir", default=".")
+            command.add_argument("--task", help="owning task ID; defaults to current task")
+            command.add_argument("--answer-revision", type=int, required=True,
+                                 help="answer_revision incorporated by the owning team")
+        command.set_defaults(fn=cmd_decisions)
     p = cmds.add_parser("tasks", help="list and edit project task assignments")
     actions = p.add_subparsers(dest="action", required=True)
     listing = actions.add_parser("list")
@@ -1074,13 +1576,13 @@ def main(argv: list[str]) -> int:
         return runtime.monitor_forever()
     run, sub = build_parsers()
     try:
-        if argv and argv[0] in ("init", "status", "run-role", "setup-codex-gate", "dashboard", "web", "limits", "tasks"):
+        if argv and argv[0] in ("init", "status", "run-role", "setup-codex-gate", "dashboard", "web", "limits", "tasks", "decisions", "briefing", "briefs", "sessions", "requests", "chief-of-staff"):
             args = sub.parse_args(argv)
             return args.fn(args)
         args = run.parse_args(argv)
         args.fn = cmd_run
         return cmd_run(args)
-    except SyndicateError as e:
+    except (SyndicateError, portfolio.PortfolioError) as e:
         print(f"syndicate: {e}", file=sys.stderr)
         return 1
 

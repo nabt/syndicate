@@ -10,27 +10,57 @@
 <p id="counts" aria-live="polite"></p>
 <div class="controls"><input id="search" type="search" aria-label="Search projects" placeholder="Search repos or paths…"><select id="filter" aria-label="Filter projects"><option value="all">All projects</option><option value="unfinished">Unfinished</option><option value="attention">Needs attention</option></select><button id="view">List projects</button></div>
 <p id="notice" role="status"></p>
+<section id="briefing" aria-label="Chief of Staff briefing"></section>
+<section id="coordination" aria-label="Project context and team requests"></section>
 <main id="content">Loading projects…</main>
 <details id="usage"><summary>Account limits</summary><pre id="limits">Expand to load account limits.</pre></details>
 <p id="updated" class="muted"></p>
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let rows=[],list=false,lastData='';
+let rows=[],list=false,lastData='',portfolioData=null;
 function age(value){if(!value)return '—';const time=Date.parse(value);if(!Number.isFinite(time))return '—';const m=Math.max(0,Math.floor((Date.now()-time)/60000));return m<1?'Just now':m<60?`${m} min ago`:m<1440?`${Math.floor(m/60)} hr ago`:new Date(time).toLocaleDateString();}
 function badge(s){return `<span class="badge ${s==='Needs attention'?'attention':s==='Working'?'working':''}">${esc(s)}</span>`;}
 function link(r){return `<a href="#${encodeURIComponent(r.path)}">${esc(r.name)}</a><div class="path">${esc(r.path)}</div>`;}
 function task(t){return `<div class="task"><strong>${esc(t.summary||'Untitled task')}</strong> <span class="badge">${esc(t.state||'unknown')}</span>${t.progress&&t.progress!==t.summary?`<p>${esc(t.progress)}</p>`:''}<p class="muted">Updated ${esc(age(t.completed_at||t.updated_at))}</p></div>`;}
+function renderBriefing(selected){
+ const data=portfolioData;
+ if(!data){$('briefing').innerHTML='<p class="muted">Briefing unavailable.</p>';return;}
+ const decisions=data.decisions.filter(d=>!selected||d.project_path===selected);
+ $('briefing').innerHTML=`<h2>Chief of Staff</h2><p>${esc(data.next_action)}</p><h2>Decision inbox (${decisions.length})</h2>${decisions.map(d=>`<div class="task"><strong>${esc(d.question)}</strong> <span class="badge attention">${d.state==='open'?'Answer needed':'Awaiting team acknowledgment'}</span><p><a href="#${encodeURIComponent(d.project_path)}">${esc(d.project_path.split('/').pop())}</a>${d.blocking?' · Blocks work':''}</p>${d.context?`<p>${esc(d.context)}</p>`:''}${d.options.length?`<p>Options: ${d.options.map(esc).join(' · ')}</p>`:''}${d.recommendation?`<p>Recommendation: ${esc(d.recommendation)}</p>`:''}${d.deadline?`<p>Deadline: ${esc(d.deadline)}</p>`:''}${d.answer?`<p>Answer: ${esc(d.answer)}</p>`:''}<p class="muted">Updated ${esc(age(d.updated_at))}</p><code>${esc(d.id)}</code></div>`).join('')||'<p class="muted">No pending decisions.</p>'}<p class="muted">Record answers with <code>syndicate decisions answer ID "your answer"</code>. Teams check the inbox and acknowledge answers after incorporating them.</p>`;
+}
+function renderCoordination(selected){
+ const data=portfolioData;
+ if(!data){$('coordination').innerHTML='';return;}
+ const requests=(data.requests||[]).filter(r=>!selected||r.project_path===selected);
+ const projects=(data.projects||[]).filter(p=>!selected||p.path===selected);
+ const sessions=(data.sessions||[]).filter(s=>!selected||s.source_path===selected||projects.some(p=>(p.sessions||[]).some(owner=>owner.id===s.id)));
+ $('coordination').innerHTML=`<h2>Team requests (${requests.length})</h2>${requests.map(r=>`<div class="task"><strong>${esc(r.message)}</strong> <span class="badge ${r.delivery_state==='failed'?'attention':''}">${esc(r.delivery_state.replaceAll('_',' '))}</span><p>${esc(r.project_path.split('/').pop())} · ${esc(r.reason||r.note||(r.delivery_state==='waiting_for_session'?'Waiting for a session on the owning task.':'Waiting for the owning team to incorporate this request.'))}</p><small>${esc(r.id)} · Task ${esc(r.task_id)} · Updated ${esc(age(r.updated_at))}</small></div>`).join('')||'<p class="muted">No pending or failed requests.</p>'}<h2>Project context</h2>${projects.filter(p=>p.brief).map(p=>{const b=p.brief;return `<details id="brief-${encodeURIComponent(p.path)}"><summary>${esc(p.name)} · Priority ${esc(b.priority||'unset')} · Revision ${b.revision}</summary><p>${esc(b.goal)}</p>${['constraints','decisions','dependencies','next_steps'].map(field=>b[field].length?`<p><strong>${esc(field.replaceAll('_',' '))}</strong></p><ul>${b[field].map(value=>`<li>${esc(value)}</li>`).join('')}</ul>`:'').join('')}<small>Updated ${esc(age(b.updated_at))}</small></details>`;}).join('')||'<p class="muted">No project briefs recorded.</p>'}<details id="owners"><summary>Session ownership (${sessions.filter(s=>s.live).length} active)</summary>${sessions.map(s=>`<p><strong>${esc(s.source_path.split('/').pop())}</strong> · ${esc(s.provider)} · ${s.live?'active':'inactive'}<br><small>Session ${esc(s.id)} · Task ${esc(s.task_id)} · PID ${s.pid}</small></p>`).join('')||'<p>No sessions recorded.</p>'}</details>`;
+}
+function currentTask(row){
+ const selected=(portfolioData?.projects||[]).find(project=>project.path===row.path);
+ const tasks=row.tasks||[];
+ if(selected?.task_id){
+  const authoritative=tasks.find(task=>task.id===selected.task_id&&(task.source_path||row.path)===(selected.source_path||row.path));
+  if(authoritative)return authoritative;
+ }
+ const reported=tasks.filter(task=>task.is_current);
+ return reported.find(task=>task.state==='running')||reported[0]||tasks.find(task=>task.state==='running')||tasks[0]||row.last_completed;
+}
 function render(){
  $('counts').textContent=`${rows.length} projects · ${rows.filter(r=>r.project_status==='Working').length} working · ${rows.filter(r=>r.project_status==='Needs attention').length} need attention`;
  let selected;try{selected=decodeURIComponent(location.hash.slice(1));}catch{selected='invalid';}
- const opened=new Set([...document.querySelectorAll('main details[open]')].map(e=>e.id));
+ const opened=new Set([...document.querySelectorAll('main details[open], #coordination details[open]')].map(e=>e.id));
+ renderBriefing(selected);
+ renderCoordination(selected);
  if(selected){const r=rows.find(r=>r.path===selected);$('content').innerHTML='<a href="#">← All projects</a>'+(r?`<h2>${esc(r.name)} ${badge(r.project_status)}</h2><p class="path">${esc(r.path)}</p><h2>${r.tasks.length?'Unfinished tasks ('+r.tasks.length+')':'Last completed task'}</h2>${r.tasks.length?r.tasks.map(task).join(''):r.last_completed?task(r.last_completed):'<p class="muted">No task details reported yet.</p>'}<details id="history"><summary>Activity history (${r.history.length})</summary>${r.history.slice().reverse().map(h=>`<p>${esc(h.summary)} <small>${esc(h.outcome||h.event)} · ${esc(age(h.at))}</small></p>`).join('')||'<p>No history yet.</p>'}</details>`:'<p>Project not found in the registry.</p>');}
  else{const query=$('search').value.toLowerCase();const visible=rows.filter(r=>(r.name+' '+r.path).toLowerCase().includes(query)).filter(r=>$('filter').value==='all'||($('filter').value==='unfinished'?r.unfinished_count>0:r.project_status==='Needs attention'));
- $('content').innerHTML=visible.length?`<div class="table-wrap"><table><thead><tr><th>Project</th><th>Status</th>${list?'':'<th>Current / latest task</th><th>Unfinished</th><th class="optional">Updated</th>'}</tr></thead><tbody>${visible.map(r=>{const t=r.tasks[0]||r.last_completed;return `<tr><td>${link(r)}</td><td>${badge(r.project_status)}</td>${list?'':`<td class="description">${esc(t?.summary||'No task details reported')}${t?.progress&&t.progress!==t.summary?`<div class="path">${esc(t.progress)}</div>`:''}${!r.tasks.length&&t?'<div class="path">Last completed</div>':''}</td><td>${r.unfinished_count}</td><td class="optional">${esc(age(r.updated_at))}</td>`}</tr>`;}).join('')}</tbody></table></div>`:`<p class="muted">${rows.length?'No projects match these filters.':'No registered projects. Run syndicate init in a repo to register it.'}</p>`;}
+ $('content').innerHTML=visible.length?`<div class="table-wrap"><table><thead><tr><th>Project</th><th>Status</th>${list?'':'<th>Current / latest task</th><th>Unfinished</th><th class="optional">Updated</th>'}</tr></thead><tbody>${visible.map(r=>{const t=currentTask(r);return `<tr><td>${link(r)}</td><td>${badge(r.project_status)}</td>${list?'':`<td class="description">${esc(t?.summary||'No task details reported')}<div class="path">Provider: ${esc(t?.provider||'unknown')} · ${esc(t?.state||'unknown')}</div>${t?.progress&&t.progress!==t.summary?`<div class="path">${esc(t.progress)}</div>`:''}${!r.tasks.length&&t?'<div class="path">Last completed</div>':''}</td><td>${r.unfinished_count}</td><td class="optional">${esc(age(r.updated_at))}</td>`}</tr>`;}).join('')}</tbody></table></div>`:`<p class="muted">${rows.length?'No projects match these filters.':'No registered projects. Run syndicate init in a repo to register it.'}</p>`;}
  for(const id of opened){const e=$(id);if(e)e.open=true;}
 }
-async function tick(){try{const res=await fetch('/api/status',{cache:'no-store'});if(!res.ok)throw Error();const data=await res.json();if(!Array.isArray(data))throw Error();rows=data;const serialized=JSON.stringify(data);if(serialized!==lastData){render();lastData=serialized;}$('notice').textContent='';$('updated').textContent='Last refreshed '+new Date().toLocaleTimeString();}catch{$('notice').textContent='Unable to refresh. Showing the last available data.';}finally{setTimeout(tick,5000);}}
+async function tick(){try{const res=await fetch('/api/status',{cache:'no-store'});if(!res.ok)throw Error();const data=await res.json();if(!Array.isArray(data))throw Error();rows=data;
+ let briefingFailed=false;try{const briefingRes=await fetch('/api/briefing',{cache:'no-store'});if(!briefingRes.ok)throw Error();portfolioData=await briefingRes.json();}catch{briefingFailed=true;}
+ const serialized=JSON.stringify([data,portfolioData]);if(serialized!==lastData){render();lastData=serialized;}$('notice').textContent=briefingFailed?'Unable to refresh briefing. Showing the last available briefing, if any.':'';$('updated').textContent='Last refreshed '+new Date().toLocaleTimeString();}catch{$('notice').textContent='Unable to refresh. Showing the last available data.';}finally{setTimeout(tick,5000);}}
 let limitsBusy=false;
 async function refreshLimits(){if(!$('usage').open||limitsBusy)return;limitsBusy=true;try{const res=await fetch('/api/limits',{cache:'no-store'});if(!res.ok)throw Error();$('limits').textContent=(await res.json()).summary;}catch{$('limits').textContent='Unable to refresh account limits. Retrying shortly.';}finally{limitsBusy=false;}}
 $('usage').addEventListener('toggle',refreshLimits);

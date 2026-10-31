@@ -295,7 +295,8 @@ def create_handoff(project, provider, task, reason, run_id):
                                         "reason": reason, "state": "waiting_on_user"})
     status = read_json(local / "status.json")
     current = status.get("current") or {}
-    current.update(role="orchestrator", round="handoff", summary=reason)
+    current.update(role="chief-of-staff" if current.get("role") == "chief-of-staff" else "orchestrator",
+                   round="handoff", summary=reason)
     status.update(state="waiting_on_user", current=current)
     atomic_json(local / "status.json", status)
     return target
