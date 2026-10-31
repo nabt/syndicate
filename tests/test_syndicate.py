@@ -238,6 +238,101 @@ class StatusAndRegistry(ProjectCase):
         paths = [p["path"] for p in sy.load_registry()]
         self.assertEqual(paths, [str(other), str(self.project)])
 
+    def test_workspace_uses_git_root_and_generic_groups(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        child = self.project / "nested"
+        child.mkdir()
+        self.assertEqual(sy.register_workspace(child), self.project)
+        self.assertEqual(len(sy.load_registry()), 1)
+        with tempfile.TemporaryDirectory() as outside:
+            other = Path(outside).resolve()
+            sy.register_workspace(other)
+            sy.write_status_stub(other, os.getpid(), "non repo task")
+            generic = next(r for r in sy.gather_statuses() if r["name"] == "Generic tasks")
+            self.assertEqual(generic["tasks"][0]["summary"], "non repo task")
+            self.assertEqual(generic["tasks"][0]["source_path"], str(other))
+
+    def test_assign_generic_task_preserves_live_source(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        with tempfile.TemporaryDirectory() as outside:
+            source = Path(outside).resolve()
+            sy.register_workspace(source)
+            sy.write_status_stub(source, os.getpid(), "draft docs")
+            data = json.loads(sy.status_path(source).read_text())
+            task_id = data["current"]["task_id"]
+            before = sy.status_path(source).read_bytes()
+            self.assertEqual(sy.main(["tasks", "edit", task_id, "--project", str(self.project)]), 0)
+            self.assertEqual(sy.status_path(source).read_bytes(), before)
+            data["current"]["summary"] = "still writing"
+            sy.status_path(source).write_text(json.dumps(data))
+            rows = sy.gather_statuses()
+            repo = next(r for r in rows if r["path"] == str(self.project))
+            self.assertEqual(repo["tasks"][0]["progress"], "still writing")
+            self.assertFalse(repo["tasks"][0]["needs_project"])
+            generic = next(r for r in rows if r["name"] == "Generic tasks")
+            self.assertEqual(generic["unfinished_count"], 0)
+            self.assertEqual(generic["project_status"], "No tasks")
+
+    def test_launch_failure_still_records_generic_task(self):
+        args = sy.build_parsers()[0].parse_args(["-C", str(self.project), "new task"])
+        with unittest.mock.patch.object(sy, "require_clis", side_effect=sy.SyndicateError("missing CLI")):
+            with self.assertRaises(sy.SyndicateError):
+                sy.cmd_run(args)
+        row = sy.gather_statuses()[0]
+        self.assertEqual(row["name"], "Generic tasks")
+        self.assertEqual(row["project_status"], "Needs attention")
+        self.assertTrue(row["tasks"][0]["needs_project"])
+
+    def test_explicit_project_uses_repo_without_prompt(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        args = sy.build_parsers()[0].parse_args(["-C", "/tmp", "--project", str(self.project), "new task"])
+        with unittest.mock.patch.object(sy, "run_session", return_value=0):
+            self.assertEqual(sy.cmd_run(args), 0)
+        self.assertEqual(args.dir, str(self.project))
+        task = sy.gather_statuses()[0]["tasks"][0]
+        self.assertFalse(task["needs_project"])
+
+    def test_relay_run_registers_before_cli_failure(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        args = argparse.Namespace(dir=str(self.project), role="backend-engineer", runtime=None, brief="work")
+        with unittest.mock.patch.object(sy, "require_clis", side_effect=sy.SyndicateError("missing CLI")):
+            with self.assertRaises(sy.SyndicateError):
+                sy.cmd_run_role(args)
+        self.assertEqual(sy.load_registry()[0]["path"], str(self.project))
+
+    def test_handoff_resumes_existing_task(self):
+        sy.register_workspace(self.project)
+        sy.write_status_stub(self.project, 2**30, "original request")
+        snapshot = self.project / "snapshot"
+        snapshot.mkdir()
+        (snapshot / "status.json").write_bytes(sy.status_path(self.project).read_bytes())
+        prior = json.loads(sy.status_path(self.project).read_text())
+        args = sy.build_parsers()[0].parse_args(["-C", str(self.project), "--handoff", str(snapshot)])
+        with unittest.mock.patch.object(sy, "run_session", return_value=0):
+            sy.cmd_run(args)
+        after = json.loads(sy.status_path(self.project).read_text())
+        self.assertEqual(after["current"]["task_id"], prior["current"]["task_id"])
+        self.assertEqual(len(after["tasks"]), 1)
+
+    def test_generic_selection_does_not_ask_or_change_directory(self):
+        args = sy.build_parsers()[0].parse_args(["-C", str(self.project), "--project", "generic", "request"])
+        with unittest.mock.patch.object(sy, "run_session", return_value=0):
+            sy.cmd_run(args)
+        row = sy.gather_statuses()[0]
+        self.assertEqual(row["name"], "Generic tasks")
+        self.assertFalse(row["tasks"][0]["needs_project"])
+        self.assertEqual(args.dir, str(self.project))
+
+    def test_task_state_edit_controls_completion_and_ambiguous_ids_fail(self):
+        sy.register_project(self.project)
+        sy.write_status_stub(self.project, 2**30, "interrupted")
+        task_id = sy.gather_statuses()[0]["tasks"][0]["id"]
+        self.assertEqual(sy.main(["tasks", "edit", task_id, "--state", "done"]), 0)
+        row = sy.gather_statuses()[0]
+        self.assertEqual(row["project_status"], "Complete")
+        self.assertEqual(row["last_completed"]["id"], task_id)
+        self.assertEqual(sy.main(["tasks", "edit", "missing", "--state", "done"]), 1)
+
     def test_write_status_stub_preserves_and_caps_history(self):
         sy.write_status_stub(self.project, 111, "first run")
         data = json.loads(sy.status_path(self.project).read_text())
@@ -260,6 +355,49 @@ class StatusAndRegistry(ProjectCase):
         self.assertFalse(sy.is_pid_alive("not-a-pid"))
         # a pid essentially guaranteed not to exist
         self.assertFalse(sy.is_pid_alive(2**30))
+
+    def test_unfinished_tasks_survive_new_run(self):
+        sy.register_project(self.project)
+        sy.write_status_stub(self.project, 2**30, "first request")
+        sy.write_status_stub(self.project, os.getpid(), "second request")
+        row = sy.gather_statuses()[0]
+        self.assertEqual(row["unfinished_count"], 2)
+        self.assertEqual(row["project_status"], "Needs attention")
+        self.assertEqual(row["tasks"][0]["summary"], "first request")
+        self.assertEqual(row["tasks"][0]["state"], "stale")
+
+    def test_completed_fallback_and_new_request(self):
+        sy.register_project(self.project)
+        sy.write_status_stub(self.project, os.getpid(), "finished request")
+        data = json.loads(sy.status_path(self.project).read_text())
+        data["state"] = "done"
+        sy.status_path(self.project).write_text(json.dumps(data))
+        row = sy.gather_statuses()[0]
+        self.assertEqual(row["project_status"], "Complete")
+        self.assertEqual(row["tasks"], [])
+        self.assertEqual(row["last_completed"]["summary"], "finished request")
+        sy.write_status_stub(self.project, os.getpid(), "new request")
+        row = sy.gather_statuses()[0]
+        self.assertEqual(row["unfinished_count"], 1)
+        self.assertEqual(row["last_completed"]["summary"], "finished request")
+
+    def test_queued_tasks_and_latest_completion(self):
+        sy.register_project(self.project)
+        sy.status_path(self.project).write_text(json.dumps({"tasks": [
+            {"id": "old", "summary": "older", "state": "done", "completed_at": "2026-01-01"},
+            {"id": "new", "summary": "newer", "state": "done", "completed_at": "2026-02-01"},
+            {"id": "next", "summary": "next", "state": "queued"},
+        ]}))
+        row = sy.gather_statuses()[0]
+        self.assertEqual(row["project_status"], "Queued")
+        self.assertEqual(row["last_completed"]["summary"], "newer")
+        self.assertEqual(row["unfinished_count"], 1)
+
+    def test_no_tasks_is_distinct_from_corrupt_status(self):
+        sy.register_project(self.project)
+        self.assertEqual(sy.gather_statuses()[0]["project_status"], "No tasks")
+        sy.status_path(self.project).write_text("invalid")
+        self.assertEqual(sy.gather_statuses()[0]["project_status"], "Needs attention")
 
     def test_gather_statuses_unknown_when_no_status_file(self):
         sy.register_project(self.project)
@@ -324,6 +462,40 @@ class StatusAndRegistry(ProjectCase):
 
 
 class WebDashboard(StatusAndRegistry):
+    def test_browser_views_filter_escape_and_completion(self):
+        if not sy.shutil.which("node"):
+            self.skipTest("Node is required for dashboard rendering checks")
+        script = (sy.WEB_DIR / "dashboard.html").read_text().split("<script>")[1].split("</script>")[0]
+        harness = """
+const assert = require('node:assert/strict');
+const elements = {};
+global.document = {
+ getElementById: id => elements[id] ||= {value:id==='filter'?'all':'',innerHTML:'',textContent:'',addEventListener(){}},
+ querySelectorAll: () => []
+};
+global.location = {hash:''};
+global.window = {addEventListener(){}};
+global.fetch = () => new Promise(()=>{});
+global.setInterval = () => 0;
+"""
+        checks = """
+rows = [{name:'<repo>',path:'/tmp/a',project_status:'Complete',unfinished_count:0,tasks:[],
+ last_completed:{summary:'Finished <script>',state:'done'},history:[]}];
+render();
+assert.ok($('content').innerHTML.includes('Finished &lt;script&gt;'));
+assert.ok(!$('content').innerHTML.includes('<repo>'));
+$('filter').value='unfinished';render();
+assert.ok($('content').innerHTML.includes('No projects match'));
+location.hash='#'+encodeURIComponent('/tmp/a');render();
+assert.ok($('content').innerHTML.includes('Last completed task'));
+rows[0].tasks=[{summary:'Pending',state:'queued'}];render();
+assert.ok($('content').innerHTML.includes('Unfinished tasks (1)'));
+assert.ok(!$('content').innerHTML.includes('Finished &lt;script&gt;'));
+location.hash='';$('filter').value='all';list=true;render();
+assert.ok(!$('content').innerHTML.includes('Current / latest task'));
+"""
+        subprocess.run(["node"], input=harness + script + checks, text=True, check=True, capture_output=True)
+
     def _start_server(self):
         server = http.server.HTTPServer(("127.0.0.1", 0), sy._DashboardHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -344,6 +516,18 @@ class WebDashboard(StatusAndRegistry):
         rows = json.loads(resp.read())
         self.assertEqual(rows[0]["current"]["summary"], "hello from the web test")
         conn.close()
+
+    def test_limits_endpoint_starts_monitor_and_returns_latest_observation(self):
+        with unittest.mock.patch.object(sy.runtime, "start_monitor") as start, \
+             unittest.mock.patch.object(sy.runtime, "describe_limits", return_value="codex: current, 94% remaining"):
+            port = self._start_server()
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", "/api/limits")
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertIn("94% remaining", json.loads(response.read())["summary"])
+            start.assert_called_once_with(sy.SCRIPT)
+            conn.close()
 
     def test_index_serves_dashboard_html(self):
         port = self._start_server()

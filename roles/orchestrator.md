@@ -132,6 +132,17 @@ anyone reading this conversation:
 Read the file before writing it (so you don't drop history), but keep
 summaries to one sentence — this is a status glance, not a report.
 
+Preserve `tasks` and `current.task_id` when updating status. Each task is a
+project-level request, not a delegated review round. The launcher creates a
+task with `id`, `summary`, `state`, `pid`, and `updated_at`. Update the matching
+task's `state`, `progress`, and `updated_at` with your current activity. On
+completion set its `state` to `done` and `completed_at` to the current ISO UTC
+timestamp. Preserve other unfinished tasks; mark them done only after verifying
+their work is complete. Additional pending requests may be recorded as tasks
+with unique IDs and `state: "queued"`. Use `blocked`, `failed`, or
+`waiting_on_user` when intervention is needed. Keep completed task records so
+the dashboard can show the most recent completion when nothing remains.
+
 ## Handoff Protocol
 - **Inputs expected:** a project goal or request, and any known
   constraints (stack, deadline, existing codebase).

@@ -64,6 +64,18 @@ class Quotas(unittest.TestCase):
             with patch("builtins.input", return_value=answer), patch("sys.stdout", new=io.StringIO()):
                 self.assertIsNone(rt.choose_target("claude", True))
 
+    def test_monitor_reports_empty_response_then_recovers(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(rt, "STATE", Path(tmp)), \
+             patch.object(rt.shutil, "which", return_value="codex"), \
+             patch.object(rt, "codex_limits", return_value={}) as limits:
+            rt.monitor_tick()
+            self.assertIn("returned no account limits", rt.describe_limits())
+            self.assertIn("interactive Claude session", rt.describe_limits())
+            limits.return_value = {"rateLimits": {"primary": {"usedPercent": 6}}}
+            rt.monitor_tick()
+            self.assertIn("94% remaining", rt.describe_limits())
+            self.assertNotIn("codex_error", rt.read_json(Path(tmp) / "monitor.json"))
+
 
 class Handoffs(ProjectCase):
     def setUp(self):
@@ -124,8 +136,9 @@ class Handoffs(ProjectCase):
         with (self.project / ".syndicate/session.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             args = sy.build_parsers()[0].parse_args(["-C", str(self.project), "task"])
-            with self.assertRaisesRegex(sy.SyndicateError, "already owns"):
-                sy.cmd_run(args)
+            with patch.object(sy, "REGISTRY_PATH", self.project / "registry" / "projects.json"):
+                with self.assertRaisesRegex(sy.SyndicateError, "already owns"):
+                    sy.cmd_run(args)
 
 
 class ProcessControl(unittest.TestCase):

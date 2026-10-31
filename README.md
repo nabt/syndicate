@@ -127,10 +127,59 @@ registered project at once:
 ```sh
 # Console: refreshes every 2s, ctrl-c to stop. --once renders a single frame.
 syndicate dashboard
+syndicate dashboard --project graphcue --once  # name or full repo path
+syndicate dashboard --list                    # registered repos and paths
 
 # Browser: starts a local server and prints the URL (http://127.0.0.1:8765/ by default)
 syndicate web
 ```
+
+The browser dashboard shows a compact project overview with working and
+needs-attention counts, repo search, and All / Unfinished / Needs attention
+filters. Select a repo to see all unfinished tasks, or its last completed task
+when none remain. “List projects” shows names, paths, and status. Activity
+history and account limits stay collapsed until needed. Project links can be
+bookmarked. Refresh failures are visible and retain the last available data.
+
+Tasks live in `.syndicate/status.json` alongside activity history. New runs
+preserve earlier tasks; the orchestrator updates task progress and completion.
+Existing status files without tasks show their current activity as one task.
+Only registered Syndicate repos and reported tasks appear; this does not scan
+external issue trackers. A repo without reported tasks displays “No tasks”.
+
+### Project discovery and task management
+
+Starting Syndicate from anywhere inside a Git repo registers its root and runs
+the team there. Registration happens before checking provider availability, so
+a failed launch still leaves a visible task. `init`, `status`, and `run-role`
+also refresh registration. Registry writes are locked and atomic so concurrent
+project launches cannot discard each other's entries. Dashboard, limits, and
+task-management queries do not create new tasks.
+
+Outside Git, runs keep their original working directory and appear together
+under **Generic tasks**. The bundled `syndicate-project` skill is injected into
+both Claude and Codex orchestrator instructions. It asks which repo should own
+an unassigned task, unless you supplied `--project`. Headless or unanswered
+tasks remain generic. `--project` accepts a registered repo name, a repo path,
+or `generic`; put it before the task text. A repo selection starts work at that
+repo's root. Explicit `generic` keeps the working directory and skips the question.
+
+```sh
+syndicate --project /home/nick/workspace/DigitalFront-AI/graphcue "Fix onboarding"
+syndicate --project generic "Draft a checklist"
+syndicate tasks list --project generic
+syndicate tasks list --json
+syndicate tasks edit TASK_ID --project graphcue
+syndicate tasks edit TASK_ID --summary "Updated task title" --state done
+```
+
+Task edits change dashboard metadata; they do not move files, stop processes,
+or change a running agent's working directory. Status and checkpoints remain
+at their source. Edits persist in `~/.syndicate/task-edits.json` independently
+of agent writes; an explicitly edited state stays authoritative until edited
+again. For ambiguous IDs (such as legacy `legacy` IDs), add
+`--source /original/working/directory`. A handoff resumed in its original
+directory retains its task ID instead of creating another unfinished task.
 
 A project whose status still says `running` but whose process has died shows
 up as `stale` rather than silently looking active forever — the dashboard

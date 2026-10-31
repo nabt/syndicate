@@ -18,6 +18,8 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +31,7 @@ GLOBAL_ROLES = HOME_DIR / "roles"
 GATE_SCRIPT = HOME_DIR / "hooks" / "require-review.sh"
 WEB_DIR = HOME_DIR / "web"
 HANDOFF_SKILL = HOME_DIR / "skills" / "syndicate-handoff" / "SKILL.md"
+PROJECT_SKILL = HOME_DIR / "skills" / "syndicate-project" / "SKILL.md"
 REGISTRY_PATH = Path.home() / ".syndicate" / "projects.json"
 CLIS = ("claude", "codex")
 LOCAL = ".syndicate"
@@ -235,7 +238,7 @@ SYNDICATE_BRIEF
 
 
 def orchestrator_body(team: Team) -> str:
-    body = team.roles["orchestrator"].body
+    body = team.roles["orchestrator"].body + "\n\n" + split_frontmatter(PROJECT_SKILL.read_text())[1]
     if team.config["handoff"] == "on":
         body += "\n\n" + split_frontmatter(HANDOFF_SKILL.read_text())[1]
     return body
@@ -349,14 +352,46 @@ def load_registry() -> list[dict]:
     return data.get("projects", []) if isinstance(data, dict) else []
 
 
-def register_project(project: Path) -> None:
+@contextmanager
+def registry_lock():
+    import fcntl
+    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with REGISTRY_PATH.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def register_project(project: Path, generic: bool = False) -> None:
     """Record this project in the user-wide registry so dashboard/web can find it
     without being pointed at it explicitly."""
     path_str = str(project)
-    projects = [p for p in load_registry() if p.get("path") != path_str]
-    projects.insert(0, {"path": path_str, "name": project.name, "last_seen": now_iso()})
-    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REGISTRY_PATH.write_text(json.dumps({"projects": projects}, indent=2) + "\n")
+    with registry_lock():
+        projects = [p for p in load_registry() if p.get("path") != path_str]
+        entry = {"path": path_str, "name": project.name, "last_seen": now_iso()}
+        if generic:
+            entry["group_path"] = str(REGISTRY_PATH.parent / "generic-tasks")
+        projects.insert(0, entry)
+        runtime.atomic_json(REGISTRY_PATH, {"projects": projects})
+
+
+def resolve_project(value: str) -> Path:
+    if value == "generic":
+        return REGISTRY_PATH.parent / "generic-tasks"
+    matches = [p for p in load_registry() if p.get("name") == value and not p.get("group_path")]
+    if len(matches) > 1:
+        raise SyndicateError("ambiguous project name; use its full repo path")
+    candidate = Path(matches[0]["path"] if matches else value).expanduser().resolve()
+    root = git(candidate, "rev-parse", "--show-toplevel")
+    if not root:
+        raise SyndicateError(f"not a Git repository: {value}")
+    return Path(root).resolve()
+
+
+def register_workspace(directory: Path) -> Path:
+    root = git(directory, "rev-parse", "--show-toplevel")
+    workspace = Path(root).resolve() if root else directory.resolve()
+    register_project(workspace, generic=not root)
+    return workspace
 
 
 def status_path(project: Path) -> Path:
@@ -371,9 +406,12 @@ def write_status_stub(project: Path, pid: int, summary: str) -> None:
     path = status_path(project)
     path.parent.mkdir(parents=True, exist_ok=True)
     history = []
+    tasks = []
     if path.is_file():
         try:
-            prior = json.loads(path.read_text()).get("history")
+            previous = read_status(str(project)) or {}
+            tasks = project_tasks(previous)
+            prior = previous.get("history")
             if isinstance(prior, list):
                 history = prior[-MAX_STATUS_HISTORY:]
         except (json.JSONDecodeError, OSError):
@@ -383,7 +421,10 @@ def write_status_stub(project: Path, pid: int, summary: str) -> None:
         "state": "running",
         "current": {"round": None, "role": "orchestrator", "summary": summary},
         "history": history,
+        "tasks": tasks + [{"id": uuid.uuid4().hex, "summary": summary,
+                           "state": "running", "updated_at": now_iso(), "pid": pid}],
     }
+    data["current"]["task_id"] = data["tasks"][-1]["id"]
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
@@ -415,14 +456,37 @@ def read_status(project_path: str) -> dict | None:
     return data
 
 
+def project_tasks(status: dict) -> list[dict]:
+    """Project-level tasks are distinct from delegated review-round history."""
+    tasks = [dict(t) for t in status.get("tasks", []) if isinstance(t, dict)] if isinstance(status.get("tasks"), list) else []
+    current = status.get("current") or {}
+    if not isinstance(current, dict):
+        current = {}
+    active = next((t for t in tasks if t.get("id") == current.get("task_id")), None)
+    if active is not None:
+        active.update(state=status.get("state", active.get("state")),
+                      progress=current.get("summary"), pid=status.get("pid"),
+                      updated_at=status.get("_mtime") or active.get("updated_at"))
+        if active.get("state") in ("done", "completed") and not active.get("completed_at"):
+            active["completed_at"] = active.get("updated_at")
+    elif not tasks and current.get("summary"):
+        tasks.append({"id": "legacy", "summary": current["summary"],
+                      "state": status.get("state", "unknown"), "pid": status.get("pid"),
+                      "updated_at": status.get("_mtime")})
+    return tasks
+
+
 def gather_statuses() -> list[dict]:
     """One row per registered project. A project whose status file says 'running'
     but whose pid is no longer alive is reported as 'stale', not 'running' — this
     is what catches a session that died without reporting back."""
     rows = []
+    overrides = runtime.read_json(REGISTRY_PATH.parent / "task-edits.json")
     for entry in load_registry():
         status = read_status(entry.get("path", ""))
-        row = {"path": entry.get("path"), "name": entry.get("name") or Path(entry.get("path", "?")).name}
+        source = entry["path"]
+        row = {"path": entry.get("group_path", source), "name": "Generic tasks" if entry.get("group_path") else entry.get("name") or Path(source).name,
+               "status_available": status is not None}
         if status is None:
             row.update(state="unknown", current=None, history=[], updated_at=None)
         else:
@@ -435,8 +499,44 @@ def gather_statuses() -> list[dict]:
                 history=status.get("history") if isinstance(status.get("history"), list) else [],
                 updated_at=status.get("_mtime"),
             )
+        tasks = project_tasks(status or {})
+        for task in tasks:
+            task["source_path"] = source
+            task.update(overrides.get(source, {}).get(task.get("id"), {}))
+        row["all_tasks"] = tasks
         rows.append(row)
-    return rows
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["path"], {**row, "all_tasks": [], "history": []})
+        grouped[row["path"]]["history"].extend(row["history"])
+        for task in row["all_tasks"]:
+            target = task.get("project_path") or row["path"]
+            group = grouped.setdefault(target, {"path": target, "name": "Generic tasks" if target == str(REGISTRY_PATH.parent / "generic-tasks") else Path(target).name,
+                                                "all_tasks": [], "history": [], "state": "unknown", "current": None, "updated_at": None})
+            group["all_tasks"].append(task)
+            group["updated_at"] = max(group.get("updated_at") or "", task.get("updated_at") or "") or None
+    rows = []
+    for row in grouped.values():
+        tasks = row.pop("all_tasks")
+        for task in tasks:
+            if task.get("state") == "running" and not is_pid_alive(task.get("pid")):
+                task["state"] = "stale"
+        unfinished = [t for t in tasks if t.get("state") not in ("done", "completed")]
+        completed = sorted((t for t in tasks if t.get("state") in ("done", "completed")),
+                           key=lambda t: t.get("completed_at") or t.get("updated_at") or "", reverse=True)
+        attention = {"waiting_on_user", "blocked", "failed", "stale", "unknown"}
+        unfinished.sort(key=lambda t: (0 if t.get("state") in attention else 1 if t.get("state") == "running" else 2))
+        label = ("Needs attention" if any(t.get("state") in attention for t in unfinished)
+                 else "Working" if any(t.get("state") == "running" for t in unfinished)
+                 else "Queued" if unfinished else "Complete" if completed
+                 else "No tasks" if row.get("status_available") or not status_path(Path(row["path"])).exists()
+                 else "Needs attention")
+        row.update(tasks=unfinished, unfinished_count=len(unfinished),
+                   last_completed=completed[0] if completed else None, project_status=label,
+                   completed_tasks=completed)
+        rows.append(row)
+    priority = {"Needs attention": 0, "Working": 1, "Queued": 2, "Complete": 3, "No tasks": 4}
+    return sorted(rows, key=lambda r: (priority[r["project_status"]], r["name"].lower(), r["path"]))
 
 
 def render_dashboard(rows: list[dict]) -> str:
@@ -446,12 +546,16 @@ def render_dashboard(rows: list[dict]) -> str:
         return "\n".join(lines)
     name_w = max(len(r["name"]) for r in rows)
     for r in rows:
-        cur = r.get("current") or {}
+        cur = next(iter(r.get("tasks", [])), None) or r.get("last_completed") or (r.get("current") if "tasks" not in r else {}) or {}
         role = cur.get("role") or ""
         if isinstance(role, list):
             role = ", ".join(role)
         summary = cur.get("summary") or ("(no status reported yet)" if r["state"] == "unknown" else "")
-        lines.append(f"[{r['state']:<14}] {r['name']:<{name_w}}  {role:<28} {summary}")
+        lines.append(f"[{r.get('project_status', r['state']):<15}] {r['name']:<{name_w}}  {role} {summary}  ({r.get('unfinished_count', 0)} unfinished)")
+        if r.get("path"):
+            lines.append(f"  {r['path']}")
+        for task in r.get("tasks", [])[1:]:
+            lines.append(f"  [{task.get('state', 'unknown')}] {task.get('summary', '')}")
     return "\n".join(lines)
 
 
@@ -459,11 +563,13 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     try:
         while True:
             rows = gather_statuses()
-            if not args.once:
+            if args.project:
+                selected = REGISTRY_PATH.parent / "generic-tasks" if args.project == "generic" else Path(args.project).expanduser().resolve()
+                rows = [r for r in rows if r["name"] == args.project or r["path"] == str(selected)]
+            if not args.once and not args.list:
                 print("\x1b[2J\x1b[H", end="")  # clear screen, home cursor
-            print(render_dashboard(rows))
-            print("\n" + runtime.describe_limits())
-            if args.once:
+            print("\n".join(f"{r['name']}  {r['path']}" for r in rows) if args.list else render_dashboard(rows))
+            if args.once or args.list:
                 return 0
             time.sleep(args.interval)
     except KeyboardInterrupt:
@@ -478,6 +584,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         if self.path in ("/", "/index.html"):
             self._serve_file(WEB_DIR / "dashboard.html", "text/html; charset=utf-8")
         elif self.path == "/api/limits":
+            runtime.start_monitor(SCRIPT)
             body = json.dumps({"summary": runtime.describe_limits(),
                                "monitor": runtime.read_json(runtime.STATE / "monitor.json")}).encode()
             self.send_response(200)
@@ -513,6 +620,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
 
 def cmd_web(args: argparse.Namespace) -> int:
     server = http.server.HTTPServer(("127.0.0.1", args.port), _DashboardHandler)
+    runtime.start_monitor(SCRIPT)
     print(f"syndicate web dashboard: http://127.0.0.1:{server.server_address[1]}/  (ctrl-c to stop)")
     try:
         server.serve_forever()
@@ -527,15 +635,46 @@ def cmd_run(args: argparse.Namespace) -> int:
     # A project lock covers the entire confirmation/switch cycle, preventing
     # another orchestrator from racing snapshots or changing the worktree.
     import fcntl
-    project = Path(args.dir).resolve()
+    directory = Path(args.dir).expanduser().resolve()
+    explicit = getattr(args, "project", None)
+    target = resolve_project(explicit) if explicit else None
+    if target and explicit != "generic":
+        directory = target
+    project = register_workspace(directory)
+    args.dir = str(project)
+    args.project_path = str(target) if target else None
     (project / LOCAL).mkdir(parents=True, exist_ok=True)
     with (project / LOCAL / "session.lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SyndicateError("another Syndicate orchestrator already owns this project")
+        prior = read_status(str(project)) or {}
+        resume = getattr(args, "handoff_path", None)
+        snapshot = runtime.read_json(Path(resume) / "status.json") if resume else {}
+        existing_id = (prior.get("current") or {}).get("task_id")
+        snapshot_id = (snapshot.get("current") or {}).get("task_id")
+        if not (resume and existing_id and existing_id == snapshot_id):
+            write_status_stub(project, os.getpid(), args.rest[0] if args.rest else "(interactive session)")
+            status = read_status(str(project))
+            task = status["tasks"][-1]
+            task["project_path"] = getattr(args, "project_path", None)
+            task["needs_project"] = not explicit and not git(project, "rev-parse", "--show-toplevel")
+        else:
+            status = prior
+            status.update(pid=os.getpid(), state="running")
+        status.pop("_mtime", None)
+        runtime.atomic_json(status_path(project), status)
         while True:
-            result = run_session(args)
+            try:
+                result = run_session(args)
+            except Exception as error:
+                status = read_status(str(project)) or {}
+                status.update(state="failed")
+                status.setdefault("current", {})["summary"] = f"Launch failed: {error}"
+                status.pop("_mtime", None)
+                runtime.atomic_json(status_path(project), status)
+                raise
             if result is not None:
                 return result
 
@@ -559,6 +698,11 @@ def run_session(args: argparse.Namespace) -> int | None:
     for w in team.warnings:
         print(f"syndicate: {w}", file=sys.stderr)
     require_clis({r.cli for r in team.roles.values()})
+    status = read_status(str(project)) or {}
+    if status:
+        status.update(state="running", pid=os.getpid())
+        status.pop("_mtime", None)
+        runtime.atomic_json(status_path(project), status)
     note = ensure_excluded(project)
     if note:
         print(f"syndicate: {note}", file=sys.stderr)
@@ -567,8 +711,6 @@ def run_session(args: argparse.Namespace) -> int | None:
     if team.host == "claude" and args.print:
         # Headless Claude gives up on still-running subagents after 600s; a team run is longer.
         os.environ.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "0")
-    register_project(project)
-    write_status_stub(project, os.getpid(), args.rest[0][:140] if args.rest else "(interactive session)")
     if team.config["handoff"] == "off":
         os.chdir(project)
         os.execvp(argv[0], argv)
@@ -596,7 +738,7 @@ def run_session(args: argparse.Namespace) -> int | None:
 
 
 def cmd_run_role(args: argparse.Namespace) -> int:
-    project = Path(args.dir).resolve()
+    project = register_workspace(Path(args.dir).expanduser().resolve())
     team = resolve_team(project)
     role = team.roles.get(args.role)
     if not role or args.role == "orchestrator":
@@ -641,8 +783,7 @@ def cmd_limits(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    project = Path(args.dir).resolve()
-    register_project(project)
+    project = register_workspace(Path(args.dir).expanduser().resolve())
     local = project / LOCAL
     (local / "roles").mkdir(parents=True, exist_ok=True)
     config = local / "config"
@@ -658,7 +799,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    project = Path(args.dir).resolve()
+    project = register_workspace(Path(args.dir).expanduser().resolve())
     team = resolve_team(project)
     print(f"project: {project}")
     print(f"host (orchestrator): {team.host}    review gate: {'on' if team.gate else 'off'}\n")
@@ -693,15 +834,60 @@ def cmd_setup_codex_gate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tasks(args: argparse.Namespace) -> int:
+    rows = gather_statuses()
+    tasks = [(r, t) for r in rows for t in r["tasks"] + r["completed_tasks"]]
+    if args.action == "list":
+        if args.project:
+            target = str(resolve_project(args.project))
+            tasks = [(r, t) for r, t in tasks if r["path"] == target]
+        if args.json:
+            print(json.dumps([{**t, "project_path": r["path"], "project_name": r["name"]} for r, t in tasks], indent=2))
+            return 0
+        for row, task in tasks:
+            print(f"{task['id']}  [{task.get('state', 'unknown')}] {row['name']}  {task.get('summary', '')}\n  source: {task['source_path']}")
+        return 0
+    matches = [(r, t) for r, t in tasks if t.get("id") == args.task_id and
+               (not args.source or t["source_path"] == str(Path(args.source).expanduser().resolve()))]
+    if len(matches) != 1:
+        raise SyndicateError("task not found or ambiguous; use tasks list and --source <directory>")
+    _, task = matches[0]
+    changes = {}
+    if args.project:
+        target = resolve_project(args.project)
+        if args.project != "generic":
+            register_project(target)
+        changes.update(project_path=str(target), needs_project=False)
+    if args.summary is not None:
+        if not args.summary.strip():
+            raise SyndicateError("task summary cannot be empty")
+        changes["summary"] = args.summary
+    if args.state:
+        changes["state"] = args.state
+        changes["completed_at"] = now_iso() if args.state == "done" else None
+    if not changes:
+        raise SyndicateError("provide --project, --summary, or --state")
+    changes["updated_at"] = now_iso()
+    # An independent overlay cannot be overwritten by an active agent's status writes.
+    with registry_lock():
+        path = REGISTRY_PATH.parent / "task-edits.json"
+        edits = runtime.read_json(path)
+        edits.setdefault(task["source_path"], {}).setdefault(task["id"], {}).update(changes)
+        runtime.atomic_json(path, edits)
+    print(f"Updated task {task['id']}")
+    return 0
+
+
 def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     run = argparse.ArgumentParser(
         prog="syndicate",
-        usage="syndicate [-x claude|codex] [-C dir] [-p] [task] [extra CLI args...]",
+        usage="syndicate [-x claude|codex] [-C dir] [--project repo|generic] [-p] [task] [extra CLI args...]",
         description="Run the orchestrator with the project's team. Other commands: "
-                    "init, status, run-role, setup-codex-gate, dashboard, web, limits.",
+                    "init, status, run-role, setup-codex-gate, dashboard, web, limits, tasks.",
     )
     run.add_argument("-x", "--runtime", choices=CLIS, help="CLI hosting the orchestrator (overrides project config)")
     run.add_argument("-C", "--dir", default=".", help="project directory (default: current)")
+    run.add_argument("--project", help="repo name or path to work in, or generic for non-repo tasks")
     run.add_argument("-p", "--print", action="store_true", help="run headless and print the result")
     run.add_argument("--reserve", type=float, help="handoff when this percentage of account usage remains (default: 10)")
     run.add_argument("--handoff", dest="handoff_path", help="continue from a saved handoff directory")
@@ -710,6 +896,19 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
 
     sub = argparse.ArgumentParser(prog="syndicate")
     cmds = sub.add_subparsers(dest="cmd", required=True)
+    p = cmds.add_parser("tasks", help="list and edit project task assignments")
+    actions = p.add_subparsers(dest="action", required=True)
+    listing = actions.add_parser("list")
+    listing.add_argument("--project", help="repo name/path or generic")
+    listing.add_argument("--json", action="store_true", help="include IDs, source paths, and assignment metadata")
+    listing.set_defaults(fn=cmd_tasks)
+    edit = actions.add_parser("edit")
+    edit.add_argument("task_id")
+    edit.add_argument("--source", help="source directory, required for ambiguous task IDs")
+    edit.add_argument("--project", help="assign to repo name/path or generic")
+    edit.add_argument("--summary")
+    edit.add_argument("--state", choices=("queued", "running", "waiting_on_user", "blocked", "failed", "done"))
+    edit.set_defaults(fn=cmd_tasks)
     for name, fn, text in (
         ("init", cmd_init, "create .syndicate/ in a project and exclude it from git"),
         ("status", cmd_status, "show the resolved team: each role's CLI and where its definition comes from"),
@@ -729,6 +928,8 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p = cmds.add_parser("dashboard", help="live console view of every registered project's status")
     p.add_argument("--interval", type=float, default=2.0, help="seconds between refreshes (default: 2)")
     p.add_argument("--once", action="store_true", help="render once and exit (for scripting)")
+    p.add_argument("--project", help="show a project by exact name or repo path")
+    p.add_argument("--list", action="store_true", help="list registered project names and paths")
     p.set_defaults(fn=cmd_dashboard)
     p = cmds.add_parser("web", help="local browser dashboard (http://127.0.0.1:<port>/)")
     p.add_argument("--port", type=int, default=8765)
@@ -754,7 +955,7 @@ def main(argv: list[str]) -> int:
         return runtime.monitor_forever()
     run, sub = build_parsers()
     try:
-        if argv and argv[0] in ("init", "status", "run-role", "setup-codex-gate", "dashboard", "web", "limits"):
+        if argv and argv[0] in ("init", "status", "run-role", "setup-codex-gate", "dashboard", "web", "limits", "tasks"):
             args = sub.parse_args(argv)
             return args.fn(args)
         args = run.parse_args(argv)

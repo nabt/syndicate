@@ -176,10 +176,14 @@ def monitor_tick():
     notified = state.get("notified", {})
     if shutil.which("codex"):
         try:
-            save_observation("codex", codex_limits())
+            observation = save_observation("codex", codex_limits())
+            if not observation["windows"]:
+                raise RuntimeError("Codex returned no account limits for this login")
             state.pop("codex_error", None)
         except (OSError, RuntimeError, ValueError) as error:
             state["codex_error"] = str(error)
+    else:
+        state["codex_error"] = "Codex CLI is not installed or is not on PATH"
     observations = {}
     events = []
     for provider in ("claude", "codex"):
@@ -237,10 +241,16 @@ def start_monitor(script):
 
 def describe_limits():
     lines = []
+    monitor = read_json(STATE / "monitor.json")
     for provider in ("claude", "codex"):
         data = read_json(STATE / f"{provider}.json")
         state, remaining = availability(data)
         text = f"{provider}: {state}"
+        if state != "current":
+            if provider == "codex":
+                text += " — " + (monitor.get("codex_error") or "waiting for the account-limit monitor to refresh")
+            else:
+                text += " — waiting for an interactive Claude session launched through Syndicate to publish account limits"
         observed = data.get("observed_at")
         if observed:
             text += " (observed " + time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime(observed)) + ")"
@@ -284,7 +294,9 @@ def create_handoff(project, provider, task, reason, run_id):
     atomic_json(local / "handoff.json", {"path": str(target), "provider": provider,
                                         "reason": reason, "state": "waiting_on_user"})
     status = read_json(local / "status.json")
-    status.update(state="waiting_on_user", current={"role": "orchestrator", "round": "handoff", "summary": reason})
+    current = status.get("current") or {}
+    current.update(role="orchestrator", round="handoff", summary=reason)
+    status.update(state="waiting_on_user", current=current)
     atomic_json(local / "status.json", status)
     return target
 
