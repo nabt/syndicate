@@ -149,6 +149,8 @@ syndicate dashboard --project graphcue --once  # name or full repo path
 syndicate dashboard --list                    # registered repos and paths
 syndicate briefing                            # cross-project briefing and decision inbox
 syndicate decisions list                      # questions and answers awaiting acknowledgment
+syndicate messages list --json                # project prompts for Chief of Staff
+syndicate live status -C /path/to/project     # managed inbox transport readiness/errors
 syndicate briefs show --project graphcue      # durable project context
 syndicate sessions                           # project session ownership
 syndicate requests list                      # pending and failed requests to teams

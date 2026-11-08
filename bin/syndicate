@@ -29,6 +29,7 @@ SCRIPT = Path(__file__).resolve()
 sys.path.insert(0, str(SCRIPT.parent))
 import syndicate_runtime as runtime
 import syndicate_portfolio as portfolio
+import syndicate_live as live
 HOME_DIR = SCRIPT.parent.parent
 GLOBAL_ROLES = HOME_DIR / "roles"
 GATE_SCRIPT = HOME_DIR / "hooks" / "require-review.sh"
@@ -36,6 +37,8 @@ WEB_DIR = HOME_DIR / "web"
 HANDOFF_SKILL = HOME_DIR / "skills" / "syndicate-handoff" / "SKILL.md"
 CHIEF_ROLE = HOME_DIR / "portfolio" / "chief-of-staff.md"
 PROJECT_SKILL = HOME_DIR / "skills" / "syndicate-project" / "SKILL.md"
+INBOX_SKILL = HOME_DIR / 'skills' / 'syndicate-inbox' / 'SKILL.md'
+SCHEDULER_TOOLS = ['CronCreate', 'CronList', 'CronDelete']
 REGISTRY_PATH = Path.home() / ".syndicate" / "projects.json"
 CLIS = ("claude", "codex")
 LOCAL = ".syndicate"
@@ -49,6 +52,8 @@ CONFIG_DEFAULTS = {
     "handoff": "on",
     "handoff-reserve": "10",
     "review-gate": "on",
+    'inbox-interval': '5',
+    'inbox-transport': 'auto',
 }
 
 CONFIG_TEMPLATE = """\
@@ -65,6 +70,8 @@ CONFIG_TEMPLATE = """\
 # handoff = on            # monitor quotas and checkpoint before switching providers
 # handoff-reserve = 10    # percentage of account usage remaining at which to stop
 # review-gate = on        # on (default) | off: block finishing until code-reviewer has reviewed
+# inbox-interval = 5      # polling interval in minutes; must divide 60 evenly
+# inbox-transport = auto  # auto: Codex queue / Claude scheduled poll; poll | channel
 """
 
 
@@ -198,6 +205,14 @@ def parse_config_file(path: Path, roles: dict[str, Role]) -> dict[str, str]:
                 valid = False
             if not valid:
                 raise SyndicateError(f"{where}: handoff-reserve must be between 0 and 100 (exclusive)")
+        elif key == 'inbox-interval':
+            try:
+                live.interval_minutes(value)
+            except portfolio.PortfolioError as error:
+                raise SyndicateError(f'{where}: {error}') from error
+        elif key == 'inbox-transport':
+            if value not in ('auto', 'poll', 'channel'):
+                raise SyndicateError(f'{where}: inbox-transport must be auto, poll, or channel')
         elif key in ("review-gate", "handoff"):
             if value not in ("on", "off"):
                 raise SyndicateError(f"{where}: {key} must be on or off")
@@ -368,7 +383,7 @@ def orchestrator_body(team: Team) -> str:
     body = team.roles["orchestrator"].body + "\n\n" + split_frontmatter(PROJECT_SKILL.read_text())[1]
     if team.config["handoff"] == "on":
         body += "\n\n" + split_frontmatter(HANDOFF_SKILL.read_text())[1]
-    return body
+    return body + live_instructions(team.project)
 
 
 def claude_agent(role: Role) -> dict:
@@ -385,6 +400,8 @@ def build_claude(team: Team, headless: bool, rest: list[str]) -> list[str]:
             agents[name] = claude_agent(role)
             if name == "orchestrator":
                 agents[name]["prompt"] = orchestrator_body(team)
+                if not headless and agents[name].get('tools'):
+                    agents[name]['tools'] = agents[name]['tools'] + [t for t in SCHEDULER_TOOLS if t not in agents[name]['tools']]
         else:
             relays = True
             agents[name] = {
@@ -447,7 +464,7 @@ def build_codex(team: Team, headless: bool, rest: list[str]) -> list[str]:
     if headless:
         argv += ["exec", "-C", str(team.project), "-s", "workspace-write"]
     else:
-        argv += ["-C", str(team.project)]
+        argv += ["-C", str(team.project), "-s", "workspace-write"]
     return argv + ["--add-dir", str(REGISTRY_PATH.parent / "portfolio"),
                    "-c", f"developer_instructions={jstr(instructions)}"] + overrides + rest
 
@@ -787,6 +804,73 @@ def cmd_requests(args):
     return 0
 
 
+def cmd_live(args):
+    project = Path(args.dir).expanduser().resolve()
+    if args.action == 'attach':
+        record = live.attach(project, os.environ.get('CODEX_THREAD_ID'))
+    elif args.action == 'poll':
+        record = live.poll(project)
+    elif args.action == 'seen':
+        record = live.poll(project, seen=args.event_ids)
+    elif args.action == 'scheduled':
+        record = live.poll(project, scheduled=args.job_id)
+    else:
+        run = runtime.read_json(project / LOCAL / 'run.json')
+        record = runtime.read_json(run.get('live_endpoint', project / LOCAL / 'no-live-endpoint'))
+    portfolio_print(json.dumps(record, indent=2))
+    return 0
+
+
+def live_instructions(project):
+    prefix = shlex.join([sys.executable, str(SCRIPT)])
+    return ('\n\n## Live portfolio inbox\n'
+            f'Syndicate executable prefix: {prefix}\nSource/workspace: {project}\n'
+            f'Inbox skill file: {INBOX_SKILL}\n' + split_frontmatter(INBOX_SKILL.read_text())[1])
+
+
+def inbox_options(args, config=None):
+    settings = {k: CONFIG_DEFAULTS[k] for k in ('inbox-interval', 'inbox-transport')}
+    if config is None:
+        # Chief of Staff inherits user inbox settings only, never project roles.
+        path = user_config_path()
+        if path.is_file():
+            for raw in path.read_text().splitlines():
+                key, sep, value = raw.split('#', 1)[0].partition('=')
+                if sep and key.strip() in settings:
+                    settings[key.strip()] = value.strip()
+    else:
+        settings.update({k: config[k] for k in settings})
+    interval = getattr(args, 'inbox_interval', None)
+    transport = getattr(args, 'inbox_transport', None) or settings['inbox-transport']
+    if transport not in ('auto', 'poll', 'channel'):
+        raise SyndicateError('inbox-transport must be auto, poll, or channel')
+    return dict(interval=live.interval_minutes(settings['inbox-interval'] if interval is None else interval),
+                transport=transport)
+
+
+def cmd_messages(args):
+    store = live.MessageStore(REGISTRY_PATH.parent / 'portfolio')
+    if args.action == 'list':
+        records = store.read()
+        if not args.all:
+            records = [r for r in records if r['state'] == 'pending']
+        portfolio_print(json.dumps(records, indent=2))
+    elif args.action == 'acknowledge':
+        portfolio_print(json.dumps(store.update(message_id=args.message_id), indent=2))
+    else:
+        source, task_id = decision_owner(args)
+        sessions = coordination_store().snapshot()['sessions']
+        owner = next((s for s in sessions if s['id'] == args.session and s['live'] and
+                      (s['source_path'], s['task_id']) == (str(source), task_id)), None)
+        if not owner:
+            raise SyndicateError('Messages must be sent by the owning active task/session')
+        if not args.message.strip() or not args.key.strip():
+            raise SyndicateError('Provide a nonempty message and key')
+        portfolio_print(json.dumps(store.update(source_path=str(source), task_id=task_id,
+                         session_id=args.session, key=args.key, message=args.message), indent=2))
+    return 0
+
+
 @contextmanager
 def project_session(project, provider):
     status = read_status(str(project)) or {}
@@ -814,18 +898,19 @@ def chief_instructions(workspace):
     return (body.strip() + f"\n\n## Launch context\nPortfolio workspace: {workspace}\n"
             f"Portfolio store: {REGISTRY_PATH.parent / 'portfolio'}\n"
             f"Use this exact executable prefix for every Syndicate command: {prefix}\n"
-            "This is a portfolio session, not a project orchestrator or specialist.\n")
+            "This is a portfolio session, not a project orchestrator or specialist.\n" + live_instructions(workspace))
 
 
 def build_chief_of_staff(provider, workspace, headless, task):
     instructions = chief_instructions(workspace)
     if provider == "claude":
+        tools = ['Read', 'Bash'] + ([] if headless else SCHEDULER_TOOLS)
         agent = dict(description="Chief of Staff for cross-project coordination", prompt=instructions,
-                     tools=["Read", "Bash"])
+                     tools=tools)
         settings = {"statusLine": {"type": "command", "command":
                     shlex.join([sys.executable, str(SCRIPT), "_claude-usage"])}}
         argv = ["claude", "--agent", "chief-of-staff", "--agents", json.dumps({"chief-of-staff": agent}),
-                "--tools", "Read,Bash", "--settings", json.dumps(settings)]
+                "--tools", ','.join(tools), "--settings", json.dumps(settings)]
         if headless:
             argv.append("-p")
     else:
@@ -862,8 +947,12 @@ def cmd_chief_of_staff(args):
         task += (f"\nContinue the Chief of Staff handoff at {snapshot}. Read its handoff.md, checkpoint.md and status.json, "
                  "then reconcile with fresh portfolio records. Preserve unresolved user requests. No project worktree belongs to this session.")
     argv = build_chief_of_staff(provider, workspace, args.print, task)
+    inbox = inbox_options(args)
+    if provider != 'claude' and inbox['transport'] == 'channel':
+        raise SyndicateError('Channel transport requires Claude')
     if args.dry_run:
-        print(json.dumps(dict(provider=provider, cwd=str(workspace), argv=argv), indent=2))
+        print(json.dumps(dict(provider=provider, cwd=str(workspace), argv=argv,
+                              inbox=dict(enabled=not args.print and not args.no_live, **inbox)), indent=2))
         return 0
     require_clis({provider})
     workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -889,7 +978,8 @@ def cmd_chief_of_staff(args):
             runtime.start_monitor(SCRIPT)
             print(f"syndicate: Chief of Staff on {provider}; monitoring at {args.reserve:g}% reserve.", file=sys.stderr)
             result, handoff = runtime.supervise(argv, workspace, {provider}, args.reserve, task, provider,
-                                                headless=args.print)
+                                                headless=args.print,
+                                                live=None if getattr(args, 'no_live', False) else dict(directory=workspace.parent, chief=True, **inbox))
             final = runtime.read_json(status_file) or status
             if not isinstance(final.get("current"), dict):
                 final["current"] = dict(status["current"])
@@ -1334,6 +1424,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 def run_session(args: argparse.Namespace) -> int | None:
     project = Path(args.dir).resolve()
     team = resolve_team(project, args.runtime)
+    inbox = inbox_options(args, team.config)
+    if team.host != 'claude' and inbox['transport'] == 'channel':
+        raise SyndicateError('Channel transport requires Claude')
     if getattr(args, "all_runtime", None):
         for role in team.roles.values():
             role.cli = args.all_runtime
@@ -1376,7 +1469,8 @@ def run_session(args: argparse.Namespace) -> int | None:
         task = args.rest[0] if args.rest else "Interactive session; see checkpoint and session output for requests."
         print(f"syndicate: monitoring account limits; handoff at {reserve:g}% remaining. "
               "Unavailable telemetry pauses work after 60s.", file=sys.stderr)
-        result, handoff = runtime.supervise(argv, project, providers, reserve, task, team.host, headless=args.print)
+        result, handoff = runtime.supervise(argv, project, providers, reserve, task, team.host, headless=args.print,
+                                           live=None if getattr(args, 'no_live', False) else dict(directory=REGISTRY_PATH.parent / 'portfolio', **inbox))
         if handoff is None:
             return result
         print(f"\nHandoff: {handoff}")
@@ -1549,6 +1643,9 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     run.add_argument("-p", "--print", action="store_true", help="run headless and print the result")
     run.add_argument("--reserve", type=float, help="handoff when this percentage of account usage remains (default: 10)")
     run.add_argument("--handoff", dest="handoff_path", help="continue from a saved handoff directory")
+    run.add_argument('--no-live', action='store_true', help='disable automatic portfolio inbox delivery for this run')
+    run.add_argument('--inbox-interval', type=int, help='polling interval in minutes (default: 5; must divide 60)')
+    run.add_argument('--inbox-transport', choices=('auto', 'poll', 'channel'), help='auto: Codex queue / Claude scheduled poll')
     run.add_argument("--all-runtime", choices=CLIS, help="use this CLI for every specialist in this run (combine with -x)")
     run.add_argument("rest", nargs=argparse.REMAINDER, help="the task, then any extra args for the CLI")
 
@@ -1560,6 +1657,9 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p.add_argument("--reserve", type=float, default=10, help="account usage reserve percentage (default: 10)")
     p.add_argument("--handoff", dest="handoff_path", help="resume a saved Chief of Staff handoff")
     p.add_argument("--dry-run", action="store_true", help="print launch arguments without starting a CLI or writing state")
+    p.add_argument('--no-live', action='store_true', help='disable automatic portfolio inbox delivery for this run')
+    p.add_argument('--inbox-interval', type=int, help='polling interval in minutes (default: 5; must divide 60)')
+    p.add_argument('--inbox-transport', choices=('auto', 'poll', 'channel'), help='auto: Codex queue / Claude scheduled poll')
     p.add_argument("task", nargs="?")
     p.set_defaults(fn=cmd_chief_of_staff)
     p = cmds.add_parser("briefs", help="durable project goals, priorities and context")
@@ -1584,6 +1684,32 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p.add_argument("--all", action="store_true", help="include earlier sessions")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_sessions)
+    p = cmds.add_parser('live', help='bind or inspect the current managed live inbox')
+    actions = p.add_subparsers(dest='action', required=True)
+    for action in ('attach', 'status', 'poll', 'seen', 'scheduled'):
+        command = actions.add_parser(action)
+        command.add_argument('-C', '--dir', default='.')
+        if action == 'seen':
+            command.add_argument('event_ids', nargs='+')
+        if action == 'scheduled':
+            command.add_argument('job_id')
+        command.set_defaults(fn=cmd_live)
+    p = cmds.add_parser('messages', help='project messages to the Chief of Staff')
+    actions = p.add_subparsers(dest='action', required=True)
+    command = actions.add_parser('list')
+    command.add_argument('--all', action='store_true')
+    command.add_argument('--json', action='store_true')
+    command.set_defaults(fn=cmd_messages)
+    command = actions.add_parser('acknowledge')
+    command.add_argument('message_id')
+    command.set_defaults(fn=cmd_messages)
+    command = actions.add_parser('send')
+    command.add_argument('message')
+    command.add_argument('--key', required=True)
+    command.add_argument('-C', '--dir', default='.')
+    command.add_argument('--task')
+    command.add_argument('--session', required=True)
+    command.set_defaults(fn=cmd_messages)
     p = cmds.add_parser("requests", help="durable task-scoped requests to project orchestrators")
     actions = p.add_subparsers(dest="action", required=True)
     listing = actions.add_parser("list")
@@ -1705,7 +1831,7 @@ def main(argv: list[str]) -> int:
         return runtime.monitor_forever()
     run, sub = build_parsers()
     try:
-        if argv and argv[0] in ("init", "config", "run-role", "setup-codex-gate", "dashboard", "web", "limits", "tasks", "decisions", "briefing", "briefs", "sessions", "requests", "chief-of-staff"):
+        if argv and argv[0] in ("init", "config", "run-role", "setup-codex-gate", "dashboard", "web", "limits", "tasks", "decisions", "briefing", "briefs", "sessions", "requests", "chief-of-staff", "live", "messages"):
             args = sub.parse_args(argv)
             return args.fn(args)
         args = run.parse_args(argv)

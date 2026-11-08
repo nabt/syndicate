@@ -191,6 +191,13 @@ def briefing(rows, decisions, coordination=None):
                 briefs=coordination['briefs'], sessions=coordination['sessions'], requests=requests)
 
 
+def process_namespace():
+    try:
+        return str(Path('/proc/self/ns/pid').readlink())
+    except OSError:
+        return None
+
+
 def process_identity(pid):
     """Linux process start time distinguishes a current owner from a reused PID."""
     try:
@@ -293,6 +300,18 @@ class CoordinationStore:
     def session_live(session):
         if session['state'] != 'active':
             return False
+        namespace = session.get('process_namespace')
+        if namespace and namespace != process_namespace():
+            # A reboot is an actual dead owner, not a sandbox visibility error.
+            try:
+                boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            except OSError:
+                boot = None
+            identity = session.get('process_identity')
+            if boot and identity and ':' in identity and not identity.startswith(boot + ':'):
+                return False
+            raise PortfolioError('Cannot validate session ownership from this PID namespace; '
+                                 'rerun this command outside the sandbox with approval')
         identity = process_identity(session['pid'])
         return (session['state'] == 'active' and identity is not None
                 and identity == session.get('process_identity'))
@@ -306,6 +325,7 @@ class CoordinationStore:
                     previous.update(state='ended', ended_at=now(), reason='superseded')
             session = dict(id=uuid.uuid4().hex, source_path=source_path, task_id=task_id,
                            provider=provider, pid=pid, process_identity=process_identity(pid),
+                           process_namespace=process_namespace(),
                            state='active', started_at=now())
             data['sessions'].append(session)
             return dict(session)

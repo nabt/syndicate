@@ -40,8 +40,9 @@ class ChiefOfStaff(ProjectCase):
                 if provider == 'claude':
                     agents = json.loads(argv[argv.index('--agents') + 1])
                     self.assertEqual(set(agents), {'chief-of-staff'})
-                    self.assertEqual(agents['chief-of-staff']['tools'], ['Read', 'Bash'])
-                    self.assertEqual(argv[argv.index('--tools') + 1], 'Read,Bash')
+                    tools = ['Read', 'Bash'] + ([] if headless else sy.SCHEDULER_TOOLS)
+                    self.assertEqual(agents['chief-of-staff']['tools'], tools)
+                    self.assertEqual(argv[argv.index('--tools') + 1], ','.join(tools))
                     self.assertEqual('-p' in argv, headless)
                     self.assertIn('statusLine', json.loads(argv[argv.index('--settings') + 1]))
                 else:
@@ -62,6 +63,15 @@ class ChiefOfStaff(ProjectCase):
         supervise.assert_not_called()
         self.assertFalse(self.workspace.parent.exists())
         self.assertFalse(sy.REGISTRY_PATH.exists())
+
+    def test_chief_inherits_user_inbox_settings_but_not_project_settings(self):
+        self.user_config('inbox-interval = 10\ninbox-transport = poll\n')
+        self.config('inbox-interval = 15\n')
+        result, output = self.command('-x', 'claude', '--dry-run')
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output)['inbox'], dict(enabled=True, interval=10, transport='poll'))
+        result, output = self.command('-x', 'claude', '--inbox-interval', '30', '--dry-run')
+        self.assertEqual(json.loads(output)['inbox']['interval'], 30)
 
     def test_supervised_launch_keeps_project_state_and_registry_untouched(self):
         sy.write_status_stub(self.project, 123, 'Existing project work')

@@ -281,6 +281,14 @@ class Coordination(unittest.TestCase):
                 self.store.transition_request(request['id'], 'acknowledge', source_path='/source', task_id='task',
                                                session_id=owner['id'], note='Wrong process')
 
+    def test_hidden_host_process_does_not_become_a_dead_session(self):
+        with patch.object(sy.portfolio, 'process_namespace', return_value='host'):
+            self.start()
+            self.send()
+        with patch.object(sy.portfolio, 'process_namespace', return_value='sandbox'):
+            with self.assertRaisesRegex(sy.portfolio.PortfolioError, 'outside the sandbox'):
+                self.store.snapshot()
+
     def test_concurrent_requests_deduplicate_without_lost_messages(self):
         self.start()
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
