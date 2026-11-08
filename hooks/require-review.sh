@@ -19,7 +19,7 @@ while [[ -n "$dir" && "$dir" != "/" ]]; do
   dir="$(dirname "$dir")"
 done
 [[ -n "$project" ]] || exit 0
-grep -qE '^[[:space:]]*review-gate[[:space:]]*=[[:space:]]*off' "$project/.syndicate/config" 2>/dev/null && exit 0
+grep -qE '^[[:space:]]*review-gate[[:space:]]*=[[:space:]]*off' "$project/.syndicate/syndicate.conf" 2>/dev/null && exit 0
 
 transcript="$(jq -r '.transcript_path // empty' <<<"$input")"
 [[ -f "$transcript" ]] || exit 0

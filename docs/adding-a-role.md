@@ -30,7 +30,7 @@ There is no build or install step for either: edit the file and the next
 ## Changing or removing a global role
 
 Edit or delete `roles/<role>.md`. Remove references to a deleted role from other
-roles' Handoff Protocol sections, and from any project's `.syndicate/config`
+roles' Handoff Protocol sections, and from any project's `.syndicate/syndicate.conf`
 (an unknown role name there is an error).
 
 ## Customizing a role for one project only

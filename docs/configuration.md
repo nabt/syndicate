@@ -1,14 +1,15 @@
 # Configuration
 
 Syndicate has one **global team** (the roles in this repo's `roles/`) and any
-number of **projects**. A project customizes the team through a single
-directory, `<project>/.syndicate/`, which is kept out of git. Nothing else in
-the project is created or modified.
+number of **projects**. Settings merge from built-in defaults, then the
+user-wide file, then the project file. A project customizes the team through a
+single directory, `<project>/.syndicate/`, which is kept out of git. Nothing
+else in the project is created or modified.
 
 ```
 <project>/
 └── .syndicate/                 local-only, git-excluded, safe to delete
-    ├── config                  which CLI runs each role, plus options
+    ├── syndicate.conf          which CLI runs each role, plus options
     ├── roles/
     │   ├── <role>.md           replaces (or adds) a role for this project
     │   └── <role>.append.md    adds project-specific guidance to a role
@@ -25,19 +26,54 @@ registered projects, `task-edits.json` stores task-management overrides, and
 isolated Chief of Staff workspace. See the [Chief of Staff guide](chief-of-staff.md)
 for its separate launch path; project role/runtime settings do not configure it.
 
-Run `syndicate init` inside a project to create `config` and `roles/` and the
+Run `syndicate init` inside a project to create `syndicate.conf` and `roles/` and the
 git exclusion. Every file below is optional: with no `.syndicate/` at all, the
-project runs the global team on Claude Code.
+project runs the global team on Claude Code, plus any user-wide settings.
 
-Use `syndicate status -C <project>` at any time to see the resolved team: each
-role's CLI and whether its definition is global, overridden, appended to, or
-project-only.
+`syndicate config` prints the merged settings for the project whose
+`.syndicate/status.json` was updated last. `-C <project>` selects a project.
+Winning keys are grouped under the file or layer that supplied them.
+`syndicate config --local` prints every layer that was read, including keys a
+later layer replaced, and marks `<project>/.syndicate/syndicate.conf` with `*`.
+`syndicate config --global` prints only the user-wide `syndicate.conf`.
 
-## Files to create in a project
+## Settings files
 
-### `.syndicate/config`: which CLI runs each role
+Both files use the same `key = value` syntax. `#` starts a comment. Syndicate
+reads them on every run and does not copy one onto the other.
 
-One `key = value` per line. `#` starts a comment.
+| Layer | Where | Effect |
+|---|---|---|
+| Built-in default | in `bin/syndicate` | `default = claude`, `handoff = on`, `handoff-reserve = 10`, `review-gate = on`. |
+| Environment | `$SYNDICATE_RUNTIME` | Sets `default` only, when the variable is set. |
+| User | `$XDG_CONFIG_HOME/syndicate/syndicate.conf`, or `~/.config/syndicate/syndicate.conf` when `XDG_CONFIG_HOME` is unset or empty | Applies to every project. |
+| Project | `<project>/.syndicate/syndicate.conf` | Replaces the same key from the layers above and leaves every other key alone. |
+| One run | `-x`, `--reserve` | Host CLI and reserve for this launch. `--all-runtime` assigns every specialist for this launch. |
+
+```
+# ~/.config/syndicate/syndicate.conf
+handoff-reserve = 25
+default = claude
+```
+
+```
+# <project>/.syndicate/syndicate.conf
+# Reviews come from Codex here; the reserve still comes from the user file.
+code-reviewer = codex
+```
+
+A role named in the user file must exist on the project being launched: a
+global role, or a role defined in that project's `.syndicate/roles/`. An
+unknown name or CLI is an error in either file.
+
+`syndicate init` writes a commented `.syndicate/syndicate.conf` when the project does
+not already have one. It does not copy values out of the user file, so a later
+edit there still reaches every project that left the key unset.
+
+### `.syndicate/syndicate.conf`: which CLI runs each role
+
+One `key = value` per line. `#` starts a comment. The same keys are valid in
+the user file.
 
 | Key | Values | Meaning |
 |---|---|---|
@@ -54,10 +90,12 @@ default = claude
 code-reviewer = codex
 ```
 
-An unknown role name or CLI is an error, not a silent fallback. Precedence for
-the host CLI: `-x` flag > `orchestrator` in the config > `default` >
-`$SYNDICATE_RUNTIME` > `claude`. For any other role: its own key > `default` >
-`$SYNDICATE_RUNTIME` > `claude`.
+Precedence for the host CLI: `-x` > the `orchestrator` key (project, otherwise
+user) > the `default` key (project, otherwise user, otherwise
+`$SYNDICATE_RUNTIME`) > `claude`. For any other role: its own key (project,
+otherwise user) > `default` by that same chain.
+
+## Project role files
 
 ### `.syndicate/roles/<role>.md`: replace a role, or add a new one
 
@@ -79,7 +117,7 @@ tools: Read, Edit, Write, Bash, Grep, Glob
   **inherited from the global role**; fields you set win.
 - If no global role has that name, this **adds a project-only role**. The
   orchestrator can delegate to it like any other, and you can give it a CLI in
-  `config`. Names are lowercase letters, digits and dashes.
+  `syndicate.conf`. Names are lowercase letters, digits and dashes.
 - `tools` is a comma-separated list of Claude Code tool names (`Read, Edit,
   Write, Bash, Grep, Glob, WebFetch, WebSearch, Agent`). It limits the role
   under Claude, and decides its Codex sandbox: any of `Edit`/`Write` gives
@@ -105,7 +143,7 @@ thin, and put business logic in services/.
 | Global role | `<syndicate repo>/roles/<role>.md` | The default definition for every project. |
 | Project override | `.syndicate/roles/<role>.md` | Replaces the body; merges frontmatter. |
 | Project append | `.syndicate/roles/<role>.append.md` | Adds guidance to whatever is below it. |
-| CLI per role | `.syndicate/config` | Chooses claude or codex for that role. |
+| CLI per role | user `syndicate.conf`, then `.syndicate/syndicate.conf` | Chooses claude or codex for that role. A project key wins. |
 
 ## Mixed-CLI teams
 
@@ -176,10 +214,11 @@ Check `git status` first so you only remove files syndicate created.
 
 ## Troubleshooting
 
-- `syndicate status -C <project>`: shows the resolved team and any warnings
-  (dangling `.append.md` files, invalid role names).
-- `unknown role 'x'` in `config`: the role doesn't exist globally or under
-  `.syndicate/roles/`. Check spelling with `status`.
+- `syndicate config -C <project>`: shows the merged settings and any warnings
+  (dangling `.append.md` files, invalid role names). `--local` also shows
+  overridden keys.
+- `unknown role 'x'` in `syndicate.conf`: the role doesn't exist globally or under
+  `.syndicate/roles/`. Check spelling with `syndicate config`.
 - Generated files are in `.syndicate/.generated/`: `claude-settings.json` and
   `codex/*.toml`. They are rewritten on every run, so edit the sources instead.
 

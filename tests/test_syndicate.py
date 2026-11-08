@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import io
 import http.client
 import http.server
@@ -30,10 +31,19 @@ class ProjectCase(unittest.TestCase):
         registry = unittest.mock.patch.object(sy, "REGISTRY_PATH", self.project / "registry" / "projects.json")
         registry.start()
         self.addCleanup(registry.stop)
+        self.xdg = self.project / "xdg"
+        env = unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.xdg)})
+        env.start()
+        self.addCleanup(env.stop)
         (self.project / ".syndicate" / "roles").mkdir(parents=True)
 
     def config(self, text):
-        (self.project / ".syndicate" / "config").write_text(text)
+        (self.project / ".syndicate" / "syndicate.conf").write_text(text)
+
+    def user_config(self, text):
+        path = sy.user_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
 
     def role_file(self, name, text):
         (self.project / ".syndicate" / "roles" / name).write_text(text)
@@ -117,6 +127,178 @@ class ConfigParsing(ProjectCase):
         self.config("review-gate = off\nhandoff = off\n")
         self.assertFalse(sy.resolve_team(self.project).gate)
 
+    def test_user_file_fills_keys_the_project_omits(self):
+        self.user_config("handoff-reserve = 25\ncode-reviewer = codex\ndefault = codex\n")
+        self.config("review-gate = off\ncode-reviewer = claude\n")
+        team = sy.resolve_team(self.project)
+        self.assertEqual(team.config["handoff-reserve"], "25")
+        self.assertEqual(team.config_sources["handoff-reserve"], "user")
+        self.assertEqual(team.config["default"], "codex")
+        self.assertEqual(team.config_sources["default"], "user")
+        self.assertEqual(team.config["review-gate"], "off")
+        self.assertEqual(team.config_sources["review-gate"], "project")
+        self.assertEqual(team.roles["code-reviewer"].cli, "claude")
+        self.assertEqual(team.config_sources["code-reviewer"], "project")
+        self.assertEqual(team.config_sources["handoff"], "default")
+        self.assertEqual(team.roles["backend-engineer"].cli, "codex")
+
+    def test_user_default_beats_environment_and_project_beats_both(self):
+        self.user_config("default = codex\n")
+        with unittest.mock.patch.dict(os.environ, {"SYNDICATE_RUNTIME": "claude"}):
+            team = sy.resolve_team(self.project)
+        self.assertEqual(team.config["default"], "codex")
+        self.assertEqual(team.config_sources["default"], "user")
+        self.config("default = claude\n")
+        with unittest.mock.patch.dict(os.environ, {"SYNDICATE_RUNTIME": "codex"}):
+            team = sy.resolve_team(self.project)
+        self.assertEqual(team.roles["qa-engineer"].cli, "claude")
+        self.assertEqual(team.config_sources["default"], "project")
+
+    def test_environment_applies_when_neither_file_sets_default(self):
+        with unittest.mock.patch.dict(os.environ, {"SYNDICATE_RUNTIME": "codex"}):
+            team = sy.resolve_team(self.project)
+        self.assertEqual(team.roles["qa-engineer"].cli, "codex")
+        self.assertEqual(team.config_sources["default"], "environment")
+
+    def test_absent_user_file_keeps_builtin_defaults(self):
+        team = sy.resolve_team(self.project)
+        self.assertEqual(team.config["handoff-reserve"], "10")
+        self.assertEqual(team.config_sources["handoff"], "default")
+        self.assertFalse(sy.user_config_path().exists())
+
+    def test_user_file_errors_include_its_path(self):
+        self.user_config("review-gate = maybe\n")
+        with self.assertRaises(sy.SyndicateError) as caught:
+            sy.resolve_team(self.project)
+        self.assertIn(str(sy.user_config_path()), str(caught.exception))
+
+    def test_user_config_path_follows_xdg_and_empty_falls_back(self):
+        self.assertEqual(sy.user_config_path(), self.xdg / "syndicate" / "syndicate.conf")
+        with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "  "}):
+            self.assertEqual(sy.user_config_path(), Path.home() / ".config" / "syndicate" / "syndicate.conf")
+
+    def test_config_groups_winning_values_by_source_file(self):
+        self.user_config("handoff-reserve = 25\ndefault = codex\n")
+        self.config("review-gate = off\ncode-reviewer = codex\ndefault = claude\n")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(sy.main(["config", "-C", str(self.project)]), 0)
+        text = output.getvalue()
+        user = str(sy.user_config_path())
+        project = str(self.project / ".syndicate" / "syndicate.conf")
+        self.assertTrue(text.startswith(f"project: {self.project}\n"))
+        self.assertLess(text.index("# built-in defaults"), text.index(f"# {user}"))
+        self.assertLess(text.index(f"# {user}"), text.index(f"# {project}"))
+        self.assertNotIn("*", text)
+        defaults, user_body, project_body = text.split("\n\n")[1:]
+        self.assertIn("handoff = on", defaults)
+        self.assertNotIn("default =", defaults)
+        self.assertNotIn("review-gate =", defaults)
+        self.assertEqual(user_body.splitlines()[1:], ["handoff-reserve = 25"])
+        self.assertEqual(project_body.splitlines()[1:], ["review-gate = off", "code-reviewer = codex", "default = claude"])
+
+    def test_local_config_shows_overridden_layers_and_marks_project_file(self):
+        self.user_config("handoff-reserve = 25\ndefault = codex\n")
+        self.config("default = claude\n")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(sy.main(["config", "-C", str(self.project), "--local"]), 0)
+        text = output.getvalue()
+        project = str(self.project / ".syndicate" / "syndicate.conf")
+        self.assertIn(f"# * {project}", text)
+        self.assertIn("default = codex  # overridden by " + project, text)
+        self.assertIn("handoff-reserve = 25", text)
+        self.assertIn("handoff = on", text)
+        self.assertIn("# built-in defaults", text)
+        self.assertLess(text.index("# built-in defaults"), text.index(f"# * {project}"))
+
+    def test_config_environment_is_its_own_group_until_a_file_replaces_it(self):
+        with unittest.mock.patch.dict(os.environ, {"SYNDICATE_RUNTIME": "codex"}):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(sy.main(["config", "-C", str(self.project)]), 0)
+        text = output.getvalue()
+        self.assertIn("# $SYNDICATE_RUNTIME\ndefault = codex", text)
+        self.assertNotIn("default = claude", text)
+        self.config("default = claude\n")
+        with unittest.mock.patch.dict(os.environ, {"SYNDICATE_RUNTIME": "codex"}):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(sy.main(["config", "-C", str(self.project), "--local"]), 0)
+        local = output.getvalue()
+        project = str(self.project / ".syndicate" / "syndicate.conf")
+        self.assertIn("default = codex  # overridden by " + project, local)
+        self.assertIn(f"# * {project}\ndefault = claude", local)
+
+    def _registered_status(self, name, config, mtime):
+        path = self.project / name
+        local = path / ".syndicate"
+        local.mkdir(parents=True)
+        if config is not None:
+            (local / "syndicate.conf").write_text(config)
+        status = local / "status.json"
+        status.write_text("{}\n")
+        os.utime(status, (mtime, mtime))
+        sy.register_project(path)
+        return path
+
+    def test_config_defaults_to_the_project_with_the_newest_status(self):
+        older = self._registered_status("older", "review-gate = off\n", 1_000)
+        newer = self._registered_status("newer", "handoff = off\n", 2_000)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(sy.main(["config"]), 0)
+        text = output.getvalue()
+        self.assertTrue(text.startswith(f"project: {newer}\n"))
+        self.assertIn("handoff = off", text)
+        self.assertNotIn("review-gate = off", text)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(sy.main(["config", "-C", str(older)]), 0)
+        chosen = output.getvalue()
+        self.assertTrue(chosen.startswith(f"project: {older}\n"))
+        self.assertIn("review-gate = off", chosen)
+
+    def test_local_marks_a_missing_project_file(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(sy.main(["config", "-C", str(self.project), "--local"]), 0)
+        text = output.getvalue()
+        project = str(self.project / ".syndicate" / "syndicate.conf")
+        self.assertIn(f"# * {project}\n# absent", text)
+        self.assertIn("handoff = on", text)
+
+    def test_config_without_a_status_file_asks_for_a_project(self):
+        with contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(sy.main(["config"]), 1)
+        self.assertIn("pass -C", error.getvalue())
+
+    def test_global_prints_only_the_user_file(self):
+        self.user_config("# shared\nhandoff-reserve = 25\n")
+        self.config("review-gate = off\n")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(sy.main(["config", "--global"]), 0)
+        text = output.getvalue()
+        self.assertEqual(text, f"# {sy.user_config_path()}\n# shared\nhandoff-reserve = 25\n")
+        with contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(sy.main(["config", "--global", "--local"]), 1)
+        self.assertIn("--global and --local", error.getvalue())
+
+    def test_global_reports_a_missing_user_file(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(sy.main(["config", "--global"]), 0)
+        self.assertEqual(output.getvalue(), f"# {sy.user_config_path()}\n# absent\n")
+
+    def test_legacy_project_config_is_renamed(self):
+        legacy = self.project / ".syndicate" / "config"
+        legacy.write_text("review-gate = off\n")
+        team = sy.resolve_team(self.project)
+        self.assertEqual(team.config["review-gate"], "off")
+        self.assertEqual(team.config_sources["review-gate"], "project")
+        self.assertFalse(legacy.exists())
+        self.assertEqual((self.project / ".syndicate" / "syndicate.conf").read_text(), "review-gate = off\n")
+
+    def test_init_writes_a_template_without_copying_user_settings(self):
+        self.user_config("handoff-reserve = 25\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sy.main(["init", "-C", str(self.project)]), 0)
+        text = (self.project / ".syndicate" / "syndicate.conf").read_text()
+        self.assertNotIn("handoff-reserve = 25", text)
+        self.assertIn("syndicate.conf", text)
+
 
 class GitExclusion(ProjectCase):
     def test_excludes_locally_without_touching_gitignore(self):
@@ -140,8 +322,8 @@ class GitExclusion(ProjectCase):
 
     def test_warns_when_already_tracked(self):
         subprocess.run(["git", "init", "-q", str(self.project)], check=True)
-        (self.project / ".syndicate" / "config").write_text("")
-        subprocess.run(["git", "-C", str(self.project), "add", "-f", ".syndicate/config"], check=True)
+        (self.project / ".syndicate" / "syndicate.conf").write_text("")
+        subprocess.run(["git", "-C", str(self.project), "add", "-f", ".syndicate/syndicate.conf"], check=True)
         self.assertIn("tracked", sy.ensure_excluded(self.project))
 
     def test_non_git_directory(self):

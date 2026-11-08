@@ -29,12 +29,17 @@ syndicate -x codex --all-runtime codex -C ~/code/project \
   --handoff ~/code/project/.syndicate/handoffs/<handoff-id>
 ```
 
-Per-project `.syndicate/config`:
+User-wide `~/.config/syndicate/syndicate.conf` (or
+`$XDG_CONFIG_HOME/syndicate/syndicate.conf`), and per-project
+`.syndicate/syndicate.conf` for keys that should differ:
 
 ```ini
 handoff = on
 handoff-reserve = 10
 ```
+
+A key in the project file replaces that same key from the user file. Other
+keys still come from the user file.
 
 `handoff = off` restores the original direct CLI launch without managed
 interruptions or skill injection. It does not stop an already-running account
