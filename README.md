@@ -42,7 +42,7 @@ agent with `syndicate chief-of-staff -x claude` or `-x codex`.
 
 ## Setup (once per machine)
 
-Requires `python3`, the `claude` and/or `codex` CLI, and `jq` (for the review
+Requires Python 3.11 or newer (`python3`), the `claude` and/or `codex` CLI, and `jq` (for the review
 gate). Put the launcher on your `PATH`:
 
 ```sh

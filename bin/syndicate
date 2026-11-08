@@ -22,6 +22,7 @@ import sys
 import time
 import tempfile
 import signal
+import tomllib
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -50,6 +51,7 @@ STATUS_STATES = ("running", "waiting_on_user", "done")
 MAX_STATUS_HISTORY = 200
 
 CONFIG_DEFAULTS = {
+    "codex-tui.show_tooltips": "false",
     "tmux": "on",
     "default": "claude",
     "handoff": "on",
@@ -76,6 +78,10 @@ CONFIG_TEMPLATE = """\
 # review-gate = on        # on (default) | off: block finishing until code-reviewer has reviewed
 # inbox-interval = 5      # polling interval in minutes; must divide 60 evenly
 # inbox-transport = auto  # auto: Codex queue / Claude scheduled poll; poll | channel
+# codex-model_verbosity = low  # Codex --config model_verbosity='"low"'
+# codex-tui.show_tooltips = false  # default: hide Codex onboarding tips
+# claude-model = sonnet   # Claude --model sonnet
+# claude-verbose = false  # true passes --verbose; false omits it
 """
 
 
@@ -192,16 +198,84 @@ def project_config_path(project: Path) -> Path:
     return path
 
 
-def parse_config_file(path: Path, roles: dict[str, Role]) -> dict[str, str]:
-    parsed: dict[str, str] = {}
+def config_entries(path):
+    """Keep quoted # characters and strip only comments outside strings."""
     for n, raw in enumerate(path.read_text().splitlines(), 1):
-        line = raw.split("#", 1)[0].strip()
+        quote, escaped = None, False
+        end = len(raw)
+        for i, char in enumerate(raw):
+            if escaped:
+                escaped = False
+            elif quote == '"' and char == '\\':
+                escaped = True
+            elif quote:
+                if char == quote:
+                    quote = None
+            elif char in ('"', "'"):
+                quote = char
+            elif char == '#':
+                end = i
+                break
+        line = raw[:end].strip()
         if not line:
             continue
         key, sep, value = (p.strip() for p in line.partition("="))
         where = f"{path}:{n}"
         if not sep or not key or not value:
             raise SyndicateError(f"{where}: expected 'key = value'")
+        yield key, value, where
+
+
+def cli_setting(key):
+    return next((cli for cli in CLIS if key.startswith(cli + '-')), None)
+
+
+def cli_value(value):
+    try:
+        return tomllib.loads('value = ' + value)['value']
+    except tomllib.TOMLDecodeError:
+        return value
+
+
+def validate_cli_setting(key, value, where):
+    cli = cli_setting(key)
+    option = key[len(cli) + 1:]
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_.-]*', option):
+        raise SyndicateError(f'{where}: invalid {cli} option name')
+    if cli == 'claude' and not isinstance(cli_value(value), (str, bool, int, float)):
+        raise SyndicateError(f'{where}: Claude options require a scalar value')
+
+
+def cli_options(provider, config=None):
+    if config is None:
+        # Chief uses user-wide CLI settings, independent of project roles.
+        config = dict(CONFIG_DEFAULTS)
+        path = user_config_path()
+        if path.is_file():
+            for key, value, where in config_entries(path):
+                if cli_setting(key):
+                    validate_cli_setting(key, value, where)
+                    config[key] = value
+    argv = []
+    for key, value in config.items():
+        if cli_setting(key) != provider:
+            continue
+        option = key[len(provider) + 1:]
+        decoded = cli_value(value)
+        if provider == 'codex':
+            # Bare strings need TOML quotes; typed TOML values retain their syntax.
+            encoded = jstr(decoded) if isinstance(decoded, str) else value
+            argv += ['--config', f'{option}={encoded}']
+        elif decoded is True:
+            argv.append('--' + option)
+        elif decoded is not False:
+            argv += ['--' + option, str(decoded)]
+    return argv
+
+
+def parse_config_file(path: Path, roles: dict[str, Role]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for key, value, where in config_entries(path):
         if key == "handoff-reserve":
             try:
                 valid = 0 < float(value) < 100
@@ -220,6 +294,8 @@ def parse_config_file(path: Path, roles: dict[str, Role]) -> dict[str, str]:
         elif key in ("review-gate", "handoff", "tmux"):
             if value not in ("on", "off"):
                 raise SyndicateError(f"{where}: {key} must be on or off")
+        elif cli_setting(key):
+            validate_cli_setting(key, value, where)
         elif key == "default" or key in roles:
             if value not in CLIS:
                 raise SyndicateError(f"{where}: cli must be one of {', '.join(CLIS)}")
@@ -430,7 +506,7 @@ def build_claude(team: Team, headless: bool, rest: list[str]) -> list[str]:
         argv += ["--settings", str(path)]
     if headless:
         argv.append("-p")
-    return argv + rest
+    return argv + cli_options('claude', team.config) + rest
 
 
 def build_codex(team: Team, headless: bool, rest: list[str]) -> list[str]:
@@ -472,7 +548,7 @@ def build_codex(team: Team, headless: bool, rest: list[str]) -> list[str]:
     else:
         argv += ["-C", str(team.project), "-s", "workspace-write"]
     return argv + ["--add-dir", str(REGISTRY_PATH.parent / "portfolio"),
-                   "-c", f"developer_instructions={jstr(instructions)}"] + overrides + rest
+                   "-c", f"developer_instructions={jstr(instructions)}"] + overrides + cli_options('codex', team.config) + rest
 
 
 def require_clis(clis: set[str]) -> None:
@@ -1046,7 +1122,7 @@ def build_chief_of_staff(provider, workspace, headless, task):
                  "--disable", "multi_agent", "--disable", "multi_agent_v2",
                  "-c", "sandbox_workspace_write.network_access=false",
                  "-c", f"developer_instructions={jstr(instructions)}"]
-    return argv + ["--", task]
+    return argv + cli_options(provider) + ["--", task]
 
 
 def cmd_chief_of_staff(args):
@@ -1626,10 +1702,10 @@ def cmd_run_role(args: argparse.Namespace) -> int:
         argv = ["claude", "-p", "--agents", json.dumps({role.name: claude_agent(role)}), "--agent", role.name]
         if role.can_write:
             argv += ["--permission-mode", "acceptEdits"]
-        argv.append(brief)
+        argv += cli_options('claude', team.config) + ['--', brief]
     else:
         argv = ["codex", "exec", "-C", str(project), "-s", role.sandbox,
-                "-c", f"developer_instructions={jstr(role.body)}", brief]
+                "-c", f"developer_instructions={jstr(role.body)}"] + cli_options('codex', team.config) + ['--', brief]
     return subprocess.run(argv, cwd=project, stdin=subprocess.DEVNULL).returncode
 
 
