@@ -25,6 +25,9 @@ loader.exec_module(sy)
 
 class ProjectCase(unittest.TestCase):
     def setUp(self):
+        tmux_patch = unittest.mock.patch.object(sy, 'tmux_enabled', return_value=False)
+        tmux_patch.start()
+        self.addCleanup(tmux_patch.stop)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.project = Path(self._tmp.name).resolve()
@@ -309,7 +312,7 @@ class ConfigParsing(ProjectCase):
     def test_init_writes_a_template_without_copying_user_settings(self):
         self.user_config("handoff-reserve = 25\n")
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(sy.main(["init", "-C", str(self.project)]), 0)
+            self.assertEqual(sy.main(["team", "init", "--project", str(self.project)]), 0)
         text = (self.project / ".syndicate" / "syndicate.conf").read_text()
         self.assertNotIn("handoff-reserve = 25", text)
         self.assertIn("syndicate.conf", text)
@@ -369,7 +372,7 @@ class LaunchCommands(ProjectCase):
         self.assertIn("SYNDICATE_BRIEF", reviewer["prompt"])
         self.assertIn("Read", agents["backend-engineer"]["tools"])
         settings = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
-        self.assertEqual(settings["permissions"]["allow"], [f"Bash({sy.SCRIPT} run-role *)"])
+        self.assertEqual(settings["permissions"]["allow"], [f"Bash({sy.SCRIPT} team run-role *)"])
 
     def test_gate_off_removes_hook(self):
         self.config("review-gate = off\nhandoff = off\n")
@@ -491,22 +494,22 @@ class StatusAndRegistry(ProjectCase):
             self.assertEqual(generic["unfinished_count"], 0)
             self.assertEqual(generic["project_status"], "No tasks")
 
-    def test_launch_failure_still_records_generic_task(self):
-        args = sy.build_parsers()[0].parse_args(["-C", str(self.project), "new task"])
+    def test_launch_failure_still_records_explicit_directory_task(self):
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "new task"])
         with unittest.mock.patch.object(sy, "require_clis", side_effect=sy.SyndicateError("missing CLI")):
             with self.assertRaises(sy.SyndicateError):
                 sy.cmd_run(args)
         row = sy.gather_statuses()[0]
-        self.assertEqual(row["name"], "Generic tasks")
+        self.assertEqual(row["name"], self.project.name)
         self.assertEqual(row["project_status"], "Needs attention")
-        self.assertTrue(row["tasks"][0]["needs_project"])
+        self.assertFalse(row["tasks"][0]["needs_project"])
 
     def test_explicit_project_uses_repo_without_prompt(self):
         subprocess.run(["git", "init", "-q", str(self.project)], check=True)
-        args = sy.build_parsers()[0].parse_args(["-C", "/tmp", "--project", str(self.project), "new task"])
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "new task"])
         with unittest.mock.patch.object(sy, "run_session", return_value=0):
             self.assertEqual(sy.cmd_run(args), 0)
-        self.assertEqual(args.dir, str(self.project))
+        self.assertEqual(args.project, str(self.project))
         task = sy.gather_statuses()[0]["tasks"][0]
         self.assertFalse(task["needs_project"])
 
@@ -525,7 +528,7 @@ class StatusAndRegistry(ProjectCase):
         snapshot.mkdir()
         (snapshot / "status.json").write_bytes(sy.status_path(self.project).read_bytes())
         prior = json.loads(sy.status_path(self.project).read_text())
-        args = sy.build_parsers()[0].parse_args(["-C", str(self.project), "--handoff", str(snapshot)])
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "--handoff", str(snapshot)])
         with unittest.mock.patch.object(sy, "run_session", return_value=0):
             sy.cmd_run(args)
         after = json.loads(sy.status_path(self.project).read_text())
@@ -533,13 +536,13 @@ class StatusAndRegistry(ProjectCase):
         self.assertEqual(len(after["tasks"]), 1)
 
     def test_generic_selection_does_not_ask_or_change_directory(self):
-        args = sy.build_parsers()[0].parse_args(["-C", str(self.project), "--project", "generic", "request"])
+        args = sy.build_parsers()[0].parse_args(["--project", "generic", "request"])
         with unittest.mock.patch.object(sy, "run_session", return_value=0):
             sy.cmd_run(args)
         row = sy.gather_statuses()[0]
         self.assertEqual(row["name"], "Generic tasks")
         self.assertFalse(row["tasks"][0]["needs_project"])
-        self.assertEqual(args.dir, str(self.project))
+        self.assertEqual(args.dir, str(sy.REGISTRY_PATH.parent / "generic-tasks"))
 
     def test_task_state_edit_controls_completion_and_ambiguous_ids_fail(self):
         sy.register_project(self.project)

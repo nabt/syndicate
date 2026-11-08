@@ -367,7 +367,7 @@ class Coordination(unittest.TestCase):
         before = sy.status_path(source).read_bytes()
         task_id = json.loads(before)['current']['task_id']
         sy.coordination_store().start_session(str(source), task_id, 'claude', 123)
-        args = sy.build_parsers()[0].parse_args(['-C', str(source), 'New task'])
+        args = sy.build_parsers()[0].parse_args(['--project', str(source), 'New task'])
         with self.assertRaisesRegex(sy.SyndicateError, 'already owns'):
             sy.cmd_run(args)
         self.assertEqual(before, sy.status_path(source).read_bytes())

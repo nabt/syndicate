@@ -364,7 +364,7 @@ def stop_group(proc, known=None):
     proc.wait()
 
 
-def supervise(argv, project, providers, threshold, task, host, headless=False, live=None):
+def supervise(argv, project, providers, threshold, task, host, headless=False, live=None, pass_fds=()):
     """Proxy a CLI terminal while keeping monitoring outside the model loop."""
     run_id = time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     local = project / ".syndicate"
@@ -402,7 +402,7 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
         try:
             proc = subprocess.Popen(argv, cwd=project, stdin=slave, stdout=slave, stderr=slave,
-                                    preexec_fn=child_setup)
+                                    preexec_fn=child_setup, pass_fds=pass_fds)
         except BaseException:
             if delivery:
                 delivery.close()
@@ -416,7 +416,7 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
     else:
         # Preserve stdin, stdout, and stderr semantics for headless pipelines.
         proc = subprocess.Popen(argv, cwd=project, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                start_new_session=True)
+                                start_new_session=True, pass_fds=pass_fds)
         sel.register(proc.stdout, selectors.EVENT_READ, "output")
         sel.register(proc.stderr, selectors.EVENT_READ, "error")
     old_winch = signal.signal(signal.SIGWINCH, resize)

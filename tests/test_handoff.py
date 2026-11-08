@@ -123,7 +123,7 @@ class Handoffs(ProjectCase):
     def test_switch_maps_every_role_and_loads_handoff(self):
         self.config("default = claude\n")
         path = rt.create_handoff(self.project, "claude", "goal", "low quota", "source")
-        args = sy.build_parsers()[0].parse_args(["-x", "codex", "--all-runtime", "codex", "-C", str(self.project), "--handoff", str(path)])
+        args = sy.build_parsers()[0].parse_args(["-x", "codex", "--all-runtime", "codex", "--project", str(self.project), "--handoff", str(path)])
         with patch.object(sy, "require_clis") as require, patch.object(sy, "register_project"), \
              patch.object(rt, "start_monitor"), patch.object(rt, "supervise", return_value=(0, None)) as run:
             self.assertEqual(sy.cmd_run(args), 0)
@@ -135,7 +135,7 @@ class Handoffs(ProjectCase):
         import fcntl
         with (self.project / ".syndicate/session.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            args = sy.build_parsers()[0].parse_args(["-C", str(self.project), "task"])
+            args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "task"])
             with patch.object(sy, "REGISTRY_PATH", self.project / "registry" / "projects.json"):
                 with self.assertRaisesRegex(sy.SyndicateError, "already owns"):
                     sy.cmd_run(args)
@@ -179,6 +179,18 @@ class RuntimeIntegration(ProjectCase):
         with patch("sys.stdout", self.out), patch("sys.stderr", self.err):
             return rt.supervise([sys.executable, "-c", code], self.project,
                                 {"claude"}, 10, "Finish feature", "claude", headless=True)
+
+    def test_supervised_cli_inherits_chief_lock(self):
+        rt.save_observation("claude", {"rate_limits": {"five_hour": {"used_percentage": 20}}})
+        with sy.chief_session_lock() as lock:
+            inode = os.fstat(lock.fileno()).st_ino
+            code = f"import os; assert os.fstat({lock.fileno()}).st_ino == {inode}"
+            with patch("sys.stdout", self.out), patch("sys.stderr", self.err):
+                result, handoff = rt.supervise([sys.executable, '-c', code], self.project,
+                    {'claude'}, 10, 'Check inherited lock', 'claude', headless=True,
+                    pass_fds=(lock.fileno(),))
+        self.assertEqual(result, 0)
+        self.assertIsNone(handoff)
 
     def test_headless_output_and_exit_status_preserved(self):
         rt.save_observation("claude", {"rate_limits": {"five_hour": {"used_percentage": 20}}})

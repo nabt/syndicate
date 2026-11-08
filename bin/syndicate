@@ -20,6 +20,8 @@ import shutil
 import subprocess
 import sys
 import time
+import tempfile
+import signal
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -48,6 +50,7 @@ STATUS_STATES = ("running", "waiting_on_user", "done")
 MAX_STATUS_HISTORY = 200
 
 CONFIG_DEFAULTS = {
+    "tmux": "on",
     "default": "claude",
     "handoff": "on",
     "handoff-reserve": "10",
@@ -63,6 +66,7 @@ CONFIG_TEMPLATE = """\
 # ($XDG_CONFIG_HOME/syndicate/syndicate.conf, or ~/.config/syndicate/syndicate.conf).
 # Keys absent from both files keep their built-in defaults. This file is not
 # rewritten from the user file.
+# Global-only: set 'tmux = off' in the user file to disable tmux for all CLI execution.
 #
 # default = claude        # CLI for every role not listed below: claude | codex
 # orchestrator = claude   # CLI that hosts the session; other roles are delegated to from it
@@ -213,7 +217,7 @@ def parse_config_file(path: Path, roles: dict[str, Role]) -> dict[str, str]:
         elif key == 'inbox-transport':
             if value not in ('auto', 'poll', 'channel'):
                 raise SyndicateError(f'{where}: inbox-transport must be auto, poll, or channel')
-        elif key in ("review-gate", "handoff"):
+        elif key in ("review-gate", "handoff", "tmux"):
             if value not in ("on", "off"):
                 raise SyndicateError(f"{where}: {key} must be on or off")
         elif key == "default" or key in roles:
@@ -221,6 +225,8 @@ def parse_config_file(path: Path, roles: dict[str, Role]) -> dict[str, str]:
                 raise SyndicateError(f"{where}: cli must be one of {', '.join(CLIS)}")
         else:
             raise SyndicateError(f"{where}: unknown role '{key}' (known: {', '.join(sorted(roles))})")
+        if key == "tmux" and path != user_config_path():
+            raise SyndicateError(f"{where}: tmux is a global-only setting")
         parsed[key] = value
     return parsed
 
@@ -361,7 +367,7 @@ def generated(project: Path) -> Path:
 
 
 def relay_command(role: Role, project: Path) -> str:
-    return f"{shlex.quote(str(SCRIPT))} run-role {role.name} -C {shlex.quote(str(project))} --runtime {role.cli} -"
+    return f"{shlex.quote(str(SCRIPT))} team run-role {role.name} --project {shlex.quote(str(project))} --runtime {role.cli} -"
 
 
 def relay_prompt(role: Role, project: Path) -> str:
@@ -416,7 +422,7 @@ def build_claude(team: Team, headless: bool, rest: list[str]) -> list[str]:
     if team.gate:
         settings["hooks"] = {"Stop": [{"hooks": [{"type": "command", "command": shlex.quote(str(GATE_SCRIPT))}]}]}
     if relays:
-        settings["permissions"] = {"allow": [f"Bash({SCRIPT} run-role *)"]}
+        settings["permissions"] = {"allow": [f"Bash({SCRIPT} team run-role *)"]}
     argv = ["claude", "--agent", "orchestrator", "--agents", json.dumps(agents)]
     if settings:
         path = generated(team.project) / "claude-settings.json"
@@ -741,6 +747,127 @@ def cmd_briefs(args):
     return 0
 
 
+def execution_project(value):
+    if value == 'generic':
+        directory = REGISTRY_PATH.parent / 'generic-tasks'
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+    candidate = Path(value).expanduser()
+    if candidate.is_dir():
+        root = git(candidate.resolve(), 'rev-parse', '--show-toplevel')
+        return Path(root).resolve() if root else candidate.resolve()
+    return resolve_project(value)
+
+
+def tmux_enabled():
+    path = user_config_path()
+    roles, _ = load_roles(Path.cwd())
+    values = parse_config_file(path, roles) if path.is_file() else {}
+    return values.get('tmux', CONFIG_DEFAULTS['tmux']) == 'on'
+
+
+@contextmanager
+def chief_session_lock(probe=False):
+    """One user-wide PID lock, held by the supervisor in either execution mode.
+
+    The kernel lock is authoritative: stale contents or a reused PID cannot
+    block recovery after a crash. Keep the inode so concurrent openers always
+    contend on the same lock, including while an owner is exiting.
+    """
+    import fcntl
+    path = REGISTRY_PATH.parent / 'portfolio' / 'chief-of-staff.lock'
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with path.open('a+') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.seek(0)
+            pid = lock.readline().strip()
+            detail = f' (PID {pid})' if pid.isdecimal() else ''
+            raise SyndicateError(f'another Chief of Staff session is already running{detail}') from None
+        try:
+            if not probe:
+                lock.seek(0)
+                lock.truncate()
+                lock.write(f'{os.getpid()}\n')
+                lock.flush()
+            yield lock
+        finally:
+            if not probe:
+                lock.seek(0)
+                lock.truncate()
+                lock.flush()
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def launch_tmux(argv, directory, name, headless=False):
+    """Run the launcher inside tmux; synchronous runs retain output and exit code."""
+    if not shutil.which('tmux'):
+        raise SyndicateError('tmux is required; install it or set tmux = off in the global config')
+    target = '=' + name
+    if subprocess.run(['tmux', 'has-session', '-t', target], capture_output=True).returncode == 0:
+        panes = (subprocess.run(['tmux', 'list-panes', '-s', '-t', target, '-F', '#{pane_dead}'],
+                                capture_output=True, text=True)
+                 if name == 'chief-of-staff-work' else None)
+        if panes is not None and panes.returncode == 0 and panes.stdout.split() and all(
+                dead == '1' for dead in panes.stdout.split()):
+            # remain-on-exit can retain a crashed chief's dead panes. Never
+            # remove a session with a live pane, or use its name as liveness.
+            removed = subprocess.run(['tmux', 'kill-session', '-t', target], capture_output=True, text=True)
+            if removed.returncode:
+                raise SyndicateError(removed.stderr.strip())
+        else:
+            raise SyndicateError(f'tmux session {name} already exists; inspect or attach to it before launching again')
+    command = shlex.join([sys.executable, str(SCRIPT), '_in-tmux', *argv])
+    base = ['tmux', 'new-session', '-d', '-s', name, '-c', str(directory)]
+    # A tmux server may predate the user's current configuration environment.
+    for key in ('XDG_CONFIG_HOME', 'SYNDICATE_RUNTIME', 'PATH'):
+        base += ['-e', f'{key}={os.environ.get(key, "")}']
+    if not headless:
+        result = subprocess.run([*base, command], capture_output=True, text=True)
+        if result.returncode:
+            raise SyndicateError(result.stderr.strip())
+        print(f'Launch requested in tmux session {name}. Attach with: '
+              f'{shlex.join(["tmux", "attach-session", "-t", target])}')
+        if sys.stdin.isatty() and sys.stdout.isatty() and not os.environ.get('TMUX'):
+            return subprocess.run(['tmux', 'attach-session', '-t', target]).returncode
+        return 0
+    with tempfile.TemporaryDirectory(prefix='syndicate-tmux-') as tmp:
+        output, errors, code = (Path(tmp) / part for part in ('stdout', 'stderr', 'exit'))
+        shell = (f'{command} >{shlex.quote(str(output))} 2>{shlex.quote(str(errors))}; '
+                 f'result=$?; printf "%s" "$result" >{shlex.quote(str(code) + ".tmp")}; '
+                 f'mv {shlex.quote(str(code) + ".tmp")} {shlex.quote(str(code))}')
+        result = subprocess.run([*base, '-P', '-F', '#{session_id}',
+                                 shlex.join(['/bin/sh', '-c', shell])], capture_output=True, text=True)
+        if result.returncode:
+            raise SyndicateError(result.stderr.strip())
+        target = result.stdout.strip() or target
+        previous_term = signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+        try:
+            while not code.exists():
+                time.sleep(0.1)
+                if subprocess.run(['tmux', 'has-session', '-t', target], capture_output=True).returncode and not code.exists():
+                    raise SyndicateError(f'tmux session {name} exited without a result')
+            sys.stdout.write(output.read_text())
+            sys.stderr.write(errors.read_text())
+            return int(code.read_text())
+        finally:
+            signal.signal(signal.SIGTERM, previous_term)
+            # This session was created by this invocation, never an existing team.
+            subprocess.run(['tmux', 'kill-session', '-t', target], capture_output=True)
+
+
+def cmd_task(args):
+    project = execution_project(args.project or str(Path.cwd()))
+    for session in coordination_store().snapshot()['sessions']:
+        if session['live'] and (session['source_path'] == str(project)
+                               or task_project(Path(session['source_path']), session['task_id']) == str(project)):
+            print(f"Team already running: {session['id']} / task {session['task_id']}")
+            return 0
+    args.dir = str(project)
+    return cmd_run(args)
+
+
 def cmd_sessions(args):
     records = coordination_store().snapshot()["sessions"]
     if args.project:
@@ -923,7 +1050,6 @@ def build_chief_of_staff(provider, workspace, headless, task):
 
 
 def cmd_chief_of_staff(args):
-    import fcntl
     import math
     if not math.isfinite(args.reserve) or not 0 < args.reserve < 100:
         raise SyndicateError("reserve must be between 0 and 100 (exclusive)")
@@ -942,7 +1068,7 @@ def cmd_chief_of_staff(args):
     if provider not in CLIS:
         raise SyndicateError("Chief of Staff runtime must be claude or codex")
     task = args.task or ("Give a concise current cross-project briefing and recommend the next action."
-                         if args.print else "Open the Chief of Staff session. Refresh portfolio context and give a short greeting with the next useful action.")
+                         if args.print else "Open the Chief of Staff session. Give a brief greeting, refresh portfolio context, then give a concise current briefing. Follow up conversationally about what the requester would like to do next: address pending approvals or prompts, start a new task, or resume existing work. Ground suggestions in verified records and wait for their choice before taking those actions.")
     if snapshot:
         task += (f"\nContinue the Chief of Staff handoff at {snapshot}. Read its handoff.md, checkpoint.md and status.json, "
                  "then reconcile with fresh portfolio records. Preserve unresolved user requests. No project worktree belongs to this session.")
@@ -956,11 +1082,7 @@ def cmd_chief_of_staff(args):
         return 0
     require_clis({provider})
     workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with (workspace.parent / "chief-of-staff.lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SyndicateError("another Chief of Staff session is already running")
+    with chief_session_lock() as lock:
         local = workspace / LOCAL
         local.mkdir(parents=True, exist_ok=True, mode=0o700)
         status_file = local / "status.json"
@@ -977,8 +1099,10 @@ def cmd_chief_of_staff(args):
         try:
             runtime.start_monitor(SCRIPT)
             print(f"syndicate: Chief of Staff on {provider}; monitoring at {args.reserve:g}% reserve.", file=sys.stderr)
+            # Keep ownership if the supervisor crashes but its CLI survives.
             result, handoff = runtime.supervise(argv, workspace, {provider}, args.reserve, task, provider,
                                                 headless=args.print,
+                                                pass_fds=(lock.fileno(),),
                                                 live=None if getattr(args, 'no_live', False) else dict(directory=workspace.parent, chief=True, **inbox))
             final = runtime.read_json(status_file) or status
             if not isinstance(final.get("current"), dict):
@@ -1167,7 +1291,7 @@ def render_dashboard(rows: list[dict], *, width: int = 100, color: bool = False,
                 lines.extend(wrapped(request.get("reason") or request["note"], "  "))
         lines.append("")
     if not rows:
-        lines.extend(wrapped("no registered projects — run 'syndicate init' (or any run) in a project first"))
+        lines.extend(wrapped("no registered projects — run 'syndicate team init' (or any run) in a project first"))
         return "\n".join(lines)
     counts = [f"{sum(status(r) == label for r in rows)} {label.lower()}" for label in styles]
     lines.extend(wrapped(f"{len(rows)} projects | " + " | ".join(counts)))
@@ -1376,8 +1500,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     import fcntl
     directory = Path(args.dir).expanduser().resolve()
     explicit = getattr(args, "project", None)
-    target = resolve_project(explicit) if explicit else None
-    if target and explicit != "generic":
+    target = execution_project(explicit) if explicit else None
+    if target:
         directory = target
     project = register_workspace(directory)
     args.dir = str(project)
@@ -1489,7 +1613,7 @@ def run_session(args: argparse.Namespace) -> int | None:
 
 
 def cmd_run_role(args: argparse.Namespace) -> int:
-    project = register_workspace(Path(args.dir).expanduser().resolve())
+    project = register_workspace(execution_project(args.dir))
     team = resolve_team(project)
     role = team.roles.get(args.role)
     if not role or args.role == "orchestrator":
@@ -1534,7 +1658,7 @@ def cmd_limits(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    project = register_workspace(Path(args.dir).expanduser().resolve())
+    project = register_workspace(execution_project(args.dir))
     local = project / LOCAL
     (local / "roles").mkdir(parents=True, exist_ok=True)
     config = project_config_path(project)
@@ -1632,14 +1756,13 @@ def cmd_tasks(args: argparse.Namespace) -> int:
 
 def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     run = argparse.ArgumentParser(
-        prog="syndicate",
-        usage="syndicate [-x claude|codex] [-C dir] [--project repo|generic] [-p] [task] [extra CLI args...]",
-        description="Run the orchestrator with the project's team. Other commands: "
-                    "init, config, run-role, setup-codex-gate, dashboard, web, limits, tasks, decisions, briefing, briefs, sessions, requests, chief-of-staff.",
+        prog="syndicate team task",
+        description="Run a project team on its configured CLI.",
+        epilog="Team commands: init (initialize a project), task (run a task), "
+               "run-role (run a specialist). Use syndicate team COMMAND --help for details.",
     )
     run.add_argument("-x", "--runtime", choices=CLIS, help="CLI hosting the orchestrator (overrides project config)")
-    run.add_argument("-C", "--dir", default=".", help="project directory (default: current)")
-    run.add_argument("--project", help="repo name or path to work in, or generic for non-repo tasks")
+    run.add_argument("--project", help="project repo name/path, or generic (default: current directory)")
     run.add_argument("-p", "--print", action="store_true", help="run headless and print the result")
     run.add_argument("--reserve", type=float, help="handoff when this percentage of account usage remains (default: 10)")
     run.add_argument("--handoff", dest="handoff_path", help="continue from a saved handoff directory")
@@ -1647,10 +1770,21 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     run.add_argument('--inbox-interval', type=int, help='polling interval in minutes (default: 5; must divide 60)')
     run.add_argument('--inbox-transport', choices=('auto', 'poll', 'channel'), help='auto: Codex queue / Claude scheduled poll')
     run.add_argument("--all-runtime", choices=CLIS, help="use this CLI for every specialist in this run (combine with -x)")
+    run.set_defaults(dir=".")
     run.add_argument("rest", nargs=argparse.REMAINDER, help="the task, then any extra args for the CLI")
 
-    sub = argparse.ArgumentParser(prog="syndicate")
+    sub = argparse.ArgumentParser(
+        prog="syndicate",
+        description="Open Chief of Staff for a greeting, portfolio briefing, and conversational next steps. "
+                    "Use -x codex or -x claude to choose its CLI. Project work lives under syndicate team.",
+        epilog="Examples: syndicate | syndicate -x codex | syndicate team task --project /repo 'task' | syndicate team init",
+    )
+    sub.add_argument('-x', '--runtime', choices=CLIS, help='Chief of Staff CLI')
     cmds = sub.add_subparsers(dest="cmd", required=True)
+    team_parser = cmds.add_parser('team', help='initialize a project or execute a task')
+    team_actions = team_parser.add_subparsers(dest='action', required=True)
+    task_parser = team_actions.add_parser('task', parents=[run], add_help=False, help='run a project task')
+    task_parser.set_defaults(fn=cmd_task)
     p = cmds.add_parser("chief-of-staff", help="run the cross-project Chief of Staff separately from project teams")
     p.add_argument("-x", "--runtime", choices=CLIS)
     p.add_argument("-p", "--print", action="store_true", help="run headless and print the result")
@@ -1779,8 +1913,8 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     edit.add_argument("--summary")
     edit.add_argument("--state", choices=("queued", "running", "waiting_on_user", "blocked", "failed", "done"))
     edit.set_defaults(fn=cmd_tasks)
-    p = cmds.add_parser("init", help="create .syndicate/ in a project and exclude it from git")
-    p.add_argument("-C", "--dir", default=".")
+    p = team_actions.add_parser("init", help="create .syndicate/ in a project and exclude it from git")
+    p.add_argument("--project", dest="dir", default=".")
     p.set_defaults(fn=cmd_init)
     p = cmds.add_parser("config", help="show the merged settings, or every layer with --local")
     p.add_argument("-C", "--dir", help="project directory (default: project whose status was updated last)")
@@ -1789,11 +1923,11 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p.add_argument("--global", dest="global_", action="store_true",
                    help="print only the user-wide syndicate.conf")
     p.set_defaults(fn=cmd_config)
-    p = cmds.add_parser("run-role", help="run one role headlessly on its configured CLI (used by relay agents)")
+    p = team_actions.add_parser("run-role", help="run one role headlessly on its configured CLI (used by relay agents)")
     p.add_argument("role")
     p.add_argument("--runtime", choices=CLIS, help="use the runtime resolved by the parent session")
     p.add_argument("brief", help="the task, or - to read it from stdin")
-    p.add_argument("-C", "--dir", default=".")
+    p.add_argument("--project", dest="dir", default=".")
     p.set_defaults(fn=cmd_run_role)
     p = cmds.add_parser("setup-codex-gate", help="install the review-gate hook into ~/.codex/hooks.json (once)")
     p.add_argument("--remove", action="store_true")
@@ -1818,6 +1952,12 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
 
 
 def main(argv: list[str]) -> int:
+    inside_tmux = bool(argv and argv[0] == '_in-tmux')
+    if inside_tmux:
+        argv = argv[1:]
+    original_argv = list(argv)
+    if not argv:
+        argv = ['chief-of-staff']
     if argv == ["_claude-usage"]:
         try:
             observation = runtime.save_observation("claude", json.load(sys.stdin))
@@ -1831,12 +1971,43 @@ def main(argv: list[str]) -> int:
         return runtime.monitor_forever()
     run, sub = build_parsers()
     try:
-        if argv and argv[0] in ("init", "config", "run-role", "setup-codex-gate", "dashboard", "web", "limits", "tasks", "decisions", "briefing", "briefs", "sessions", "requests", "chief-of-staff", "live", "messages"):
+        if argv[0] in ("team", "config", "setup-codex-gate", "dashboard", "web", "limits", "tasks", "decisions", "briefing", "briefs", "sessions", "requests", "chief-of-staff", "live", "messages"):
             args = sub.parse_args(argv)
-            return args.fn(args)
-        args = run.parse_args(argv)
-        args.fn = cmd_run
-        return cmd_run(args)
+        elif argv[0] in ('-h', '--help'):
+            sub.parse_args(argv)
+        else:
+            args = sub.parse_args(['chief-of-staff', *argv])
+        if args.fn in (cmd_task, cmd_run_role, cmd_chief_of_staff) and not getattr(args, 'dry_run', False) and not inside_tmux and not (args.fn == cmd_run_role and os.environ.get('TMUX')) and tmux_enabled():
+            if args.fn == cmd_chief_of_staff:
+                # Detect a direct or tmux owner before starting another CLI.
+                # The child acquires the lifetime lock too, closing launch races.
+                with chief_session_lock(probe=True):
+                    pass
+                directory = REGISTRY_PATH.parent / 'portfolio' / 'workspace'
+                directory.mkdir(parents=True, exist_ok=True)
+                name = 'chief-of-staff-work'
+            else:
+                project = getattr(args, 'project', None)
+                directory = execution_project(project or getattr(args, 'dir', '.'))
+                name = re.sub(r'[^\w-]', '-', directory.name) + '-work'
+                if args.fn == cmd_task:
+                    for session in coordination_store().snapshot()['sessions']:
+                        if session['live'] and (session['source_path'] == str(directory)
+                                                or task_project(Path(session['source_path']), session['task_id']) == str(directory)):
+                            print(f"Team already running: {session['id']} / task {session['task_id']}")
+                            return 0
+                else:
+                    name += '-' + args.role + '-' + uuid.uuid4().hex[:8]
+                    if args.brief == '-':
+                        # Materialize piped briefs before detaching from the terminal.
+                        brief = sys.stdin.read()
+                        original_argv = ['team', 'run-role', args.role, '--project', str(directory)]
+                        if args.runtime:
+                            original_argv += ['--runtime', args.runtime]
+                        original_argv += ['--', brief]
+            return launch_tmux(original_argv, directory, name,
+                               headless=getattr(args, 'print', False) or args.fn == cmd_run_role)
+        return args.fn(args)
     except (SyndicateError, portfolio.PortfolioError) as e:
         print(f"syndicate: {e}", file=sys.stderr)
         return 1

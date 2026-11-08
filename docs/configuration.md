@@ -26,7 +26,7 @@ registered projects, `task-edits.json` stores task-management overrides, and
 isolated Chief of Staff workspace. See the [Chief of Staff guide](chief-of-staff.md)
 for its separate launch path; project role/runtime settings do not configure it.
 
-Run `syndicate init` inside a project to create `syndicate.conf` and `roles/` and the
+Run `syndicate team init` inside a project to create `syndicate.conf` and `roles/` and the
 git exclusion. Every file below is optional: with no `.syndicate/` at all, the
 project runs the global team on Claude Code, plus any user-wide settings.
 
@@ -66,7 +66,7 @@ A role named in the user file must exist on the project being launched: a
 global role, or a role defined in that project's `.syndicate/roles/`. An
 unknown name or CLI is an error in either file.
 
-`syndicate init` writes a commented `.syndicate/syndicate.conf` when the project does
+`syndicate team init` writes a commented `.syndicate/syndicate.conf` when the project does
 not already have one. It does not copy values out of the user file, so a later
 edit there still reaches every project that left the key unset.
 
@@ -77,6 +77,7 @@ the user file.
 
 | Key | Values | Meaning |
 |---|---|---|
+| `tmux` | `on` (default) \| `off` | Global-only setting: run Chief of Staff, team tasks, and specialist CLIs in tmux, or execute directly. Project overrides are rejected. |
 | `handoff` | `on` \| `off` | Managed quota monitoring and automatic handoff (default `on`). |
 | `handoff-reserve` | number between 0 and 100, exclusive | Account usage remaining at which to stop (default `10`). |
 | `default` | `claude` \| `codex` | CLI for every role not listed individually. |
@@ -85,6 +86,16 @@ the user file.
 | `review-gate` | `on` (default) \| `off` | Block finishing until `code-reviewer` has reviewed delegated work. |
 | `inbox-interval` | minutes dividing 60 evenly (default `5`) | Scheduled inbox cadence. Examples: `5`, `10`, `15`, `30`, `60`. |
 | `inbox-transport` | `auto` (default) \| `poll` \| `channel` | `auto`: Codex native queue, Claude native scheduled polling. `channel`: explicit Claude preview channel. |
+
+Set `tmux = off` in `~/.config/syndicate/syndicate.conf` (or
+`$XDG_CONFIG_HOME/syndicate/syndicate.conf`) to disable tmux for every execution
+task. With tmux enabled, Chief of Staff uses `chief-of-staff-work` and project
+tasks use `<project_name>-work`. Interactive launches attach automatically from
+a terminal outside tmux; launches from inside tmux remain detached and print an
+attach command. Headless runs wait and return the CLI's stdout, stderr, and exit
+code. Specialists already inside a team tmux session run there; standalone
+specialist runs use a temporary named session. Missing tmux produces an error
+with instructions to install it or disable the setting. Dry runs start nothing.
 
 Chief of Staff inherits the two inbox settings from the user file, without
 loading project settings or role assignments. Both launch paths accept
@@ -159,14 +170,14 @@ thin, and put business logic in services/.
 The orchestrator runs in one CLI (the host) and can only spawn that CLI's own
 agents. A role configured for the *other* CLI appears in the host as a thin
 **relay agent** with the same name and description. When the orchestrator
-delegates to it, the relay runs `syndicate run-role <role>`, which executes the
+delegates to it, the relay runs `syndicate team run-role <role>`, which executes the
 real role headlessly on its own CLI and hands the output back. Because the relay
 keeps the role's name, delegation and the review gate work identically.
 
 Things to know:
 
 - **Claude host, Codex role.** The generated settings allow the relay's exact
-  command (`Bash(<syndicate> run-role *)`) so it doesn't prompt every time.
+  command (`Bash(<syndicate> team run-role *)`) so it doesn't prompt every time.
 - **Codex host, Claude role.** Codex's sandbox blocks network by default, so the
   relayed `claude` couldn't reach its API. When a Claude-backed role exists under
   a Codex host, syndicate launches Codex with
@@ -188,7 +199,7 @@ Things to know:
 - `.syndicate/` is excluded through the repository's **local-only**
   `.git/info/exclude` (correct for worktrees and for projects in a repo
   subdirectory), never `.gitignore`, so nothing is added to a tracked file.
-  `syndicate init` and every run make sure the entry exists.
+  `syndicate team init` and every run make sure the entry exists.
 - If `.syndicate/` files are already tracked, syndicate warns and tells you to
   `git rm -r --cached .syndicate`.
 - Outside a git repository there is nothing to exclude and syndicate says so.
@@ -218,7 +229,7 @@ hooks under `.claude/` and `.codex/`, and merged a Stop entry into
 In a project you installed into, delete the copied files (`.claude/agents/*.md`,
 `.claude/hooks/require-review.sh`, `.codex/agents/*.toml`,
 `.codex/hooks/require-review.sh`) and remove the `require-review.sh` Stop entry
-from `.claude/settings.json` and `.codex/hooks.json`, then run `syndicate init`.
+from `.claude/settings.json` and `.codex/hooks.json`, then run `syndicate team init`.
 Check `git status` first so you only remove files syndicate created.
 
 ## Troubleshooting

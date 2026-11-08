@@ -56,31 +56,40 @@ setup-codex-gate` once and approve the hook in Codex (see
 ## Use
 
 ```sh
+# Greet, get a portfolio briefing, and choose what to do next (from any directory)
+syndicate
+syndicate -x codex  # same Chief of Staff opening, hosted on Codex
+
 # Coordinate across projects (independent portfolio session)
 syndicate chief-of-staff -x codex
 
 # Run the orchestrator on a project (interactive)
-syndicate -C ~/code/some-project "add rate limiting to the public API"
+syndicate team task --project ~/code/some-project "add rate limiting to the public API"
 
 # Headless: prints the result and exits
-syndicate -C ~/code/some-project -p "add rate limiting to the public API"
+syndicate team task --project ~/code/some-project -p "add rate limiting to the public API"
 
 # Host the session on Codex for this run
-syndicate -x codex -C ~/code/some-project "..."
+syndicate team task -x codex --project ~/code/some-project "..."
 
-syndicate init   -C ~/code/some-project   # create .syndicate/ (optional)
+syndicate team init   --project ~/code/some-project   # create .syndicate/ (optional)
 syndicate config                          # merged settings for the project updated last
 syndicate config --local -C ~/code/some-project
 syndicate config --global                     # user-wide ~/.config/syndicate/syndicate.conf
 ```
 
-Run from inside a project, `-C` can be omitted. The orchestrator decides which
+Run from inside a project, `--project` can be omitted. The orchestrator decides which
 roles the task needs and delegates to them. Extra arguments after the task are
 passed to the underlying CLI.
 
+All CLI execution uses tmux by default. Chief of Staff uses `chief-of-staff-work`;
+project tasks use `<project_name>-work`. To disable tmux globally, add
+`tmux = off` to `~/.config/syndicate/syndicate.conf` (or the corresponding
+`$XDG_CONFIG_HOME` path). Headless runs still return their output and exit code.
+
 ## Customizing a project
 
-Everything lives in `<project>/.syndicate/`, created by `syndicate init` and
+Everything lives in `<project>/.syndicate/`, created by `syndicate team init` and
 excluded from git automatically:
 
 ```
@@ -110,7 +119,7 @@ role, see [`docs/adding-a-role.md`](docs/adding-a-role.md).
 
 The orchestrator runs in one CLI and can only spawn that CLI's agents. A role
 assigned to the *other* CLI shows up in the host as a thin relay agent with the
-same name; delegating to it runs `syndicate run-role <role>`, which executes the
+same name; delegating to it runs `syndicate team run-role <role>`, which executes the
 real role headlessly on its own CLI and returns the output. Roles are injected
 at launch (Claude via `--agents`, Codex via `-c`), so no agent files are written
 into the project. Note that a Codex host with a Claude-backed role enables
@@ -125,7 +134,7 @@ other CLI. A confirmed switch moves every role for that run. The bundled
 handoff skill keeps a checkpoint so decisions and pending work survive.
 
 ```sh
-syndicate --reserve 20 -C ~/code/some-project "your task"
+syndicate team task --reserve 20 --project ~/code/some-project "your task"
 syndicate limits --watch
 ```
 
@@ -197,8 +206,8 @@ or `generic`; put it before the task text. A repo selection starts work at that
 repo's root. Explicit `generic` keeps the working directory and skips the question.
 
 ```sh
-syndicate --project /home/nick/workspace/DigitalFront-AI/graphcue "Fix onboarding"
-syndicate --project generic "Draft a checklist"
+syndicate team task --project /home/nick/workspace/DigitalFront-AI/graphcue "Fix onboarding"
+syndicate team task --project generic "Draft a checklist"
 syndicate tasks list --project generic
 syndicate tasks list --json
 syndicate tasks edit TASK_ID --project graphcue

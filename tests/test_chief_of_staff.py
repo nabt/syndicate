@@ -2,6 +2,9 @@ import contextlib
 import fcntl
 import io
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,6 +23,79 @@ class ChiefOfStaff(ProjectCase):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             result = sy.main(['chief-of-staff', *args])
         return result, output.getvalue()
+
+    def test_bare_command_opens_interactive_chief_from_any_directory(self):
+        outside = self.project / 'outside-repo'
+        outside.mkdir()
+        for directory in (self.project, outside):
+            with self.subTest(directory=directory), \
+                 patch.object(sy.os, 'getcwd', return_value=str(directory)), \
+                 patch.object(sy, 'require_clis'), \
+                 patch.object(sy.runtime, 'start_monitor'), \
+                 patch.object(sy.runtime, 'supervise', return_value=(0, None)) as supervise, \
+                 patch.object(sy, 'cmd_run') as run_project, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sy.main([]), 0)
+                run_project.assert_not_called()
+                self.assertEqual(supervise.call_args.args[1], self.workspace)
+                self.assertFalse(supervise.call_args.kwargs['headless'])
+                prompt = supervise.call_args.args[0][-1]
+                self.assertIn('brief greeting', prompt)
+                self.assertIn('current briefing', prompt)
+                self.assertIn('Follow up conversationally', prompt)
+                self.assertIn('resume existing work', prompt)
+        self.assertFalse(sy.status_path(self.project).exists())
+        self.assertFalse(sy.REGISTRY_PATH.exists())
+
+    def test_explicit_run_arguments_still_launch_project(self):
+        with patch.object(sy, 'resolve_project', return_value=self.project), \
+                 patch.object(sy, 'cmd_run', return_value=0) as run_project, \
+             patch.object(sy, 'cmd_chief_of_staff') as chief:
+            self.assertEqual(sy.main(['team', 'task', '--project', str(self.project), 'Build a feature']), 0)
+        chief.assert_not_called()
+        self.assertEqual(run_project.call_args.args[0].rest, ['Build a feature'])
+
+    def test_runtime_only_opens_chief_with_opening_prompt(self):
+        for flags in (['-x', 'codex'], ['--runtime', 'codex'],
+                      ['--runtime=codex'], ['-xcodex'], ['-x', 'claude']):
+            with self.subTest(flags=flags), \
+                 patch.object(sy, 'require_clis'), \
+                 patch.object(sy.runtime, 'start_monitor'), \
+                 patch.object(sy.runtime, 'supervise', return_value=(0, None)) as supervise, \
+                 patch.object(sy, 'cmd_run') as run_project, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sy.main(flags), 0)
+                run_project.assert_not_called()
+                argv = supervise.call_args.args[0]
+                self.assertEqual(argv[0], 'claude' if flags[-1] == 'claude' else 'codex')
+                self.assertEqual(supervise.call_args.args[1], self.workspace)
+                self.assertIn('brief greeting', argv[-1])
+                self.assertIn('current briefing', argv[-1])
+                self.assertIn('Follow up conversationally', argv[-1])
+
+    def test_runtime_with_project_or_task_still_opens_orchestrator(self):
+        for flags in ([], ['-x', 'codex'], ['-x', 'codex', '--project', '.'], ['-x', 'codex', 'Build a feature']):
+            with self.subTest(flags=flags), \
+                 patch.object(sy, 'resolve_project', return_value=self.project), \
+                 patch.object(sy, 'cmd_run', return_value=0) as run_project, \
+                 patch.object(sy, 'cmd_chief_of_staff') as chief:
+                self.assertEqual(sy.main(['team', 'task', *flags]), 0)
+                run_project.assert_called_once()
+                chief.assert_not_called()
+
+    def test_top_level_project_options_require_team(self):
+        with patch.object(sy, 'cmd_run') as run_project, \
+             contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            sy.main(['-C', str(self.project), 'Build a feature'])
+        run_project.assert_not_called()
+
+    def test_top_level_task_goes_to_chief(self):
+        with patch.object(sy, 'cmd_chief_of_staff', return_value=0) as chief, \
+             patch.object(sy, 'cmd_run') as run_project:
+            self.assertEqual(sy.main(['-x', 'codex', 'Brief me']), 0)
+        self.assertEqual(chief.call_args.args[0].task, 'Brief me')
+        self.assertEqual(chief.call_args.args[0].runtime, 'codex')
+        run_project.assert_not_called()
 
     def test_role_is_separate_from_project_rosters(self):
         team = sy.resolve_team(self.project)
@@ -105,6 +181,67 @@ class ChiefOfStaff(ProjectCase):
                 self.assertEqual(self.command('-x', 'codex')[0], 1)
             supervise.assert_not_called()
         self.assertEqual((local / 'status.json').read_text(), '{"state":"running"}')
+
+    def test_pid_is_recorded_while_running_and_cleared_on_exit(self):
+        path = self.workspace.parent / 'chief-of-staff.lock'
+        def supervised(*args, **kwargs):
+            self.assertEqual(path.read_text(), f'{os.getpid()}\n')
+            fd, = kwargs['pass_fds']
+            self.assertEqual(os.fstat(fd).st_ino, path.stat().st_ino)
+            with self.assertRaisesRegex(sy.SyndicateError, f'PID {os.getpid()}'):
+                with sy.chief_session_lock():
+                    self.fail('second owner acquired the lock')
+            return 0, None
+        with patch.object(sy, 'require_clis'), patch.object(sy.runtime, 'start_monitor'), \
+             patch.object(sy.runtime, 'supervise', side_effect=supervised):
+            self.assertEqual(self.command('-x', 'codex')[0], 0)
+        self.assertEqual(path.read_text(), '')
+
+    def test_stale_malformed_and_reused_pid_records_do_not_block(self):
+        path = self.workspace.parent / 'chief-of-staff.lock'
+        path.parent.mkdir(parents=True)
+        for record in ('999999999\n', 'not a pid\n', f'{os.getpid()}\n', ''):
+            with self.subTest(record=record):
+                path.write_text(record)
+                with sy.chief_session_lock():
+                    self.assertEqual(path.read_text(), f'{os.getpid()}\n')
+                self.assertEqual(path.read_text(), '')
+
+    def test_direct_owner_blocks_tmux_and_tmux_child_launches(self):
+        with sy.chief_session_lock():
+            for argv in (['-x', 'codex'], ['_in-tmux', '-x', 'claude']):
+                with self.subTest(argv=argv), \
+                     patch.object(sy, 'tmux_enabled', return_value=True), \
+                     patch.object(sy, 'launch_tmux') as launch, \
+                     patch.object(sy, 'require_clis'), \
+                     patch.object(sy.runtime, 'supervise') as supervise:
+                    self.assertEqual(sy.main(argv), 1)
+                    launch.assert_not_called()
+                    supervise.assert_not_called()
+
+    def test_killed_owner_does_not_leave_a_stale_lock(self):
+        path = self.workspace.parent / 'chief-of-staff.lock'
+        path.parent.mkdir(parents=True)
+        code = ("import fcntl,os,sys,time; "
+                "f=open(sys.argv[1], 'a+'); fcntl.flock(f, fcntl.LOCK_EX); "
+                "f.seek(0); f.truncate(); f.write(str(os.getpid())+'\\n'); f.flush(); "
+                "print('locked', flush=True); time.sleep(60)")
+        proc = subprocess.Popen([sys.executable, '-c', code, str(path)], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(proc.stdout.readline().strip(), 'locked')
+            with self.assertRaisesRegex(sy.SyndicateError, str(proc.pid)):
+                with sy.chief_session_lock():
+                    self.fail('lock acquired while owner was alive')
+            proc.kill()
+            proc.wait(timeout=5)
+            self.assertEqual(path.read_text(), f'{proc.pid}\n')
+            with sy.chief_session_lock():
+                self.assertEqual(path.read_text(), f'{os.getpid()}\n')
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+            proc.stdout.close()
 
     def make_snapshot(self, provider='claude', role='chief-of-staff'):
         snapshot = self.project / 'snapshot'
