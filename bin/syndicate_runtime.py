@@ -364,7 +364,7 @@ def stop_group(proc, known=None):
     proc.wait()
 
 
-def supervise(argv, project, providers, threshold, task, host, headless=False):
+def supervise(argv, project, providers, threshold, task, host, headless=False, live=None):
     """Proxy a CLI terminal while keeping monitoring outside the model loop."""
     run_id = time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     local = project / ".syndicate"
@@ -376,6 +376,17 @@ def supervise(argv, project, providers, threshold, task, host, headless=False):
             reason = f"{provider}: {remaining:g}% account usage remaining (reserve {threshold:g}%); no CLI launched"
             return 75, create_handoff(project, host, task, reason, run_id)
     interactive = not headless and sys.stdin.isatty() and sys.stdout.isatty()
+    delivery = None
+    if live and interactive:
+        # Lazy import avoids a runtime/portfolio/live import cycle.
+        from syndicate_live import Delivery
+        delivery = Delivery(live['directory'], project, run_id, host,
+                            chief=live.get('chief', False), interval=live.get('interval', 5),
+                            transport=live.get('transport', 'auto'))
+        record = read_json(local / 'run.json')
+        record['live_endpoint'] = str(delivery.path)
+        atomic_json(local / 'run.json', record)
+        argv = delivery.prepare(argv)
     old_terminal = termios.tcgetattr(sys.stdin) if interactive else None
     master = None
     sel = selectors.DefaultSelector()
@@ -393,6 +404,8 @@ def supervise(argv, project, providers, threshold, task, host, headless=False):
             proc = subprocess.Popen(argv, cwd=project, stdin=slave, stdout=slave, stderr=slave,
                                     preexec_fn=child_setup)
         except BaseException:
+            if delivery:
+                delivery.close()
             os.close(master)
             sel.close()
             raise
@@ -465,6 +478,8 @@ def supervise(argv, project, providers, threshold, task, host, headless=False):
                             break
                 if reason:
                     break
+                if delivery:
+                    delivery.tick(now)
             # Drain bytes already written by a fast-exiting CLI. Do not wait
             # for worker-held descriptors after the leader exits.
             for key in list(sel.get_map().values()):
@@ -486,6 +501,8 @@ def supervise(argv, project, providers, threshold, task, host, headless=False):
         reason = "Interrupted by user"
     finally:
         stop_group(proc, workers)
+        if delivery:
+            delivery.close()
         sel.close()
         if master is not None:
             os.close(master)

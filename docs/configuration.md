@@ -44,11 +44,11 @@ reads them on every run and does not copy one onto the other.
 
 | Layer | Where | Effect |
 |---|---|---|
-| Built-in default | in `bin/syndicate` | `default = claude`, `handoff = on`, `handoff-reserve = 10`, `review-gate = on`. |
+| Built-in default | in `bin/syndicate` | `default = claude`, `handoff = on`, `handoff-reserve = 10`, `review-gate = on`, `inbox-interval = 5`, `inbox-transport = auto`. |
 | Environment | `$SYNDICATE_RUNTIME` | Sets `default` only, when the variable is set. |
 | User | `$XDG_CONFIG_HOME/syndicate/syndicate.conf`, or `~/.config/syndicate/syndicate.conf` when `XDG_CONFIG_HOME` is unset or empty | Applies to every project. |
 | Project | `<project>/.syndicate/syndicate.conf` | Replaces the same key from the layers above and leaves every other key alone. |
-| One run | `-x`, `--reserve` | Host CLI and reserve for this launch. `--all-runtime` assigns every specialist for this launch. |
+| One run | `-x`, `--reserve` | Host CLI and reserve for this launch. `--all-runtime` assigns every specialist. `--inbox-interval`, `--inbox-transport`, and `--no-live` control inbox delivery. |
 
 ```
 # ~/.config/syndicate/syndicate.conf
@@ -83,6 +83,15 @@ the user file.
 | `orchestrator` | `claude` \| `codex` | CLI that **hosts the session**. Every other role is delegated to from here. |
 | `<role name>` | `claude` \| `codex` | CLI for that one role: any global role, or a project-only role you defined. |
 | `review-gate` | `on` (default) \| `off` | Block finishing until `code-reviewer` has reviewed delegated work. |
+| `inbox-interval` | minutes dividing 60 evenly (default `5`) | Scheduled inbox cadence. Examples: `5`, `10`, `15`, `30`, `60`. |
+| `inbox-transport` | `auto` (default) \| `poll` \| `channel` | `auto`: Codex native queue, Claude native scheduled polling. `channel`: explicit Claude preview channel. |
+
+Chief of Staff inherits the two inbox settings from the user file, without
+loading project settings or role assignments. Both launch paths accept
+`--inbox-interval MINUTES` and `--inbox-transport MODE` overrides. Polling defaults
+to five minutes and checks messages, requests, and decisions only; ordinary
+project-status refreshes remain manual. See [live inbox delivery](chief-of-staff.md#live-inbox-delivery)
+for scheduling, standardized queue envelopes, readiness, and acknowledgments.
 
 ```
 # Everything on Claude, but reviews come from Codex:

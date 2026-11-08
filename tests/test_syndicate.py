@@ -166,6 +166,21 @@ class ConfigParsing(ProjectCase):
         self.assertEqual(team.config_sources["handoff"], "default")
         self.assertFalse(sy.user_config_path().exists())
 
+    def test_inbox_config_merges_and_cli_wins(self):
+        self.user_config('inbox-interval = 10\ninbox-transport = poll\n')
+        self.config('inbox-interval = 15\n')
+        team = sy.resolve_team(self.project)
+        self.assertEqual(team.config['inbox-interval'], '15')
+        self.assertEqual(team.config['inbox-transport'], 'poll')
+        args = sy.build_parsers()[0].parse_args(['--inbox-interval', '30', '--inbox-transport', 'auto'])
+        self.assertEqual(sy.inbox_options(args, team.config), dict(interval=30, transport='auto'))
+
+    def test_invalid_inbox_config_is_rejected(self):
+        for content in ('inbox-interval = 0', 'inbox-interval = 7', 'inbox-interval = nan', 'inbox-transport = invalid'):
+            self.config(content + '\n')
+            with self.assertRaises(sy.SyndicateError):
+                sy.resolve_team(self.project)
+
     def test_user_file_errors_include_its_path(self):
         self.user_config("review-gate = maybe\n")
         with self.assertRaises(sy.SyndicateError) as caught:
@@ -371,6 +386,7 @@ class LaunchCommands(ProjectCase):
         self.config("default = codex\n")
         for headless in (False, True):
             argv = sy.build_codex(sy.resolve_team(self.project), headless, ["task"])
+            self.assertEqual(argv[argv.index("-s") + 1], "workspace-write")
             roots = [argv[index + 1] for index, flag in enumerate(argv) if flag == "--add-dir"]
             self.assertEqual(roots, [str(sy.REGISTRY_PATH.parent / "portfolio")])
             self.assertTrue(Path(roots[0]).is_dir())

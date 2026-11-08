@@ -52,6 +52,172 @@ status and checkpoints are accepted. On resume, the agent reads the snapshot
 and reconciles it with fresh portfolio records; it preserves unresolved work
 without assuming that interrupted actions succeeded.
 
+## Live inbox delivery
+
+New managed interactive sessions enable automatic inbox delivery by default.
+Restart already-running teams and Chief of Staff once to load it. Codex's root
+agent runs the supplied `syndicate live attach -C SOURCE` startup instruction;
+this binds its `CODEX_THREAD_ID` to that managed run. Specialists must not attach.
+Claude registers a native session timer at startup. No terminal input is
+injected, and receiving an event does not start a stopped team or switch providers.
+
+Codex's default host queue checks for inbox events approximately once a second.
+Claude defaults to a session timer that runs the bundled
+[`syndicate-inbox` skill](../skills/syndicate-inbox/SKILL.md) every five minutes;
+preview channels are not required. Both use the same durable event queue:
+
+| Event | Recipient |
+|---|---|
+| New queued request | Live owner of that exact source/task and bound session |
+| New answer or revised answer | Live owner of the decision's source/task |
+| Open or edited decision question | Running Chief of Staff |
+| Request acknowledged or failed; decision resolved | Running Chief of Staff |
+| Explicit project message | Running Chief of Staff |
+
+Codex uses its native [`queue` command](https://learn.chatgpt.com/docs/developer-commands#codex-queue)
+without `--resume`; Claude uses its native
+[`/loop`/cron scheduler](https://code.claude.com/docs/en/scheduled-tasks).
+Provider scheduling determines the next safe delivery point. Tool calls and
+permission prompts are not forcibly interrupted. Normal tool permissions and
+account reserve monitoring still apply. Ordinary project status changes do not
+wake Chief of Staff; ask it for a status refresh when needed.
+
+Configure polling in the user-wide or project `syndicate.conf`:
+
+```ini
+inbox-interval = 5
+inbox-transport = auto
+```
+
+The interval is in minutes. Supported values divide an hour evenly: 1, 2, 3, 4,
+5, 6, 10, 12, 15, 20, 30, or 60. Unsupported values fail instead of silently
+rounding the schedule. `auto` selects Codex queue delivery or Claude scheduled
+polling. `poll` selects polling for either provider; Codex then checks on the
+configured host interval and queues a model turn only when new events exist.
+Chief of Staff inherits these two user settings, ignoring project settings.
+Override a run with `--inbox-interval MINUTES` or `--inbox-transport MODE`:
+
+```sh
+syndicate chief-of-staff -x claude --inbox-interval 10
+syndicate -x codex --all-runtime codex -C /source/repo \
+  --inbox-transport poll --inbox-interval 5 "Continue the project"
+```
+
+Claude's root agent registers one recurring CronCreate job and records its ID.
+Restored inbox jobs are reconciled on resume, without altering unrelated jobs.
+No global scheduler or provider configuration is modified. Native scheduling
+runs between turns, can be delayed by work or provider timing, and expires after
+seven days unless renewed. It needs a running session and available cron tools;
+when unavailable, the agent reports that polling is unavailable and retains
+boundary checks. Empty Claude timer runs still use model turns. Polling never
+refreshes routine project status or bypasses account reserve monitoring.
+
+`channel` is an explicit Claude-only alternative using an MCP
+[channel notification](https://code.claude.com/docs/en/channels-reference).
+Claude custom channels currently require its preview feature and the
+`--dangerously-load-development-channels server:syndicate-live` flag, supplied
+only to interactive managed launches that select `channel`. This admits Syndicate's bundled channel;
+it does not bypass tool permissions or relay approvals. If the account does not
+support channels, use the default scheduled polling. `--no-live` is also
+available for Codex and Chief of Staff. Headless launches and `handoff = off`
+retain boundary checks without automatic delivery.
+
+Orchestrators use decisions for questions requiring a durable answer. For other
+prompts to present to the requester:
+
+```sh
+syndicate messages send "Please inspect the proposed onboarding flow" \
+  -C /source/repo --task TASK_ID --session SESSION_ID --key onboarding-preview
+syndicate messages list --json
+# Chief of Staff acknowledges after presenting the message:
+syndicate messages acknowledge MESSAGE_ID
+syndicate messages list --all --json
+```
+
+Messages are durable in `~/.syndicate/portfolio/messages.json`. Sending requires
+the active owning session; repeated source/task/session/key values return the
+same message. Changed text needs a new key. Presentation acknowledgment does not
+resolve a decision or complete project work.
+
+Inspect transport readiness and delivery errors with:
+
+```sh
+syndicate live status -C /source/repo
+syndicate live status -C ~/.syndicate/portfolio/workspace
+```
+
+For Codex, expect a `thread_id`. For Claude polling, expect `mode: poll`, a
+`scheduler_job_id`, and `last_checked_at` after a successful poll. For an opt-in
+Claude channel, expect `channel_ready: true`. `delivered` tracks provider
+queue/channel submissions or handled polling envelopes, independently
+of request, decision, and message acknowledgments. Failed queue/channel submissions
+retain `last_error` and retry after ten seconds while the supervised CLI is running.
+Failed scheduled checks leave events unseen and retry at the next polling interval.
+Delivery is at least once: a crash between provider submission and recording it
+can repeat a notification. Receivers must read fresh records and keep normal
+acknowledgments idempotent. Undelivered records remain available after shutdown.
+
+### Common message envelope and ordering
+
+Requests, decision changes, and orchestrator messages retain their typed durable
+records and existing acknowledgments. All transports wrap record references in
+the same versioned envelope, stored in `~/.syndicate/portfolio/events.json`:
+
+```json
+{
+  "schema_version": 1,
+  "event_id": "request:RECORD_ID:queued:CONTENT_DIGEST",
+  "sequence": 42,
+  "correlation_id": "request:RECORD_ID",
+  "kind": "request",
+  "state": "queued",
+  "occurred_at": "2026-11-08T18:00:00+00:00",
+  "enqueued_at": "2026-11-08T18:00:01+00:00",
+  "sender": {"role": "chief-of-staff"},
+  "recipient": {
+    "role": "project-orchestrator",
+    "source_path": "/source/repo",
+    "task_id": "TASK_ID",
+    "session_id": "SESSION_ID"
+  },
+  "payload": {
+    "record_type": "request",
+    "record_id": "RECORD_ID",
+    "answer_revision": null
+  }
+}
+```
+
+`sequence` is the authoritative global enqueue order, allocated under a shared
+lock. Simultaneously observed records are sorted by occurrence time and stable
+ID before enqueuing. Later discoveries get later sequences, even if their source
+timestamp is older. The stable event ID deduplicates repeated reports; changed
+content, state, or answer revision creates a distinct event. Correlation IDs
+group changes to the same request, decision, or message. Sender/recipient roles
+are explicit, with source/task/session identity when available. Timestamps are
+informational and do not authorize session reassignment.
+
+Polling returns up to 20 relevant, unseen envelopes in FIFO order:
+
+```sh
+syndicate live poll -C /source/repo
+# After incorporation/presentation and any application acknowledgment:
+syndicate live seen EVENT_ID -C /source/repo
+```
+
+`seen` does not replace a request, decision, or message acknowledgment. Unseen
+envelopes retry on the next poll. Seen markers are per managed run, so pending
+durable work can be presented again after restart. Receivers read current records
+before acting, skip canceled work, and incorporate the newest answer revision.
+An independent event can proceed if an earlier one is blocked; its seen marker
+does not discard the earlier event. `has_more` indicates another bounded batch.
+
+Host process ownership checks must run outside PID-isolated sandboxes, with
+normal approval. New session records retain their PID namespace so an isolated
+reader gets an explicit validation error instead of falsely reporting a dead
+owner. Older records lack this guard; refresh them outside the sandbox or
+restart their sessions. Invisible processes do not prove a team has stopped.
+
 ## Using the workspace
 
 ```sh
@@ -78,8 +244,8 @@ key. Closed decisions stay closed when reported again. Use `--deadline` only
 for an explicitly supplied deadline. `decisions list --project NAME_OR_PATH`
 filters by dashboard ownership, which can differ from the source directory.
 
-Answers are persisted, not pushed into running CLI sessions. Orchestrators
-check the shared inbox at work/resume boundaries and acknowledge answers after
+Answers are persisted, and live notifications prompt managed interactive teams
+to read them. Other runs check the inbox at work/resume boundaries. Teams acknowledge answers after
 incorporating them. Acknowledgment must include the exact `answer_revision` read
 with the incorporated answer; a revision mismatch is rejected under the store
 lock, requiring the team to read and incorporate the new answer. Answered questions remain visible until then; resolved and
@@ -142,7 +308,8 @@ Requests are durable messages, not injected keystrokes or executable commands.
 They target a source/task and bind to the current live session when available.
 Without an owner, they wait for a session on that exact task. They are not
 silently moved to a new task when a project starts unrelated work. An owning
-team checks requests at safe boundaries; acknowledgment means incorporated,
+team receives a live inbox notification when supported and checks requests at
+safe boundaries; acknowledgment means incorporated,
 not completed. It must supply its active session token, source/task identity,
 and a note. Another session cannot acknowledge a request bound to an old one.
 
@@ -228,6 +395,19 @@ A generic waiting status alone is not enough to invent a decision question.
 Keep source project/task references visible so the requester can inspect context.
 
 ## Later delivery
+
+The requester deferred the following work for a future session:
+
+1. Mixed-provider live smoke test: run Claude on theforge, Codex on graphcue, and a separate
+   Chief of Staff session; verify ownership/current work, a routed request and
+   acknowledgment, and a decision question/answer/versioned acknowledgment cycle.
+   The Codex-only request/acknowledgment and decision/answer/revision acknowledgment
+   smoke test passed on 2026-11-08. Mixed-provider validation remains unrun.
+   Automatic delivery added afterward still needs a provider-backed smoke test.
+2. Show Chief of Staff running/waiting/stopped status and its latest checkpoint
+   summary in the dashboards.
+3. Notify the requester about decisions needing attention and failed requests.
+4. Add user-directed team start, pause, and handoff controls.
 
 Project briefs, session ownership, the acknowledged request channel, and the
 separate Chief of Staff agent are implemented. The remaining phase is team
