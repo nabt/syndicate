@@ -103,6 +103,69 @@ class RoleResolution(ProjectCase):
 
 
 class ConfigParsing(ProjectCase):
+    def test_cli_options_merge_and_preserve_types_and_quoted_comments(self):
+        self.user_config('codex-model_verbosity = high\ncodex-tui.show_tooltips = true\n'
+                         'claude-model = "sonnet#chosen" # comment\nclaude-verbose = true\n')
+        self.config('codex-model_verbosity = low\nclaude-verbose = false\n')
+        team = sy.resolve_team(self.project)
+        codex = sy.cli_options('codex', team.config)
+        self.assertIn('model_verbosity="low"', codex)
+        self.assertIn('tui.show_tooltips=true', codex)
+        self.assertNotIn('--model', codex)
+        self.assertEqual(sy.cli_options('claude', team.config), ['--model', 'sonnet#chosen'])
+        self.assertEqual(team.config_sources['codex-model_verbosity'], 'project')
+
+    def test_cli_values_are_separate_arguments_without_shell_evaluation(self):
+        value = '$(touch /tmp/never-run); "quoted" # literal'
+        self.config('codex-custom = ' + json.dumps(value) + '\n'
+                    'claude-system-prompt = ' + json.dumps(value) + '\n'
+                    'codex-features.example = true\ncodex-example.count = 3\n'
+                    'codex-example.items = ["one", "two"]\n')
+        team = sy.resolve_team(self.project)
+        argv = sy.build_codex(team, False, ['task'])
+        self.assertIn('custom=' + json.dumps(value), argv)
+        for encoded in ('features.example=true', 'example.count=3', 'example.items=["one", "two"]'):
+            self.assertIn(encoded, argv)
+        claude = sy.build_claude(team, False, ['task'])
+        self.assertEqual(claude[claude.index('--system-prompt') + 1], value)
+        self.assertNotIn('--system-prompt', argv)
+
+    def test_bad_cli_option_names_and_claude_collections_rejected(self):
+        for text in ('codex- = low', 'claude---model = low', 'codex-a b = low',
+                     'claude-model = ["sonnet"]'):
+            self.config(text + '\n')
+            with self.assertRaises(sy.SyndicateError):
+                sy.resolve_team(self.project)
+
+    def test_chief_cli_options_use_only_user_layer_and_selected_provider(self):
+        self.user_config('codex-model_verbosity = low\nclaude-model = sonnet\n')
+        self.config('codex-model_verbosity = high\nclaude-model = opus\n')
+        for headless in (False, True):
+            codex = sy.build_chief_of_staff('codex', self.project, headless, 'Brief me')
+            self.assertIn('model_verbosity="low"', codex)
+            self.assertNotIn('model_verbosity="high"', codex)
+            self.assertNotIn('--model', codex)
+            claude = sy.build_chief_of_staff('claude', self.project, headless, 'Brief me')
+            self.assertEqual(claude[claude.index('--model') + 1], 'sonnet')
+            self.assertFalse(any('model_verbosity=' in arg for arg in claude))
+
+    def test_specialist_launch_uses_its_runtime_options(self):
+        self.config('codex-model_verbosity = low\nclaude-model = sonnet\n')
+        for provider in ('claude', 'codex'):
+            with unittest.mock.patch.object(sy, 'require_clis'), \
+                 unittest.mock.patch.object(sy, 'execution_project', return_value=self.project), \
+                 unittest.mock.patch.object(sy, 'register_workspace', side_effect=lambda p: p), \
+                 unittest.mock.patch.object(sy.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+                self.assertEqual(sy.main(['team', 'run-role', 'code-reviewer', '--project',
+                                         str(self.project), '--runtime', provider, 'Review']), 0)
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[-2:], ['--', 'Review'])
+            if provider == 'codex':
+                self.assertIn('model_verbosity="low"', argv)
+                self.assertNotIn('--model', argv)
+            else:
+                self.assertEqual(argv[argv.index('--model') + 1], 'sonnet')
+
     def test_default_and_per_role(self):
         self.config("default = claude\ncode-reviewer = codex  # cheaper\n")
         team = sy.resolve_team(self.project)

@@ -97,6 +97,44 @@ code. Specialists already inside a team tmux session run there; standalone
 specialist runs use a temporary named session. Missing tmux produces an error
 with instructions to install it or disable the setting. Dry runs start nothing.
 
+Interactive Codex launches suppress the default welcome-screen onboarding tips
+with the built-in `codex-tui.show_tooltips = false` setting, for both project
+teams and Chief of Staff. Set it to `true` to restore tips.
+
+### CLI-specific options
+
+Use `<cli>-<option> = value` in either settings file. These keys follow the
+same per-key merge rules: project values replace user values, while omitted
+keys keep their user or built-in values. Only options for the CLI being
+launched are passed. Runtime overrides and mixed-provider specialist launches
+use the options for the selected runtime. Chief of Staff reads user settings
+only, independent of the current project.
+
+```ini
+codex-model_verbosity = low
+codex-tui.show_tooltips = false
+claude-model = sonnet
+claude-verbose = false
+```
+
+Codex keys become `--config` arguments: `codex-model_verbosity = low` produces
+`--config 'model_verbosity="low"'`. Bare strings are quoted as TOML strings;
+explicitly quoted strings, booleans, numbers, arrays, and inline tables retain
+their TOML types. Nested Codex keys use dots. These are Codex configuration
+keys, rather than top-level flags such as `--no-alt-screen`.
+
+Claude keys become long options: `claude-model = sonnet` produces
+`--model sonnet`. Boolean `true` passes a bare flag; `false` omits that flag.
+Quote `"false"` to pass it as a literal value. Claude values must be scalar.
+Options retain their spelling, including hyphens and underscores.
+
+Values are passed as individual arguments without shell expansion. Quoted `#`
+characters are preserved; unquoted `#` begins a comment. CLI options are added
+after Syndicate's generated options and before task text; explicit trailing
+CLI arguments come later. Use options supported by the selected provider and
+execution mode; Syndicate validates names and value shapes but leaves provider
+option support to that CLI. These settings affect Syndicate launches only.
+
 Chief of Staff inherits the two inbox settings from the user file, without
 loading project settings or role assignments. Both launch paths accept
 `--inbox-interval MINUTES` and `--inbox-transport MODE` overrides. Polling defaults
