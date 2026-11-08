@@ -4,7 +4,35 @@ Cross-project coordination layer for Syndicate. The first delivery provides
 persistent decisions, durable project briefs, session ownership, a team request
 channel, and briefing/inbox views in both dashboards. The Chief of Staff agent runs separately from project teams using those tools.
 
+## Routing new work
+
+For a new task without a running team, the Chief of Staff asks whether you want
+to start a Syndicate team. After approval it runs
+`syndicate team task --project PROJECT "task brief"`, which starts the CLI in a
+detached tmux session named `<project_name>-work`. Use `-x claude` or `-x codex`
+to select a provider. A live team is reused without launching another CLI;
+an existing tmux name without a verified live team is reported for inspection.
+Tmux is enabled globally by default; set `tmux = off` in the user config to run directly. Unsupported session-name punctuation becomes hyphens.
+Existing teams receive requests through their orchestrator, which decides
+whether the work extends the current goal or needs a fresh session. An explicit
+new-task indication always requires a fresh session and context, even in the
+same repository. Follow-ups within the current goal can stay in that session.
+
+Fresh tasks use a normal launch without `--handoff` or provider resume flags.
+The orchestrator preserves unfinished work and prepares a self-contained brief
+before returning session control to the requester and launcher. The current
+owner must exit before a replacement starts in the same project. Starting tmux
+confirms a launch request; verified session records confirm a running team.
+
 ## Launching the agent
+
+Run `syndicate` with no arguments (or only `-x codex` / `-x claude`) from any directory to open the Chief of Staff
+in its dedicated portfolio workspace. It greets you, refreshes portfolio
+records, gives a current briefing, and asks conversationally what you would
+like to do next: address approvals or prompts, start new tasks, or resume
+existing work. Actions follow your choice. Use `syndicate team task` with project/task arguments
+to launch the project orchestrator; `syndicate chief-of-staff` provides
+the Chief of Staff's runtime and other options.
 
 ```sh
 syndicate chief-of-staff -x claude
@@ -25,8 +53,20 @@ outside `roles/`. It is not injected into project teams and does not load their
 role overrides or runtime configuration. It uses a dedicated workspace at
 `~/.syndicate/portfolio/workspace`, with its own `.syndicate/status.json`,
 checkpoint and supervised session logs. It does not register a project or
-replace any project status or orchestrator session. A portfolio lock allows
-one Chief of Staff session at a time while project teams run independently.
+replace any project status or orchestrator session. One user-wide PID lock at
+`~/.syndicate/portfolio/chief-of-staff.lock` allows one active Chief of Staff
+session across providers and both tmux and direct execution. The supervisor
+records its PID and holds an exclusive kernel lock; the CLI inherits the lock
+so a surviving CLI still prevents a duplicate after a supervisor crash. Tmux
+launches check ownership before starting, and the child checks again to prevent
+launch races. Project teams run independently.
+
+Normal exit clears the PID record. After a crash, the kernel releases ownership
+when all holders exit; the next session replaces stale or malformed PID contents.
+A reused PID alone never blocks startup. The lock file stays in place to avoid
+inode races between concurrent launchers. A retained `chief-of-staff-work` tmux
+session can be replaced automatically only when every pane is dead; live panes
+are never removed automatically.
 
 Claude receives only the Chief of Staff custom role and Read/Bash built-in
 tools, without automatic permission bypass. Codex launches in the portfolio
@@ -99,7 +139,7 @@ Override a run with `--inbox-interval MINUTES` or `--inbox-transport MODE`:
 
 ```sh
 syndicate chief-of-staff -x claude --inbox-interval 10
-syndicate -x codex --all-runtime codex -C /source/repo \
+syndicate team task -x codex --all-runtime codex --project /source/repo \
   --inbox-transport poll --inbox-interval 5 "Continue the project"
 ```
 
@@ -407,7 +447,7 @@ The requester deferred the following work for a future session:
 2. Show Chief of Staff running/waiting/stopped status and its latest checkpoint
    summary in the dashboards.
 3. Notify the requester about decisions needing attention and failed requests.
-4. Add user-directed team start, pause, and handoff controls.
+4. Add user-directed team task, pause, and handoff controls.
 
 Project briefs, session ownership, the acknowledged request channel, and the
 separate Chief of Staff agent are implemented. The remaining phase is team

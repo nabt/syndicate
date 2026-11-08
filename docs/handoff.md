@@ -15,17 +15,17 @@ reserve is a precaution, not a guarantee that no request will hit a limit.
 
 ```sh
 # Default: stop at 10% remaining
-syndicate -C ~/code/project "implement the feature"
+syndicate team task --project ~/code/project "implement the feature"
 
 # Override for one run
-syndicate --reserve 20 -C ~/code/project "implement the feature"
+syndicate team task --reserve 20 --project ~/code/project "implement the feature"
 
 # Inspect both providers and reset notices
 syndicate limits
 syndicate limits --watch
 
 # Resume later, using Codex for the orchestrator and every specialist
-syndicate -x codex --all-runtime codex -C ~/code/project \
+syndicate team task -x codex --all-runtime codex --project ~/code/project \
   --handoff ~/code/project/.syndicate/handoffs/<handoff-id>
 ```
 
