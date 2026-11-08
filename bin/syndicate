@@ -3,7 +3,9 @@
 
 Global roles live in <repo>/roles. Each project can override them, and choose
 which CLI runs each role, from an untracked <project>/.syndicate/ directory.
-Nothing is written anywhere else in the project. See README.md and
+User-wide settings in $XDG_CONFIG_HOME/syndicate/syndicate.conf (or
+~/.config/syndicate/syndicate.conf) apply first; a project key replaces that
+one key. Nothing is written anywhere else in the project. See README.md and
 docs/configuration.md.
 """
 from __future__ import annotations
@@ -42,9 +44,20 @@ RELAY_SANDBOX = "workspace-write"
 STATUS_STATES = ("running", "waiting_on_user", "done")
 MAX_STATUS_HISTORY = 200
 
+CONFIG_DEFAULTS = {
+    "default": "claude",
+    "handoff": "on",
+    "handoff-reserve": "10",
+    "review-gate": "on",
+}
+
 CONFIG_TEMPLATE = """\
 # Local-only syndicate team config for this project (git-ignored).
 # One 'key = value' per line; '#' starts a comment.
+# A key set here replaces the same key from the user file
+# ($XDG_CONFIG_HOME/syndicate/syndicate.conf, or ~/.config/syndicate/syndicate.conf).
+# Keys absent from both files keep their built-in defaults. This file is not
+# rewritten from the user file.
 #
 # default = claude        # CLI for every role not listed below: claude | codex
 # orchestrator = claude   # CLI that hosts the session; other roles are delegated to from it
@@ -95,11 +108,22 @@ class Role:
         return "workspace-write" if self.can_write else "read-only"
 
 
+class ConfigLayer:
+    def __init__(self, source: str, label: str, values: dict[str, str], path: Path | None = None):
+        self.source = source
+        self.label = label
+        self.values = values
+        self.path = path
+
+
 class Team:
-    def __init__(self, project: Path, roles: dict[str, Role], config: dict, warnings: list[str], host: str):
+    def __init__(self, project: Path, roles: dict[str, Role], config: dict, config_sources: dict,
+                 layers: list[ConfigLayer], warnings: list[str], host: str):
         self.project = project
         self.roles = roles
         self.config = config
+        self.config_sources = config_sources
+        self.layers = layers
         self.warnings = warnings
         self.host = host
 
@@ -141,51 +165,152 @@ def load_roles(project: Path) -> tuple[dict[str, Role], list[str]]:
     return roles, warnings
 
 
-def load_config(project: Path, roles: dict[str, Role]) -> dict:
-    config = {"default": os.environ.get("SYNDICATE_RUNTIME") or "claude", "review-gate": "on", "handoff": "on", "handoff-reserve": "10"}
-    if config["default"] not in CLIS:
-        raise SyndicateError(f"SYNDICATE_RUNTIME must be one of {', '.join(CLIS)}")
-    path = project / LOCAL / "config"
-    if path.is_file():
-        for n, raw in enumerate(path.read_text().splitlines(), 1):
-            line = raw.split("#", 1)[0].strip()
-            if not line:
-                continue
-            key, sep, value = (p.strip() for p in line.partition("="))
-            where = f"{path}:{n}"
-            if not sep or not key or not value:
-                raise SyndicateError(f"{where}: expected 'key = value'")
-            if key == "handoff-reserve":
-                try:
-                    valid = 0 < float(value) < 100
-                except ValueError:
-                    valid = False
-                if not valid:
-                    raise SyndicateError(f"{where}: handoff-reserve must be between 0 and 100 (exclusive)")
-            elif key in ("review-gate", "handoff"):
-                if value not in ("on", "off"):
-                    raise SyndicateError(f"{where}: {key} must be on or off")
-            elif key == "default" or key in roles:
-                if value not in CLIS:
-                    raise SyndicateError(f"{where}: cli must be one of {', '.join(CLIS)}")
-            else:
-                raise SyndicateError(f"{where}: unknown role '{key}' (known: {', '.join(sorted(roles))})")
+def user_config_path() -> Path:
+    """User-wide settings. $XDG_CONFIG_HOME wins when it is set and non-empty."""
+    base = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    root = Path(base).expanduser() if base else Path.home() / ".config"
+    return root / "syndicate" / "syndicate.conf"
+
+
+def project_config_path(project: Path) -> Path:
+    """Project settings. A leftover `.syndicate/config` is renamed once."""
+    path = project / LOCAL / "syndicate.conf"
+    legacy = project / LOCAL / "config"
+    if not path.exists() and legacy.is_file():
+        legacy.rename(path)
+    return path
+
+
+def parse_config_file(path: Path, roles: dict[str, Role]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for n, raw in enumerate(path.read_text().splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        key, sep, value = (p.strip() for p in line.partition("="))
+        where = f"{path}:{n}"
+        if not sep or not key or not value:
+            raise SyndicateError(f"{where}: expected 'key = value'")
+        if key == "handoff-reserve":
+            try:
+                valid = 0 < float(value) < 100
+            except ValueError:
+                valid = False
+            if not valid:
+                raise SyndicateError(f"{where}: handoff-reserve must be between 0 and 100 (exclusive)")
+        elif key in ("review-gate", "handoff"):
+            if value not in ("on", "off"):
+                raise SyndicateError(f"{where}: {key} must be on or off")
+        elif key == "default" or key in roles:
+            if value not in CLIS:
+                raise SyndicateError(f"{where}: cli must be one of {', '.join(CLIS)}")
+        else:
+            raise SyndicateError(f"{where}: unknown role '{key}' (known: {', '.join(sorted(roles))})")
+        parsed[key] = value
+    return parsed
+
+
+def load_config(project: Path, roles: dict[str, Role]) -> tuple[dict[str, str], dict[str, str], list[ConfigLayer]]:
+    """Merge built-in defaults, $SYNDICATE_RUNTIME, the user file, then the project file.
+
+    A later layer replaces one key and leaves every other key in place. The project
+    layer is always present so a missing project file can still be shown.
+    """
+    layers = [ConfigLayer("default", "built-in defaults", dict(CONFIG_DEFAULTS))]
+    env = os.environ.get("SYNDICATE_RUNTIME")
+    if env:
+        if env not in CLIS:
+            raise SyndicateError(f"SYNDICATE_RUNTIME must be one of {', '.join(CLIS)}")
+        layers.append(ConfigLayer("environment", "$SYNDICATE_RUNTIME", {"default": env}))
+    user = user_config_path()
+    if user.is_file():
+        layers.append(ConfigLayer("user", str(user), parse_config_file(user, roles), user))
+    project_path = project_config_path(project)
+    project_values = parse_config_file(project_path, roles) if project_path.is_file() else {}
+    layers.append(ConfigLayer("project", str(project_path), project_values, project_path))
+    config: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    for layer in layers:
+        for key, value in layer.values.items():
             config[key] = value
-    return config
+            sources[key] = layer.source
+    return config, sources, layers
 
 
 def resolve_team(project: Path, host_override: str | None = None) -> Team:
     roles, warnings = load_roles(project)
     if "orchestrator" not in roles:
         raise SyndicateError("no 'orchestrator' role found")
-    config = load_config(project, roles)
+    config, sources, layers = load_config(project, roles)
     for name, role in roles.items():
         role.cli = config.get(name, config["default"])
     host = host_override or roles["orchestrator"].cli
     if host not in CLIS:
         raise SyndicateError(f"unknown runtime '{host}' (use {' or '.join(CLIS)})")
     roles["orchestrator"].cli = host
-    return Team(project, roles, config, warnings, host)
+    return Team(project, roles, config, sources, layers, warnings, host)
+
+
+def render_config(team: Team, local: bool) -> str:
+    """Resultant settings grouped by the layer that won, or the full stack with --local.
+
+    --local keeps keys a later layer replaced and marks the project file with *.
+    """
+    lines = [f"project: {team.project}"]
+    winners = {layer.source: layer for layer in team.layers}
+    for layer in team.layers:
+        rows = []
+        for key, value in layer.values.items():
+            winning = winners[team.config_sources[key]]
+            if local:
+                note = "" if winning is layer else f"  # overridden by {winning.label}"
+                rows.append(f"{key} = {value}{note}")
+            elif winning is layer:
+                rows.append(f"{key} = {value}")
+        show_project = local and layer.source == "project"
+        if not rows and not show_project:
+            continue
+        star = "* " if show_project else ""
+        lines.append("")
+        lines.append(f"# {star}{layer.label}")
+        if show_project and layer.path is not None and not layer.path.is_file():
+            lines.append("# absent")
+        lines.extend(rows)
+    for warning in team.warnings:
+        lines.append(f"warning: {warning}")
+    return "\n".join(lines) + "\n"
+
+
+def render_global_config() -> str:
+    """The user-wide syndicate.conf only, comments included."""
+    path = user_config_path()
+    if not path.is_file():
+        return f"# {path}\n# absent\n"
+    text = path.read_text()
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return f"# {path}\n{text}"
+
+
+def latest_status_project() -> Path:
+    """Registered project whose .syndicate/status.json was written most recently."""
+    best: Path | None = None
+    best_mtime = -1.0
+    for entry in load_registry():
+        raw = entry.get("path")
+        if not raw:
+            continue
+        path = Path(raw)
+        try:
+            mtime = (path / LOCAL / "status.json").stat().st_mtime
+        except OSError:
+            continue
+        if mtime > best_mtime:
+            best_mtime = mtime
+            best = path
+    if best is None:
+        raise SyndicateError("no registered project has a status file; pass -C <project>")
+    return best
 
 
 def git(project: Path, *args: str) -> str | None:
@@ -1318,7 +1443,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     project = register_workspace(Path(args.dir).expanduser().resolve())
     local = project / LOCAL
     (local / "roles").mkdir(parents=True, exist_ok=True)
-    config = local / "config"
+    config = project_config_path(project)
     if config.exists():
         print(f"kept existing {config}")
     else:
@@ -1330,16 +1455,17 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_status(args: argparse.Namespace) -> int:
-    project = register_workspace(Path(args.dir).expanduser().resolve())
-    team = resolve_team(project)
-    print(f"project: {project}")
-    print(f"host (orchestrator): {team.host}    review gate: {'on' if team.gate else 'off'}\n")
-    width = max(len(n) for n in team.roles)
-    for name, role in team.roles.items():
-        print(f"  {name:<{width}}  {role.cli:<7} {' + '.join(role.sources)}")
-    for w in team.warnings:
-        print(f"\nwarning: {w}")
+def cmd_config(args: argparse.Namespace) -> int:
+    if args.global_ and args.local:
+        raise SyndicateError("--global and --local cannot be used together")
+    if args.global_:
+        sys.stdout.write(render_global_config())
+        return 0
+    if args.dir:
+        project = register_workspace(Path(args.dir).expanduser().resolve())
+    else:
+        project = latest_status_project()
+    sys.stdout.write(render_config(resolve_team(project), args.local))
     return 0
 
 
@@ -1415,7 +1541,7 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
         prog="syndicate",
         usage="syndicate [-x claude|codex] [-C dir] [--project repo|generic] [-p] [task] [extra CLI args...]",
         description="Run the orchestrator with the project's team. Other commands: "
-                    "init, status, run-role, setup-codex-gate, dashboard, web, limits, tasks, decisions, briefing, briefs, sessions, requests, chief-of-staff.",
+                    "init, config, run-role, setup-codex-gate, dashboard, web, limits, tasks, decisions, briefing, briefs, sessions, requests, chief-of-staff.",
     )
     run.add_argument("-x", "--runtime", choices=CLIS, help="CLI hosting the orchestrator (overrides project config)")
     run.add_argument("-C", "--dir", default=".", help="project directory (default: current)")
@@ -1527,13 +1653,16 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     edit.add_argument("--summary")
     edit.add_argument("--state", choices=("queued", "running", "waiting_on_user", "blocked", "failed", "done"))
     edit.set_defaults(fn=cmd_tasks)
-    for name, fn, text in (
-        ("init", cmd_init, "create .syndicate/ in a project and exclude it from git"),
-        ("status", cmd_status, "show the resolved team: each role's CLI and where its definition comes from"),
-    ):
-        p = cmds.add_parser(name, help=text)
-        p.add_argument("-C", "--dir", default=".")
-        p.set_defaults(fn=fn)
+    p = cmds.add_parser("init", help="create .syndicate/ in a project and exclude it from git")
+    p.add_argument("-C", "--dir", default=".")
+    p.set_defaults(fn=cmd_init)
+    p = cmds.add_parser("config", help="show the merged settings, or every layer with --local")
+    p.add_argument("-C", "--dir", help="project directory (default: project whose status was updated last)")
+    p.add_argument("--local", action="store_true",
+                   help="show every layer read for this project, including overridden keys; * marks .syndicate/syndicate.conf")
+    p.add_argument("--global", dest="global_", action="store_true",
+                   help="print only the user-wide syndicate.conf")
+    p.set_defaults(fn=cmd_config)
     p = cmds.add_parser("run-role", help="run one role headlessly on its configured CLI (used by relay agents)")
     p.add_argument("role")
     p.add_argument("--runtime", choices=CLIS, help="use the runtime resolved by the parent session")
@@ -1576,7 +1705,7 @@ def main(argv: list[str]) -> int:
         return runtime.monitor_forever()
     run, sub = build_parsers()
     try:
-        if argv and argv[0] in ("init", "status", "run-role", "setup-codex-gate", "dashboard", "web", "limits", "tasks", "decisions", "briefing", "briefs", "sessions", "requests", "chief-of-staff"):
+        if argv and argv[0] in ("init", "config", "run-role", "setup-codex-gate", "dashboard", "web", "limits", "tasks", "decisions", "briefing", "briefs", "sessions", "requests", "chief-of-staff"):
             args = sub.parse_args(argv)
             return args.fn(args)
         args = run.parse_args(argv)

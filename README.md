@@ -69,7 +69,9 @@ syndicate -C ~/code/some-project -p "add rate limiting to the public API"
 syndicate -x codex -C ~/code/some-project "..."
 
 syndicate init   -C ~/code/some-project   # create .syndicate/ (optional)
-syndicate status -C ~/code/some-project   # show each role's CLI and definition source
+syndicate config                          # merged settings for the project updated last
+syndicate config --local -C ~/code/some-project
+syndicate config --global                     # user-wide ~/.config/syndicate/syndicate.conf
 ```
 
 Run from inside a project, `-C` can be omitted. The orchestrator decides which
@@ -82,16 +84,22 @@ Everything lives in `<project>/.syndicate/`, created by `syndicate init` and
 excluded from git automatically:
 
 ```
-.syndicate/config                  # which CLI runs each role
+.syndicate/syndicate.conf                  # which CLI runs each role
 .syndicate/roles/<role>.md         # replace a role (or add a new one)
 .syndicate/roles/<role>.append.md  # add project-specific guidance to a role
 ```
 
 ```
-# .syndicate/config: reviews come from Codex, everything else from Claude
+# .syndicate/syndicate.conf: reviews come from Codex, everything else from Claude
 default = claude
 code-reviewer = codex
 ```
+
+The same syntax in `~/.config/syndicate/syndicate.conf` applies to every
+project. A key in `.syndicate/syndicate.conf` replaces that one key and leaves the
+rest. `syndicate config` prints the winning values grouped by the file or
+layer they came from. `syndicate config --local` also prints the values that
+were replaced, with `*` on the project file.
 
 The full reference (every file, every key, precedence, how mixed-CLI teams
 work, and how the local-only guarantee is kept) is in
@@ -214,7 +222,7 @@ session leaves no other signal that it stopped.
 The role docs say work must pass through the code reviewer. The review gate
 enforces it: if the orchestrator delegated work to any build role and never
 invoked `code-reviewer`, finishing is blocked until it does. It's on by default
-and controlled per project with `review-gate = on|off` in `.syndicate/config`.
+and controlled per project with `review-gate = on|off` in `.syndicate/syndicate.conf`.
 
 - **Claude Code:** nothing to set up; the hook is passed at launch.
 - **Codex:** run `syndicate setup-codex-gate` once, then open `codex` and accept
