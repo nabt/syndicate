@@ -778,7 +778,8 @@ def coordination_store():
 
 
 def project_briefing():
-    return portfolio.briefing(gather_statuses(), decision_store().read(), coordination_store().snapshot())
+    return portfolio.briefing(gather_statuses(), decision_store().read(), coordination_store().snapshot(),
+                              portfolio.chief_status(REGISTRY_PATH.parent / "portfolio"))
 
 
 def task_project(source, task_id):
@@ -1276,6 +1277,12 @@ def cmd_briefing(args):
         portfolio_print(json.dumps(data, indent=2))
         return 0
     portfolio_print("CHIEF OF STAFF / BRIEFING\n")
+    chief = data['chief']
+    portfolio_print(f"Chief: {chief['state']} / {chief['provider']} / saved report: {chief['report_state']}")
+    if chief.get('reason'):
+        portfolio_print(chief['reason'])
+    portfolio_print(f"Saved checkpoint ({chief['checkpoint']['updated_at'] or 'unavailable'}):")
+    portfolio_print(chief['checkpoint']['summary'] or 'Checkpoint unavailable or empty.')
     portfolio_print(data["next_action"] + "\n")
     for project in data["projects"]:
         portfolio_print(f"{project['name']} [{project['status']}] / {project['provider']} / report: {project['report_state']}")
@@ -1315,7 +1322,7 @@ def dashboard_color(mode: str = "auto") -> bool:
 
 def render_dashboard(rows: list[dict], *, width: int = 100, color: bool = False,
                      details: bool = False, decisions: list[dict] | None = None,
-                     coordination: dict | None = None) -> str:
+                     coordination: dict | None = None, chief: dict | None = None) -> str:
     import textwrap
     width = max(24, width)
 
@@ -1341,6 +1348,21 @@ def render_dashboard(rows: list[dict], *, width: int = 100, color: bool = False,
         return portfolio.current_task(row, coordination.get("sessions", []) if coordination else [])
 
     lines = [paint("SYNDICATE / PROJECTS", "1"), *wrapped(now_iso()), ""]
+    if chief is not None:
+        lines.append(paint("CHIEF OF STAFF / " + clean(chief['state']), "1"))
+        lines.extend(wrapped(f"Provider: {chief['provider']} / saved report: {chief['report_state']}"))
+        if chief.get('reason'):
+            lines.extend(wrapped(chief['reason']))
+        checkpoint = chief['checkpoint']
+        lines.extend(wrapped(f"Saved checkpoint: {checkpoint['updated_at'] or 'unavailable'}"))
+        lines.extend(wrapped(checkpoint['summary'] or f"Checkpoint {checkpoint['state']}."))
+        if checkpoint['truncated']:
+            lines.extend(wrapped("Checkpoint excerpt truncated."))
+        if details:
+            lines.extend(wrapped(f"Session: {chief.get('session_id') or 'unknown'} / status saved: {chief.get('status_updated_at') or 'unknown'}"))
+            if chief.get('summary'):
+                lines.extend(wrapped("Saved progress: " + chief['summary']))
+        lines.append("")
     coordination = coordination or dict(briefs={}, sessions=[], requests=[])
     inbox = portfolio.pending(decisions or [])
     if inbox:
@@ -1491,7 +1513,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                 print("\n".join(f"{r['name']}  {r['path']}" for r in rows) if args.list else render_dashboard(
                     rows, width=shutil.get_terminal_size((100, 24)).columns,
                     color=dashboard_color(getattr(args, "color", "auto")),
-                    details=getattr(args, "details", False), decisions=decisions, coordination=coordination))
+                    details=getattr(args, "details", False), decisions=decisions, coordination=coordination,
+                    chief=portfolio.chief_status(REGISTRY_PATH.parent / "portfolio")))
                 if args.once or args.list:
                     return 0
                 if keyboard is not None:
