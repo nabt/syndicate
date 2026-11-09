@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import json
+import os
 from pathlib import Path
 import uuid
 
@@ -153,7 +154,79 @@ def current_task(row, sessions=()):
     return row.get('last_completed') or (row.get('current') if 'tasks' not in row else {}) or {}
 
 
-def briefing(rows, decisions, coordination=None):
+def chief_status(directory):
+    """Read portfolio-only Chief records; the inherited kernel lock proves ownership.
+
+    Do not probe PIDs: dashboards may run in a different PID namespace and the
+    CLI can retain the lock after its supervisor exits. Never create state here.
+    """
+    directory = Path(directory)
+    local = directory / 'workspace' / '.syndicate'
+    result = dict(state='unknown', owner_active=None, provider='unknown',
+                  report_state='unknown', summary=None, session_id=None,
+                  status_updated_at=None, reason=None,
+                  checkpoint=dict(state='unavailable', summary=None, updated_at=None, truncated=False))
+    try:
+        with (directory / 'chief-of-staff.lock').open('rb') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                result['owner_active'] = True
+            else:
+                result['owner_active'] = False
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            try:
+                owner_pid = lock.read(64).decode('ascii').strip()
+            except UnicodeError:
+                owner_pid = ''
+                result['reason'] = 'Chief ownership contents are invalid; activity cannot be matched to its status.'
+    except FileNotFoundError:
+        owner_pid = ''
+        result['reason'] = 'No Chief ownership record is available.'
+    except OSError:
+        owner_pid = ''
+        result.update(state='unavailable', reason='Chief ownership record cannot be read.')
+    try:
+        with (local / 'status.json').open() as stream:
+            status = json.load(stream)
+            stamp = datetime.fromtimestamp(os.fstat(stream.fileno()).st_mtime, timezone.utc).isoformat()
+        current = status.get('current') if isinstance(status, dict) else None
+        if not isinstance(current, dict) or current.get('role') != 'chief-of-staff':
+            raise ValueError('Invalid Chief status')
+        result.update(report_state=status.get('state') if isinstance(status.get('state'), str) else 'unknown',
+                      provider=status.get('provider') if status.get('provider') in ('claude', 'codex') else 'unknown',
+                      session_id=status.get('session_id') if isinstance(status.get('session_id'), str) else None,
+                      summary=current.get('summary') if isinstance(current.get('summary'), str) else None,
+                      status_updated_at=stamp)
+        matches = (type(status.get('pid')) is int and owner_pid == str(status['pid']))
+        if result['owner_active'] is True:
+            if not matches:
+                result['reason'] = result['reason'] or 'Chief owns the lock, but its status record does not match the owner.'
+            elif result['report_state'] == 'running':
+                result['state'] = 'running'
+            elif result['report_state'] in ('waiting_on_user', 'waiting', 'blocked'):
+                result['state'] = 'waiting'
+            else:
+                result['reason'] = 'Chief owns the lock; current activity is unknown.'
+    except (OSError, ValueError, TypeError):
+        if result['owner_active'] is True:
+            result['reason'] = 'Chief owns the lock; its status record is unavailable or invalid.'
+        elif not result['reason']:
+            result['reason'] = 'Chief status record is unavailable or invalid.'
+    if result['owner_active'] is False:
+        result.update(state='stopped', reason='No active Chief lock owner; status and checkpoint are saved records.')
+    try:
+        with (local / 'checkpoint.md').open() as stream:
+            text = stream.read(2001)
+            stamp = datetime.fromtimestamp(os.fstat(stream.fileno()).st_mtime, timezone.utc).isoformat()
+        result['checkpoint'] = dict(state='available' if text.strip() else 'empty', summary=text[:2000].strip() or None,
+                                    updated_at=stamp, truncated=len(text) > 2000)
+    except (OSError, UnicodeError):
+        pass
+    return result
+
+
+def briefing(rows, decisions, coordination=None, chief=None):
     coordination = coordination or dict(briefs={}, sessions=[], requests=[])
     inbox = pending(decisions)
     projects = []
@@ -187,7 +260,7 @@ def briefing(rows, decisions, coordination=None):
         next_action = 'Review requests whose target team could not acknowledge them.'
     elif not first and not inbox and requests:
         next_action = 'Team requests are waiting for their owning tasks to acknowledge them.'
-    return dict(generated_at=now(), projects=projects, decisions=inbox, next_action=next_action,
+    return dict(generated_at=now(), chief=chief, projects=projects, decisions=inbox, next_action=next_action,
                 briefs=coordination['briefs'], sessions=coordination['sessions'], requests=requests)
 
 

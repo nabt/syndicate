@@ -836,6 +836,13 @@ global.fetch = () => new Promise(()=>{});
 global.setInterval = () => 0;
 """
         checks = """
+portfolioData={decisions:[],next_action:'Review projects',chief:{state:'waiting',provider:'codex',report_state:'waiting_on_user',status_updated_at:null,reason:'Saved <script>',checkpoint:{state:'available',summary:'Checkpoint <script>',updated_at:'2026-11-08',truncated:true}}};
+renderBriefing('/unrelated-project');
+assert.ok($('briefing').innerHTML.includes('waiting'));
+assert.ok($('briefing').innerHTML.includes('Checkpoint &lt;script&gt;'));
+assert.ok(!$('briefing').innerHTML.includes('<script>'));
+assert.ok($('briefing').innerHTML.includes('excerpt truncated'));
+portfolioData=null;
 rows = [{name:'<repo>',path:'/tmp/a',project_status:'Complete',unfinished_count:0,tasks:[],
  last_completed:{summary:'Finished <script>',state:'done'},history:[]}];
 render();
