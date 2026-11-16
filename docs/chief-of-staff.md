@@ -303,6 +303,24 @@ sessions record their provider; older reports display `unknown` when absent.
 The briefing preserves reported task state and timestamps, including stale
 process reports; it does not infer active progress from an old report.
 
+## Chief visibility
+
+Both dashboards and `briefing --json` expose a separate portfolio Chief record.
+The read-only view uses `chief-of-staff.lock` kernel ownership, including a CLI
+that inherited the lock after a supervisor crash. It does not probe PIDs, so a
+PID namespace difference cannot falsely mark the Chief stopped. A held lock and
+matching Chief status show `running` or `waiting`; a free lock shows `stopped`,
+even when the saved report still says running or waiting for a handoff. Missing
+ownership records or mismatched/invalid active status show `unknown`; unreadable
+ownership shows `unavailable`. No project session or task is created or reassigned.
+
+The view includes the saved report state and provider, plus the latest checkpoint
+file's modification time and a plain-text excerpt of up to 2,000 characters.
+Checkpoint text is saved context, not proof of live activity or a generated
+summary; missing/empty checkpoints are labeled explicitly. Status timestamps are
+file modification times. Project filters keep the global Chief visible. Reads do
+not create portfolio files, and no lifecycle controls are added.
+
 ## Project briefs, ownership, and team requests
 
 ```sh
@@ -444,8 +462,9 @@ The requester deferred the following work for a future session:
    The Codex-only request/acknowledgment and decision/answer/revision acknowledgment
    smoke test passed on 2026-11-08. Mixed-provider validation remains unrun.
    Automatic delivery added afterward still needs a provider-backed smoke test.
-2. Show Chief of Staff running/waiting/stopped status and its latest checkpoint
-   summary in the dashboards.
+2. Chief dashboard state and saved checkpoint visibility is implemented. The requester
+   confirmed the live Codex smoke test passed on 2026-11-08: running, waiting,
+   stopped, checkpoint updates, and project-filter visibility in both dashboards.
 3. Notify the requester about decisions needing attention and failed requests.
 4. Add user-directed team task, pause, and handoff controls.
 

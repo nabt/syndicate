@@ -304,3 +304,87 @@ class ChiefOfStaff(ProjectCase):
         with patch.object(sy, 'require_clis'), patch.object(sy.runtime, 'start_monitor'), \
              patch.object(sy.runtime, 'supervise', return_value=(0, None)):
             self.assertEqual(self.command('-x', 'codex', '-p')[0], 0)
+
+class ChiefVisibility(ProjectCase):
+    def setUp(self):
+        super().setUp()
+        self.workspace = sy.REGISTRY_PATH.parent / 'portfolio' / 'workspace'
+
+    def save_status(self, state='running', pid=None):
+        local = self.workspace / '.syndicate'
+        local.mkdir(parents=True, exist_ok=True)
+        sy.runtime.atomic_json(local / 'status.json', dict(
+            pid=os.getpid() if pid is None else pid, provider='codex', state=state,
+            session_id='chief-session', current=dict(role='chief-of-staff', summary='Saved progress')))
+        return local
+
+    def snapshot(self):
+        return sy.portfolio.chief_status(self.workspace.parent)
+
+    def test_missing_records_are_unknown_and_reads_create_nothing(self):
+        self.assertEqual(self.snapshot()['state'], 'unknown')
+        self.assertFalse(self.workspace.parent.exists())
+
+    def test_lock_overrides_stale_running_and_waiting_reports(self):
+        local = self.save_status()
+        (local / 'checkpoint.md').write_text('Review the release <script>.')
+        for state, expected in [('running', 'running'), ('waiting_on_user', 'waiting')]:
+            self.save_status(state)
+            with sy.chief_session_lock():
+                result = self.snapshot()
+                self.assertEqual(result['state'], expected)
+                self.assertTrue(result['owner_active'])
+            result = self.snapshot()
+            self.assertEqual(result['state'], 'stopped')
+            self.assertEqual(result['report_state'], state)
+            self.assertEqual(result['checkpoint']['summary'], 'Review the release <script>.')
+            self.assertTrue(result['checkpoint']['updated_at'])
+
+    def test_held_lock_requires_matching_valid_chief_status(self):
+        local = self.save_status(pid=os.getpid() + 1)
+        with sy.chief_session_lock():
+            self.assertEqual(self.snapshot()['state'], 'unknown')
+            (local / 'status.json').write_text('{broken')
+            result = self.snapshot()
+            self.assertEqual(result['state'], 'unknown')
+            self.assertTrue(result['owner_active'])
+            self.assertEqual(result['checkpoint']['state'], 'unavailable')
+            self.save_status('done')
+            self.assertEqual(self.snapshot()['state'], 'unknown')
+
+    def test_unreadable_ownership_and_checkpoint_excerpt(self):
+        local = self.save_status()
+        (self.workspace.parent / 'chief-of-staff.lock').mkdir()
+        (local / 'checkpoint.md').write_text('x' * 2500)
+        result = self.snapshot()
+        self.assertEqual(result['state'], 'unavailable')
+        self.assertEqual(len(result['checkpoint']['summary']), 2000)
+        self.assertTrue(result['checkpoint']['truncated'])
+
+    def test_non_ascii_lock_contents_preserve_kernel_ownership(self):
+        self.save_status()
+        path = self.workspace.parent / 'chief-of-staff.lock'
+        with path.open('wb') as lock:
+            lock.write(b'\xff')
+            lock.flush()
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.snapshot()
+            self.assertEqual(result['state'], 'unknown')
+            self.assertTrue(result['owner_active'])
+            self.assertIn('contents are invalid', result['reason'])
+        result = self.snapshot()
+        self.assertEqual(result['state'], 'stopped')
+        self.assertFalse(result['owner_active'])
+
+    def test_briefing_and_console_keep_chief_out_of_project_ownership(self):
+        self.save_status('waiting_on_user')
+        with sy.chief_session_lock():
+            with patch.object(sy, 'gather_statuses', return_value=[]):
+                data = sy.project_briefing()
+        self.assertEqual(data['chief']['state'], 'waiting')
+        self.assertEqual(data['projects'], [])
+        self.assertEqual(data['sessions'], [])
+        output = sy.render_dashboard([], chief=data['chief'], width=50)
+        self.assertIn('CHIEF OF STAFF / waiting', output)
+        self.assertIn('Checkpoint unavailable', output)
+        self.assertIn('no registered projects', output)
