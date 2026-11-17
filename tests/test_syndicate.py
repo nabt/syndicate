@@ -31,6 +31,11 @@ class ProjectCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.project = Path(self._tmp.name).resolve()
+        # Launch arguments default to '.', so a test must never run from the real
+        # checkout: an earlier generic-task test wrote tasks (PID 2 from a sandbox,
+        # project_path /tmp/.../generic-tasks) into the repo's own status.json.
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.project)
         registry = unittest.mock.patch.object(sy, "REGISTRY_PATH", self.project / "registry" / "projects.json")
         registry.start()
         self.addCleanup(registry.stop)
@@ -545,7 +550,8 @@ class StatusAndRegistry(ProjectCase):
             data = json.loads(sy.status_path(source).read_text())
             task_id = data["current"]["task_id"]
             before = sy.status_path(source).read_bytes()
-            self.assertEqual(sy.main(["tasks", "edit", task_id, "--project", str(self.project)]), 0)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sy.main(["tasks", "edit", task_id, "--project", str(self.project)]), 0)
             self.assertEqual(sy.status_path(source).read_bytes(), before)
             data["current"]["summary"] = "still writing"
             sy.status_path(source).write_text(json.dumps(data))
@@ -599,9 +605,15 @@ class StatusAndRegistry(ProjectCase):
         self.assertEqual(len(after["tasks"]), 1)
 
     def test_generic_selection_does_not_ask_or_change_directory(self):
+        launch_cwd = Path(self._reg_tmp.name) / "launch-cwd"
+        launch_cwd.mkdir()
+        os.chdir(launch_cwd)
         args = sy.build_parsers()[0].parse_args(["--project", "generic", "request"])
         with unittest.mock.patch.object(sy, "run_session", return_value=0):
             sy.cmd_run(args)
+        # Regression: generic runs once wrote their task into the launch cwd (the repo).
+        self.assertFalse((launch_cwd / ".syndicate").exists())
+        self.assertTrue(sy.status_path(sy.REGISTRY_PATH.parent / "generic-tasks").is_file())
         row = sy.gather_statuses()[0]
         self.assertEqual(row["name"], "Generic tasks")
         self.assertFalse(row["tasks"][0]["needs_project"])
@@ -611,7 +623,8 @@ class StatusAndRegistry(ProjectCase):
         sy.register_project(self.project)
         sy.write_status_stub(self.project, 2**30, "interrupted")
         task_id = sy.gather_statuses()[0]["tasks"][0]["id"]
-        self.assertEqual(sy.main(["tasks", "edit", task_id, "--state", "done"]), 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sy.main(["tasks", "edit", task_id, "--state", "done"]), 0)
         row = sy.gather_statuses()[0]
         self.assertEqual(row["project_status"], "Complete")
         self.assertEqual(row["last_completed"]["id"], task_id)
@@ -632,23 +645,31 @@ class StatusAndRegistry(ProjectCase):
         self.assertEqual(len(data2["history"]), sy.MAX_STATUS_HISTORY)
         self.assertEqual(data2["history"][-1]["round"], "r249")  # most recent kept
 
-    def test_is_pid_alive(self):
-        self.assertTrue(sy.is_pid_alive(os.getpid()))
-        self.assertFalse(sy.is_pid_alive(0))
-        self.assertFalse(sy.is_pid_alive(-5))
-        self.assertFalse(sy.is_pid_alive("not-a-pid"))
-        # a pid essentially guaranteed not to exist
-        self.assertFalse(sy.is_pid_alive(2**30))
-
     def test_unfinished_tasks_survive_new_run(self):
         sy.register_project(self.project)
-        sy.write_status_stub(self.project, 2**30, "first request")
+        sy.write_status_stub(self.project, os.getpid(), "first request")
+        status = json.loads(sy.status_path(self.project).read_text())
+        status["tasks"][0]["state"] = status["state"] = "blocked"
+        sy.status_path(self.project).write_text(json.dumps(status))
         sy.write_status_stub(self.project, os.getpid(), "second request")
         row = sy.gather_statuses()[0]
         self.assertEqual(row["unfinished_count"], 2)
         self.assertEqual(row["project_status"], "Needs attention")
         self.assertEqual(row["tasks"][0]["summary"], "first request")
-        self.assertEqual(row["tasks"][0]["state"], "stale")
+        self.assertEqual(row["tasks"][0]["state"], "blocked")
+
+    def test_superseded_running_task_is_ended_not_stale_or_done(self):
+        sy.register_project(self.project)
+        sy.write_status_stub(self.project, 2**30, "first request")
+        sy.write_status_stub(self.project, os.getpid(), "second request")
+        current = json.loads(sy.status_path(self.project).read_text())["current"]["task_id"]
+        row = sy.gather_statuses()[0]
+        self.assertEqual(row["unfinished_count"], 1)
+        self.assertEqual(row["project_status"], "Working")
+        self.assertIsNone(row["last_completed"])
+        ended = row["ended_tasks"][0]
+        self.assertEqual((ended["summary"], ended["state"], ended["last_state"]), ("first request", "ended", "running"))
+        self.assertEqual(ended["end_reason"], f"superseded by task {current}")
 
     def test_completed_fallback_and_new_request(self):
         sy.register_project(self.project)
@@ -689,11 +710,14 @@ class StatusAndRegistry(ProjectCase):
         self.assertEqual(rows[0]["state"], "unknown")
         self.assertIsNone(rows[0]["current"])
 
-    def test_gather_statuses_detects_stale_dead_pid(self):
+    def test_gather_statuses_does_not_guess_dead_from_bare_pid(self):
         sy.register_project(self.project)
-        sy.write_status_stub(self.project, 2**30, "stub")  # pid that can't exist
+        sy.write_status_stub(self.project, 2**30, "stub")  # pid that can't exist: no identity recorded
         rows = sy.gather_statuses()
-        self.assertEqual(rows[0]["state"], "stale")
+        self.assertEqual(rows[0]["state"], "running")
+        self.assertEqual(rows[0]["liveness"], "unknown")
+        self.assertEqual(rows[0]["tasks"][0]["liveness"], "unknown")
+        self.assertFalse((sy.REGISTRY_PATH.parent / "task-edits.json").exists())
 
     def test_gather_statuses_running_waiting_done(self):
         sy.register_project(self.project)
@@ -818,6 +842,823 @@ class StatusAndRegistry(ProjectCase):
         self.assertEqual([p["path"] for p in sy.load_registry()], [str(self.project)])
 
 
+
+def spawn_owner():
+    """A real short-lived process whose identity is recorded while it is alive."""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    return proc, sy.portfolio.process_identity(proc.pid)
+
+
+def reap(proc):
+    proc.kill()
+    proc.wait()
+
+
+class StaleSessions(ProjectCase):
+    def setUp(self):
+        super().setUp()
+        registry = tempfile.TemporaryDirectory()
+        self.addCleanup(registry.cleanup)
+        patcher = unittest.mock.patch.object(sy, "REGISTRY_PATH", Path(registry.name) / "projects.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def edits_path(self):
+        return sy.REGISTRY_PATH.parent / "task-edits.json"
+
+    def current_task_id(self):
+        return json.loads(sy.status_path(self.project).read_text())["current"]["task_id"]
+
+    def test_normal_exit_closes_owned_running_task_as_ended(self):
+        sy.register_project(self.project)
+        sy.write_status_stub(self.project, os.getpid(), "supervised work")
+        task_id = self.current_task_id()
+        with sy.project_session(self.project, "codex") as session:
+            self.assertTrue(sy.coordination_store().snapshot()["sessions"][0]["live"])
+        status = json.loads(sy.status_path(self.project).read_text())
+        task = status["tasks"][-1]
+        self.assertEqual(status["state"], "ended")
+        self.assertEqual((task["id"], task["state"], task["last_state"], task["end_reason"]),
+                         (task_id, "ended", "running", "session exited"))
+        self.assertTrue(task["ended_at"])
+        self.assertNotIn("completed_at", task)
+        self.assertEqual(sy.coordination_store().read()["sessions"][0]["state"], "ended")
+        row = sy.gather_statuses()[0]
+        self.assertEqual((row["unfinished_count"], row["last_completed"], row["project_status"]), (0, None, "No tasks"))
+        self.assertEqual(row["ended_tasks"][0]["id"], task_id)
+        self.assertEqual(row["ended_tasks"][0]["session_id"], session["id"])
+
+    def test_normal_exit_preserves_agent_written_final_states(self):
+        sy.register_project(self.project)
+        for final in ("done", "failed", "blocked", "waiting_on_user"):
+            with self.subTest(final=final):
+                sy.write_status_stub(self.project, os.getpid(), f"{final} work")
+                with sy.project_session(self.project, "claude"):
+                    status = json.loads(sy.status_path(self.project).read_text())
+                    status["state"] = final
+                    sy.status_path(self.project).write_text(json.dumps(status))
+                after = json.loads(sy.status_path(self.project).read_text())
+                self.assertEqual(after["state"], final)
+                self.assertNotIn("end_reason", after["tasks"][-1])
+
+    def test_launch_failure_is_not_closed_as_ended(self):
+        sy.write_status_stub(self.project, os.getpid(), "launch fails")
+        with self.assertRaises(RuntimeError):
+            with sy.project_session(self.project, "codex"):
+                raise RuntimeError("launch error")
+        self.assertEqual(json.loads(sy.status_path(self.project).read_text())["state"], "running")
+
+    def isolate_launch(self):
+        """Keep launches away from the real ~/.syndicate (limits state, HOME)."""
+        home = Path(self._tmp.name) / "home"
+        home.mkdir(exist_ok=True)
+        for patcher in (unittest.mock.patch.dict(os.environ, {"HOME": str(home)}),
+                        unittest.mock.patch.object(sy.runtime, "STATE", home / ".syndicate" / "limits"),
+                        unittest.mock.patch.object(sy, "require_clis"),
+                        unittest.mock.patch.object(sy.runtime, "start_monitor")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "needs /proc process identities")
+    def test_supervised_run_never_passes_project_lock_and_records_cli_owner(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        self.isolate_launch()
+        lock_path = self.project / ".syndicate" / "session.lock"
+        child, identity = spawn_owner()
+        self.addCleanup(reap, child)
+        seen = {}
+
+        def supervised(*_, **kwargs):
+            fd = args.session_lock_fd
+            seen.update(inheritable=os.get_inheritable(fd), pass_fds=tuple(kwargs.get("pass_fds", ())),
+                        inode=os.fstat(fd).st_ino, probe=sy.portfolio.probe_lock(lock_path))
+            kwargs["on_start"](child.pid)
+            status = json.loads(sy.status_path(self.project).read_text())
+            session = sy.coordination_store().read()["sessions"][-1]
+            seen.update(status_child=status["cli_owner"], task_child=status["tasks"][-1]["cli_owner"],
+                        session_child=session["cli_owner"], lock_owned=status["lock_owned"])
+            return 0, None
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "supervised task"])
+        with unittest.mock.patch.object(sy.runtime, "supervise", side_effect=supervised), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(sy.cmd_run(args), 0)
+        self.assertFalse(seen["inheritable"])
+        self.assertNotIn(args.session_lock_fd, seen["pass_fds"])
+        self.assertEqual(seen["pass_fds"], ())
+        self.assertEqual(seen["probe"], "held")
+        self.assertTrue(seen["lock_owned"])
+        for key in ("status_child", "task_child", "session_child"):
+            self.assertEqual((seen[key]["pid"], seen[key]["process_identity"]), (child.pid, identity))
+        status = json.loads(sy.status_path(self.project).read_text())
+        self.assertEqual(status["state"], "ended")
+        self.assertEqual(status["lock_inode"], [lock_path.stat().st_dev, seen["inode"]])
+        self.assertEqual(status["process_identity"], sy.portfolio.process_identity(os.getpid()))
+        self.assertEqual(sy.portfolio.probe_lock(lock_path), "free")
+
+    def test_exec_path_never_inherits_project_lock_and_relies_on_identity(self):
+        import fcntl
+        self.config("handoff = off\n")
+        self.isolate_launch()
+        lock_path = self.project / ".syndicate" / "session.lock"
+        seen = {}
+
+        def execvp(*_):
+            fd = args.session_lock_fd
+            status = json.loads(sy.status_path(self.project).read_text())
+            seen.update(inheritable=os.get_inheritable(fd), inode=os.fstat(fd).st_ino,
+                        cloexec=bool(fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC),
+                        lock_owned=status["lock_owned"], task_lock_owned=status["tasks"][-1]["lock_owned"],
+                        pid=status["pid"])
+            raise SystemExit(0)
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "-p", "exec task"])
+        with unittest.mock.patch.object(sy.os, "execvp", side_effect=execvp), \
+             contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                sy.cmd_run(args)
+        self.assertEqual(seen, dict(inheritable=False, cloexec=True, inode=lock_path.stat().st_ino, lock_owned=False,
+                                    task_lock_owned=False, pid=os.getpid()))
+
+    def test_launch_retries_past_a_momentary_lock_probe(self):
+        import fcntl
+        lock_path = self.project / ".syndicate" / "session.lock"
+        lock_path.touch()
+        probe = lock_path.open("rb")
+        self.addCleanup(probe.close)
+        fcntl.flock(probe, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        sleeps = []
+
+        def release(delay):  # deterministic: the probe ends during the first retry wait
+            sleeps.append(delay)
+            fcntl.flock(probe, fcntl.LOCK_UN)
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "task"])
+        with unittest.mock.patch.object(sy, "run_session", return_value=0), \
+             unittest.mock.patch.object(sy.time, "sleep", side_effect=release):
+            self.assertEqual(sy.cmd_run(args), 0)
+        self.assertEqual(sleeps, [0.05])
+
+    def test_held_lock_error_explains_leftover_holders(self):
+        import fcntl
+        lock_path = self.project / ".syndicate" / "session.lock"
+        lock_path.touch()
+        holder = lock_path.open("rb")
+        self.addCleanup(holder.close)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "task"])
+        with unittest.mock.patch.object(sy, "run_session", return_value=0) as run, \
+             unittest.mock.patch.object(sy.time, "sleep"):
+            with self.assertRaises(sy.SyndicateError) as raised:
+                sy.cmd_run(args)
+        run.assert_not_called()
+        message = str(raised.exception)
+        self.assertIn("another Syndicate orchestrator already owns this project", message)
+        self.assertIn("leftover process may still hold it", message)
+        self.assertIn("fuser -v", message)
+        self.assertIn("lsof", message)
+        self.assertIn(".syndicate/session.lock", message)
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "needs /proc process identities")
+    def test_abrupt_exit_is_swept_with_requests_failed_and_idempotent(self):
+        sy.register_project(self.project)
+        proc, identity = spawn_owner()
+        try:
+            sy.write_status_stub(self.project, proc.pid, "abrupt work")
+            task_id = self.current_task_id()
+            store = sy.coordination_store()
+            session = store.start_session(str(self.project), task_id, "codex", proc.pid)
+            sy.runtime.atomic_json(sy.status_path(self.project), {
+                **json.loads(sy.status_path(self.project).read_text()),
+                "current": {"task_id": task_id, "session_id": session["id"], "summary": "abrupt work"}})
+            request = store.send_request(source_path=str(self.project), project_path=str(self.project),
+                                         task_id=task_id, key="k", message="Review")
+            self.assertEqual(request["session_id"], session["id"])
+            self.assertEqual(sy.gather_statuses()[0]["tasks"][0]["liveness"], "alive")
+        finally:
+            reap(proc)  # SIGKILL: no finally block in the owner ever runs
+        status_before = sy.status_path(self.project).read_bytes()
+        row = sy.gather_statuses()[0]
+        data = store.read()
+        self.assertEqual((data["sessions"][0]["state"], data["sessions"][0]["reason"]), ("ended", "owner process exited"))
+        self.assertEqual((data["requests"][0]["state"], data["requests"][0]["reason"]),
+                         ("failed", "Target session ended before acknowledgment"))
+        task = row["ended_tasks"][0]
+        self.assertEqual((task["id"], task["last_state"], task["end_reason"]), (task_id, "running", "owner process exited"))
+        self.assertEqual(row["state"], "ended")
+        self.assertEqual(sy.status_path(self.project).read_bytes(), status_before)  # agent-owned file untouched
+        edits, coordination = self.edits_path().read_bytes(), store.path.read_bytes()
+        sy.gather_statuses()
+        sy.reconcile_stale()
+        self.assertEqual(self.edits_path().read_bytes(), edits)
+        self.assertEqual(store.path.read_bytes(), coordination)
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "needs /proc process identities")
+    def test_resumed_task_ignores_closure_for_its_previous_owner(self):
+        sy.register_project(self.project)
+        proc, _ = spawn_owner()
+        sy.write_status_stub(self.project, proc.pid, "resumable")
+        reap(proc)
+        status = json.loads(sy.status_path(self.project).read_text())
+        self.assertEqual(sy.gather_statuses()[0]["ended_tasks"][0]["end_reason"], "owner process exited")
+        status.update(sy.owner_identity(os.getpid()))  # a handoff resume takes over the same task
+        sy.status_path(self.project).write_text(json.dumps(status))
+        row = sy.gather_statuses()[0]
+        self.assertEqual(row["tasks"][0]["state"], "running")
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "needs /proc process identities")
+    def test_pid_reuse_mismatch_is_dead(self):
+        sy.register_project(self.project)
+        sy.write_status_stub(self.project, os.getpid(), "reused pid")
+        status = json.loads(sy.status_path(self.project).read_text())
+        status["process_identity"] = sy.portfolio.boot_id() + ":1"  # same live PID, different start time
+        sy.status_path(self.project).write_text(json.dumps(status))
+        task = sy.gather_statuses()[0]["ended_tasks"][0]
+        self.assertEqual(task["end_reason"], "owner process exited")
+        session = sy.coordination_store().start_session(str(self.project), "other", "codex", os.getpid())
+        data = sy.coordination_store().read()
+        data["sessions"][0]["process_identity"] = sy.portfolio.boot_id() + ":1"
+        sy.runtime.atomic_json(sy.coordination_store().path, data)
+        sy.gather_statuses()
+        self.assertEqual(sy.coordination_store().read()["sessions"][0]["state"], "ended", session["id"])
+
+    def test_legacy_bare_pid_is_not_probed_but_superseded_by_lock_proof(self):
+        sy.register_project(self.project)
+        legacy = {"id": "legacy-request", "summary": "request", "state": "running", "pid": 2,
+                  "project_path": "/tmp/tmpfjkj4dv8/generic-tasks", "updated_at": "2026-11-08T19:48:16Z"}
+        sy.status_path(self.project).write_text(json.dumps({"pid": 2, "state": "running",
+            "current": {"task_id": "legacy-request", "summary": "request"}, "tasks": [legacy]}))
+        # PID 2 is usually kthreadd on the host and the test runner inside a
+        # sandbox: a bare PID probe proves nothing either way.
+        row = next(r for r in sy.gather_statuses() if r["tasks"])
+        self.assertEqual((row["tasks"][0]["state"], row["tasks"][0]["liveness"]), ("running", "unknown"))
+        self.assertFalse(self.edits_path().exists())
+        sy.write_status_stub(self.project, os.getpid(), "later launch")
+        rows = sy.gather_statuses()
+        ended = next(t for r in rows for t in r["ended_tasks"] if t["id"] == "legacy-request")
+        self.assertEqual(ended["end_reason"], f"superseded by task {self.current_task_id()}")
+        self.assertEqual(ended["last_state"], "running")
+
+    def test_same_sandbox_pid_with_new_identity_is_superseded(self):
+        sy.register_project(self.project)
+        sy.write_status_stub(self.project, 2, "first sandboxed run")
+        status = json.loads(sy.status_path(self.project).read_text())
+        status["process_identity"] = status["tasks"][0]["process_identity"] = sy.portfolio.boot_id() + ":100"
+        sy.status_path(self.project).write_text(json.dumps(status))
+        sy.write_status_stub(self.project, 2, "second sandboxed run")
+        status = json.loads(sy.status_path(self.project).read_text())
+        status["process_identity"] = status["tasks"][1]["process_identity"] = sy.portfolio.boot_id() + ":200"
+        status["process_namespace"] = status["tasks"][1]["process_namespace"] = "pid:[sandbox]"
+        sy.status_path(self.project).write_text(json.dumps(status))
+        row = sy.gather_statuses()[0]
+        self.assertEqual([t["summary"] for t in row["ended_tasks"]], ["first sandboxed run"])
+        self.assertEqual(row["tasks"][0]["liveness"], "unknown")
+
+    def test_superseded_waiting_task_ends_but_current_question_is_kept(self):
+        sy.register_project(self.project)
+        sy.write_status_stub(self.project, 2**30, "needs an answer")
+        status = json.loads(sy.status_path(self.project).read_text())
+        status["state"] = "waiting_on_user"
+        sy.status_path(self.project).write_text(json.dumps(status))
+        decision = sy.decision_store().request(source_path=str(self.project), project_path=str(self.project),
+                                               task_id=status["current"]["task_id"], key="q", question="Which?")
+        store = sy.coordination_store()
+        store.end_session(store.start_session(str(self.project), status["current"]["task_id"], "codex", os.getpid())["id"])
+        row = sy.gather_statuses()[0]
+        self.assertEqual(row["tasks"][0]["state"], "waiting_on_user")  # current question kept after session end
+        self.assertFalse(self.edits_path().exists())
+        sy.write_status_stub(self.project, os.getpid(), "new work")
+        ended = sy.gather_statuses()[0]["ended_tasks"][0]
+        self.assertEqual((ended["last_state"], ended["state"]), ("waiting_on_user", "ended"))
+        self.assertEqual(sy.decision_store().read(), [decision])  # decision inbox untouched
+
+    def test_manual_state_edit_wins_and_ended_is_an_edit_choice(self):
+        sy.register_project(self.project)
+        sy.write_status_stub(self.project, 2**30, "first")
+        first = self.current_task_id()
+        sy.write_status_stub(self.project, os.getpid(), "second")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sy.main(["tasks", "edit", first, "--state", "done"]), 0)
+        row = sy.gather_statuses()[0]
+        self.assertEqual(row["last_completed"]["id"], first)
+        self.assertEqual(row["ended_tasks"], [])
+        second = self.current_task_id()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sy.main(["tasks", "edit", second, "--state", "ended"]), 0)
+        ended = sy.gather_statuses()[0]["ended_tasks"][0]
+        self.assertEqual((ended["id"], ended["end_reason"], ended["last_state"]), (second, "closed manually", "running"))
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(sy.main(["tasks", "list"]), 0)
+        self.assertIn("[ended]", output.getvalue())
+        self.assertIn("ended: closed manually (was running)", output.getvalue())
+
+    def foreign_owner(self):
+        """Owner recorded in another PID namespace (e.g. launched inside a sandbox)."""
+        sy.register_project(self.project)
+        proc, identity = spawn_owner()
+        reap(proc)
+        sy.write_status_stub(self.project, proc.pid, "sandboxed work")
+        task_id = self.current_task_id()
+        status = json.loads(sy.status_path(self.project).read_text())
+        status.update(process_identity=identity, process_namespace="pid:[1]")
+        sy.status_path(self.project).write_text(json.dumps(status))
+        store = sy.coordination_store()
+        store.start_session(str(self.project), task_id, "codex", os.getpid())
+        store.send_request(source_path=str(self.project), project_path=str(self.project),
+                           task_id=task_id, key="k", message="Review")
+        data = store.read()
+        data["sessions"][0].update(pid=proc.pid, process_identity=identity, process_namespace="pid:[1]")
+        sy.runtime.atomic_json(store.path, data)
+        return store
+
+    def assert_unknown_without_writes(self, store):
+        before = store.path.read_bytes()
+        row = sy.gather_statuses()[0]
+        self.assertEqual((row["state"], row["liveness"], row["project_status"]), ("running", "unknown", "Working"))
+        self.assertEqual(row["tasks"][0]["liveness"], "unknown")
+        self.assertFalse(self.edits_path().exists())
+        self.assertEqual(store.path.read_bytes(), before)
+        briefing = sy.project_briefing()
+        self.assertEqual(briefing["sessions"][0]["liveness"], "unknown")
+        self.assertEqual(briefing["requests"][0]["delivery_state"], "unverified")
+        args = sy.build_parsers()[1].parse_args(["dashboard", "--once", "--details", "--color", "never"])
+        with unittest.mock.patch("sys.stdout", new=io.StringIO()) as output:
+            self.assertEqual(sy.cmd_dashboard(args), 0)
+        text = output.getvalue()
+        self.assertNotIn("stale", text)
+        self.assertIn("running (unverified)", text)
+        self.assertIn("unverified", text)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(sy.main(["briefing"]), 0)
+            self.assertEqual(sy.main(["sessions"]), 0)
+        self.assertIn("[unverified]", output.getvalue())
+        self.assertEqual(store.path.read_bytes(), before)
+
+    def test_foreign_namespace_is_unknown_never_stale_and_writes_nothing(self):
+        store = self.foreign_owner()
+        self.assert_unknown_without_writes(store)
+        with self.assertRaisesRegex(sy.portfolio.PortfolioError, "PID namespace"):
+            store.snapshot()  # ownership commands keep their explicit error
+
+    def test_unreadable_proc_is_unknown_and_writes_nothing(self):
+        store = self.foreign_owner()
+        with unittest.mock.patch.object(sy.portfolio, "process_namespace", return_value=None):
+            self.assert_unknown_without_writes(store)
+
+    def test_lock_released_proves_exit_from_another_namespace(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "locked task"])
+        with unittest.mock.patch.object(sy, "run_session", return_value=0):
+            sy.cmd_run(args)
+        import fcntl
+        with unittest.mock.patch.object(sy.portfolio, "process_namespace", return_value="pid:[sandbox]"):
+            with (self.project / ".syndicate" / "session.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self.assertEqual(sy.gather_statuses()[0]["tasks"][0]["liveness"], "unknown")
+                self.assertFalse(self.edits_path().exists())
+            ended = sy.gather_statuses()[0]["ended_tasks"][0]
+        self.assertEqual(ended["end_reason"], "owner process exited (project lock released)")
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "needs /proc process identities")
+    def test_held_project_lock_defers_closing_the_current_task(self):
+        import fcntl
+        sy.register_project(self.project)
+        proc, _ = spawn_owner()
+        sy.write_status_stub(self.project, proc.pid, "relaunching")
+        sy.coordination_store().start_session(str(self.project), self.current_task_id(), "codex", proc.pid)
+        reap(proc)
+        with (self.project / ".syndicate" / "session.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            row = sy.gather_statuses()[0]
+            self.assertEqual(row["tasks"][0]["liveness"], "unknown")
+            self.assertEqual(sy.coordination_store().read()["sessions"][0]["state"], "active")
+        self.assertEqual(sy.gather_statuses()[0]["ended_tasks"][0]["end_reason"], "owner process exited")
+
+    # --- Safe lock handling (FIFO, symlinks, replaced inode) -----------------
+
+    def run_with_timeout(self, fn, seconds=10):
+        """Run fn in a daemon thread; fail (instead of hanging the suite) if it blocks."""
+        result = {}
+
+        def target():
+            try:
+                result["value"] = fn()
+            except BaseException as error:  # surfaced to the test below
+                result["error"] = error
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(seconds)
+        self.assertFalse(thread.is_alive(), f"{fn} blocked for more than {seconds}s")
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
+    def locked_launch(self):
+        """A completed cmd_run whose recorded launcher identity is unverifiable
+        (as from a sandbox), so only lock and CLI-child evidence remains."""
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "locked task"])
+        with unittest.mock.patch.object(sy, "run_session", return_value=0):
+            sy.cmd_run(args)
+        status = json.loads(sy.status_path(self.project).read_text())
+        status["process_namespace"] = status["tasks"][-1]["process_namespace"] = "pid:[sandbox]"
+        sy.status_path(self.project).write_text(json.dumps(status))
+        return status
+
+    def test_fifo_session_lock_never_blocks_sweeps_listing_or_launch(self):
+        self.locked_launch()
+        lock_path = self.project / ".syndicate" / "session.lock"
+        lock_path.unlink()
+        os.mkfifo(lock_path)
+        self.assertEqual(self.run_with_timeout(lambda: sy.portfolio.probe_lock(lock_path)), "unknown")
+        row = self.run_with_timeout(sy.gather_statuses)[0]
+        self.assertEqual((row["tasks"][0]["state"], row["tasks"][0]["liveness"]), ("running", "unknown"))
+        self.assertFalse(self.edits_path().exists())
+
+        def listing():
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(sy.main(["tasks", "list"]), 0)
+            return output.getvalue()
+        self.assertIn("[running (unverified)]", self.run_with_timeout(listing))
+        self.run_with_timeout(sy.reconcile_stale)
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "next"])
+        with unittest.mock.patch.object(sy, "run_session", return_value=0) as run:
+            with self.assertRaisesRegex(sy.SyndicateError, "not a regular file"):
+                self.run_with_timeout(lambda: sy.cmd_run(args))
+        run.assert_not_called()
+        self.assertFalse(self.edits_path().exists())
+
+    def test_symlinked_session_lock_is_refused_and_its_target_never_opened_for_write(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        victim = Path(self._tmp.name) / "bashrc"
+        victim.write_text("export SAFE=1\n")
+        victim.chmod(0o644)
+        before = (victim.read_bytes(), victim.stat().st_mtime_ns, victim.stat().st_mode)
+        lock_path = self.project / ".syndicate" / "session.lock"
+        lock_path.symlink_to(victim)
+        opened, real_open = [], os.open
+
+        def tracking_open(path, flags, *rest, **kwargs):
+            opened.append((os.fspath(path), flags))
+            return real_open(path, flags, *rest, **kwargs)
+        writes = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "task"])
+        with unittest.mock.patch.object(os, "open", side_effect=tracking_open), \
+             unittest.mock.patch.object(sy, "run_session", return_value=0) as run:
+            with self.assertRaisesRegex(sy.SyndicateError, "symbolic link"):
+                sy.cmd_run(args)
+            self.assertEqual(sy.portfolio.probe_lock(lock_path), "unknown")
+        run.assert_not_called()
+        lock_opens = [(path, flags) for path, flags in opened if path in ("session.lock", str(lock_path), str(victim))]
+        self.assertTrue(lock_opens)
+        self.assertFalse([entry for entry in lock_opens if entry[1] & writes])
+        self.assertTrue(all(flags & os.O_NOFOLLOW for path, flags in lock_opens))
+        self.assertEqual((victim.read_bytes(), victim.stat().st_mtime_ns, victim.stat().st_mode), before)
+        self.assertTrue(lock_path.is_symlink())
+
+    def test_symlinked_syndicate_directory_is_refused(self):
+        project = self.project / "linked"
+        project.mkdir()
+        subprocess.run(["git", "init", "-q", str(project)], check=True)
+        elsewhere = self.project / "elsewhere"
+        elsewhere.mkdir()
+        (project / ".syndicate").symlink_to(elsewhere, target_is_directory=True)
+        args = sy.build_parsers()[0].parse_args(["--project", str(project), "task"])
+        with unittest.mock.patch.object(sy, "run_session", return_value=0) as run:
+            with self.assertRaisesRegex(sy.SyndicateError, "symbolic link"):
+                sy.cmd_run(args)
+        run.assert_not_called()
+        self.assertFalse((elsewhere / "session.lock").exists())
+        (elsewhere / "session.lock").touch()
+        self.assertEqual(sy.portfolio.probe_lock(project / ".syndicate" / "session.lock"), "unknown")
+
+    def test_hard_linked_or_foreign_lock_is_refused(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        lock_path = self.project / ".syndicate" / "session.lock"
+        lock_path.touch()
+        os.link(lock_path, self.project / "second-name")
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "task"])
+        with unittest.mock.patch.object(sy, "run_session", return_value=0):
+            with self.assertRaisesRegex(sy.SyndicateError, "hard links"):
+                sy.cmd_run(args)
+        self.assertEqual(sy.portfolio.probe_lock(lock_path), "unknown")
+        (self.project / "second-name").unlink()
+        with unittest.mock.patch.object(sy.portfolio.os, "getuid", return_value=os.getuid() + 1):
+            self.assertEqual(sy.portfolio.probe_lock(lock_path), "unknown")
+            with self.assertRaisesRegex(sy.SyndicateError, "not owned by the current user"):
+                sy.cmd_run(args)
+
+    def test_replaced_lock_inode_is_unknown_not_released(self):
+        status = self.locked_launch()
+        lock_path = self.project / ".syndicate" / "session.lock"
+        self.assertEqual(status["lock_inode"], [lock_path.stat().st_dev, lock_path.stat().st_ino])
+        replacement = self.project / ".syndicate" / "replacement"
+        replacement.touch()  # created while the original exists: a distinct inode
+        os.replace(replacement, lock_path)
+        self.assertNotEqual(status["lock_inode"][1], lock_path.stat().st_ino)
+        self.assertEqual(sy.portfolio.probe_lock(lock_path), "free")
+        self.assertEqual(sy.portfolio.probe_lock(lock_path, expect=status["lock_inode"]), "unknown")
+        row = sy.gather_statuses()[0]
+        self.assertEqual((row["tasks"][0]["state"], row["tasks"][0]["liveness"]), ("running", "unknown"))
+        self.assertFalse(self.edits_path().exists())
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "needs /proc process identities")
+    def test_supervisor_crash_free_lock_defers_to_the_recorded_cli_child(self):
+        self.locked_launch()
+        child, _ = spawn_owner()
+        self.addCleanup(reap, child)
+        status = json.loads(sy.status_path(self.project).read_text())
+        status["cli_owner"] = status["tasks"][-1]["cli_owner"] = sy.owner_identity(child.pid)
+        sy.status_path(self.project).write_text(json.dumps(status))
+        task = sy.gather_statuses()[0]["tasks"][0]
+        self.assertEqual((task["state"], task["liveness"]), ("running", "alive"))  # lock free, child alive
+        self.assertFalse(self.edits_path().exists())
+        foreign = {**status["cli_owner"], "process_namespace": "pid:[other]"}
+        sy.status_path(self.project).write_text(json.dumps({**status, "cli_owner": foreign}))
+        self.assertEqual(sy.gather_statuses()[0]["tasks"][0]["liveness"], "unknown")  # child unverifiable
+        self.assertFalse(self.edits_path().exists())
+        sy.status_path(self.project).write_text(json.dumps(status))
+        reap(child)
+        ended = sy.gather_statuses()[0]["ended_tasks"][0]
+        self.assertEqual(ended["end_reason"], "owner process exited (project lock released)")
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "needs /proc process identities")
+    def test_supervisor_crash_keeps_coordination_session_while_cli_child_lives(self):
+        sy.register_project(self.project)
+        launcher, _ = spawn_owner()
+        child, _ = spawn_owner()
+        self.addCleanup(reap, child)
+        sy.write_status_stub(self.project, launcher.pid, "supervised")
+        task_id = self.current_task_id()
+        store = sy.coordination_store()
+        session = store.start_session(str(self.project), task_id, "codex", launcher.pid)
+        store.send_request(source_path=str(self.project), project_path=str(self.project),
+                           task_id=task_id, key="k", message="Review")
+        sy.record_cli_owner(self.project, session, child.pid)
+        status = json.loads(sy.status_path(self.project).read_text())
+        status["current"]["session_id"] = session["id"]
+        sy.status_path(self.project).write_text(json.dumps(status))
+        reap(launcher)  # the supervisor crashed; its CLI child survives
+        row = sy.gather_statuses()[0]
+        self.assertEqual(row["tasks"][0]["liveness"], "alive")
+        self.assertEqual(store.read()["sessions"][0]["state"], "active")
+        self.assertEqual(store.read()["requests"][0]["state"], "queued")
+        status["cli_owner"] = None  # even if the agent drops its copy, the session's copy counts
+        sy.status_path(self.project).write_text(json.dumps(status))
+        self.assertEqual(sy.gather_statuses()[0]["tasks"][0]["liveness"], "alive")
+        with self.assertRaisesRegex(sy.SyndicateError, rf"may still run.*ps -o pid,args -p {child.pid}"):
+            sy.cmd_run(sy.build_parsers()[0].parse_args(["--project", str(self.project), "again"]))
+        reap(child)
+        row = sy.gather_statuses()[0]
+        self.assertEqual(row["ended_tasks"][0]["end_reason"], "owner process exited")
+        self.assertEqual(store.read()["sessions"][0]["state"], "ended")
+        self.assertEqual(store.read()["requests"][0]["state"], "failed")
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "needs /proc process identities")
+    def test_forged_status_cli_owner_does_not_block_launch_but_store_copy_does(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        sy.register_project(self.project)
+        victim, _ = spawn_owner()  # any live process an agent could name
+        self.addCleanup(reap, victim)
+        sy.write_status_stub(self.project, 2**30, "agent-written")
+        status = json.loads(sy.status_path(self.project).read_text())
+        status["cli_owner"] = status["tasks"][-1]["cli_owner"] = sy.owner_identity(victim.pid)
+        sy.status_path(self.project).write_text(json.dumps(status))
+        parse = sy.build_parsers()[0].parse_args
+        with unittest.mock.patch.object(sy, "run_session", return_value=0) as run:
+            self.assertEqual(sy.cmd_run(parse(["--project", str(self.project), "launch"])), 0)
+        run.assert_called_once()
+        # A child recorded by the launcher in the coordination store still refuses.
+        launcher, _ = spawn_owner()
+        store = sy.coordination_store()
+        session = store.start_session(str(self.project), self.current_task_id(), "codex", launcher.pid)
+        store.record_cli_owner(session["id"], sy.owner_identity(victim.pid))
+        reap(launcher)
+        with unittest.mock.patch.object(sy, "run_session", return_value=0) as run:
+            with self.assertRaisesRegex(sy.SyndicateError, rf"ls -l /proc/{victim.pid}/cwd"):
+                sy.cmd_run(parse(["--project", str(self.project), "again"]))
+        run.assert_not_called()
+
+    def owner_write_fails(self, store_fails):
+        sy.write_status_stub(self.project, os.getpid(), "supervised")
+        status = json.loads(sy.status_path(self.project).read_text())
+        status["lock_owned"] = status["tasks"][-1]["lock_owned"] = True
+        sy.status_path(self.project).write_text(json.dumps(status))
+        session = sy.coordination_store().start_session(str(self.project), self.current_task_id(), "codex", os.getpid())
+        real, writes = sy.runtime.atomic_json, []
+
+        def flaky(*args, **kwargs):
+            if Path(args[0]) == sy.status_path(self.project):
+                writes.append(args[0])
+                if len(writes) == 1:
+                    raise OSError("read-only")  # only the first status write fails
+            return real(*args, **kwargs)
+        failing = unittest.mock.patch.object(sy.portfolio.CoordinationStore, "record_cli_owner",
+                                             side_effect=sy.portfolio.PortfolioError("unavailable"))
+        with (failing if store_fails else contextlib.nullcontext()), \
+             unittest.mock.patch.object(sy.runtime, "atomic_json", side_effect=flaky), \
+             contextlib.redirect_stderr(io.StringIO()):
+            sy.record_cli_owner(self.project, session, os.getpid())
+        store = sy.coordination_store()
+        recorded = next(s for s in store.read()["sessions"] if s["id"] == session["id"])
+        store.end_session(session["id"])
+        return json.loads(sy.status_path(self.project).read_text()), recorded
+
+    def test_unrecorded_cli_owner_withdraws_the_lock_as_proof_of_death(self):
+        status, session = self.owner_write_fails(store_fails=True)
+        self.assertNotIn("cli_owner", session)
+        for record in (status, status["tasks"][-1]):
+            self.assertIs(record["lock_owned"], False)
+            self.assertIsNone(record["cli_owner"])
+        # One stored copy is enough: the status keeps its lock evidence.
+        status, session = self.owner_write_fails(store_fails=False)
+        self.assertEqual(session["cli_owner"]["pid"], os.getpid())
+        self.assertIs(status["lock_owned"], True)
+
+    # --- Handoff, resume, and claimed tasks ---------------------------------
+
+    def test_handoff_exit_keeps_the_task_resumable(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        self.isolate_launch()
+        handoff = self.project / ".syndicate" / "handoffs" / "run"
+
+        def supervised(*_, **__):
+            return 75, handoff  # status left 'running', as when no handoff state was written
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "-p", "interrupted work"])
+        with unittest.mock.patch.object(sy.runtime, "supervise", side_effect=supervised), \
+             unittest.mock.patch.object(sy.runtime, "choose_target", return_value=None), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(sy.cmd_run(args), 75)
+        status = json.loads(sy.status_path(self.project).read_text())
+        self.assertEqual(status["state"], "running")
+        self.assertNotIn("end_reason", status["tasks"][-1])
+        self.assertEqual(sy.coordination_store().read()["sessions"][0]["state"], "ended")
+        sy.write_status_stub(self.project, os.getpid(), "direct")
+        task_id = self.current_task_id()
+        with sy.project_session(self.project, "codex", {"handoff": True}):
+            pass
+        status = json.loads(sy.status_path(self.project).read_text())
+        self.assertEqual((status["state"], status["current"]["task_id"]), ("running", task_id))
+        self.assertNotIn("end_reason", status["tasks"][-1])
+
+    def test_resume_clears_end_fields_of_the_resumed_task(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        sy.write_status_stub(self.project, os.getpid(), "resumable")
+        status = json.loads(sy.status_path(self.project).read_text())
+        status["state"] = "ended"
+        status["tasks"][-1].update(state="ended", last_state="running", ended_at="2026-01-01T00:00:00Z",
+                                   end_reason="session exited")
+        sy.status_path(self.project).write_text(json.dumps(status))
+        handoff = self.project / ".syndicate" / "handoffs" / "run"
+        handoff.mkdir(parents=True)
+        (handoff / "status.json").write_text(json.dumps(status))
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "--handoff", str(handoff)])
+        with unittest.mock.patch.object(sy, "run_session", return_value=0):
+            self.assertEqual(sy.cmd_run(args), 0)
+        after = json.loads(sy.status_path(self.project).read_text())
+        task = after["tasks"][-1]
+        self.assertEqual((after["state"], task["state"], task["id"]), ("running", "running", status["tasks"][-1]["id"]))
+        for key in ("ended_at", "end_reason", "last_state"):
+            self.assertNotIn(key, task)
+
+    def test_superseded_closure_does_not_stick_once_the_current_session_claims_the_task(self):
+        sy.register_project(self.project)
+        sy.write_status_stub(self.project, 2**30, "first")
+        first = self.current_task_id()
+        sy.write_status_stub(self.project, os.getpid(), "second")
+        self.assertEqual(sy.gather_statuses()[0]["ended_tasks"][0]["id"], first)
+        store = sy.coordination_store()
+        session = store.start_session(str(self.project), self.current_task_id(), "codex", os.getpid())
+        status = json.loads(sy.status_path(self.project).read_text())
+        status["current"]["session_id"] = session["id"]
+        status["tasks"][0].update(state="running", session_id=session["id"])  # the owner resumes it
+        sy.status_path(self.project).write_text(json.dumps(status))
+        row = sy.gather_statuses()[0]
+        claimed = next(t for t in row["tasks"] if t["id"] == first)
+        self.assertEqual((claimed["state"], claimed["liveness"]), ("running", "alive"))
+        self.assertEqual(row["ended_tasks"], [])
+        edits = json.loads(self.edits_path().read_text())[str(self.project)][first]
+        self.assertEqual(edits["auto_end"]["owner"]["session_id"], None)  # only the old owner's closure
+        store.end_session(session["id"])  # the claiming session ends: the task closes for it
+        reclosed = sy.gather_statuses()[0]["ended_tasks"]
+        self.assertIn(first, [t["id"] for t in reclosed])
+
+    # --- Sweep scheduling and read-only views ---------------------------------
+
+    def test_cmd_task_sweeps_once_for_many_live_sessions(self):
+        store = sy.coordination_store()
+        for name in ("one", "two", "three"):
+            store.start_session(str(self.project / name), f"task-{name}", "codex", os.getpid())
+        calls = []
+        real = sy.gather_statuses
+
+        def counted(*args, **kwargs):
+            calls.append(kwargs.get("sweep", True))
+            return real(*args, **kwargs)
+        args = argparse.Namespace(project=str(self.project))
+        with unittest.mock.patch.object(sy, "gather_statuses", side_effect=counted), \
+             unittest.mock.patch.object(sy, "execution_project", return_value=self.project), \
+             unittest.mock.patch.object(sy, "cmd_run", return_value=0) as run:
+            self.assertEqual(sy.cmd_task(args), 0)
+        run.assert_called_once()
+        self.assertEqual(calls, [True])
+
+    def test_tmux_prelaunch_task_check_sweeps_once_for_many_live_sessions(self):
+        store = sy.coordination_store()
+        for name in ("one", "two", "three"):
+            store.start_session(str(self.project / name), f"task-{name}", "codex", os.getpid())
+        calls = []
+        real = sy.gather_statuses
+
+        def counted(*args, **kwargs):
+            calls.append(kwargs.get("sweep", True))
+            return real(*args, **kwargs)
+        with unittest.mock.patch.object(sy, "gather_statuses", side_effect=counted), \
+             unittest.mock.patch.object(sy, "tmux_enabled", return_value=True), \
+             unittest.mock.patch.object(sy, "execution_project", return_value=self.project), \
+             unittest.mock.patch.object(sy, "launch_tmux", return_value=0) as launch:
+            self.assertEqual(sy.main(["team", "task", "--project", str(self.project), "goal"]), 0)
+        launch.assert_called_once()
+        self.assertEqual(calls, [True])
+
+    def test_failed_sweep_keeps_assignments_and_never_launches_a_duplicate_team(self):
+        other = self.project / "source"
+        task = dict(id="task-x", source_path=str(other))
+        row = dict(path=str(self.project), tasks=[task], completed_tasks=[], ended_tasks=[])
+        sy.coordination_store().start_session(str(other), "task-x", "codex", os.getpid())
+        calls = []
+
+        def gather(*args, sweep=True):
+            calls.append(sweep)
+            if sweep:
+                raise OSError("sweep failed")
+            return [row]
+        with unittest.mock.patch.object(sy, "gather_statuses", side_effect=gather), \
+             unittest.mock.patch.object(sy, "execution_project", return_value=self.project), \
+             unittest.mock.patch.object(sy, "tmux_enabled", return_value=True), \
+             unittest.mock.patch.object(sy, "launch_tmux", return_value=0) as launch, \
+             unittest.mock.patch.object(sy, "cmd_run", return_value=0) as run, \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(sy.cmd_task(argparse.Namespace(project=str(self.project))), 0)
+            self.assertEqual(sy.main(["team", "task", "--project", str(self.project), "goal"]), 0)
+        run.assert_not_called()
+        launch.assert_not_called()
+        self.assertEqual(out.getvalue().count("Team already running"), 2)
+        self.assertEqual(calls, [True, False, True, False])  # read-only fallback after each failed sweep
+
+    def test_generic_group_liveness_reflects_every_member(self):
+        live, foreign = self.project / "live", self.project / "foreign"
+        for source in (live, foreign):
+            source.mkdir()
+            sy.register_project(source, generic=True)
+        sy.write_status_stub(live, os.getpid(), "verified")
+        sy.write_status_stub(foreign, os.getpid(), "sandboxed")
+        status = json.loads(sy.status_path(foreign).read_text())
+        status["process_namespace"] = status["tasks"][0]["process_namespace"] = "pid:[sandbox]"
+        status["pid"] = status["tasks"][0]["pid"] = 2
+        sy.status_path(foreign).write_text(json.dumps(status))
+        group = next(r for r in sy.gather_statuses() if r["name"] == "Generic tasks")
+        self.assertEqual(len(group["tasks"]), 2)
+        self.assertEqual(group["liveness"], "unknown")
+        status["process_namespace"] = status["tasks"][0]["process_namespace"] = sy.portfolio.process_namespace()
+        status.update(sy.owner_identity(os.getpid()))
+        status["tasks"][0].update(sy.owner_identity(os.getpid()))
+        sy.status_path(foreign).write_text(json.dumps(status))
+        group = next(r for r in sy.gather_statuses() if r["name"] == "Generic tasks")
+        self.assertNotIn("liveness", group)
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "needs /proc process identities")
+    def test_web_get_handlers_compute_verdicts_without_writing(self):
+        sy.register_project(self.project)
+        proc, _ = spawn_owner()
+        sy.write_status_stub(self.project, proc.pid, "abrupt")
+        task_id = self.current_task_id()
+        store = sy.coordination_store()
+        store.start_session(str(self.project), task_id, "codex", proc.pid)
+        store.send_request(source_path=str(self.project), project_path=str(self.project),
+                           task_id=task_id, key="k", message="Review")
+        reap(proc)
+        before = (store.path.read_bytes(), sy.status_path(self.project).read_bytes())
+        server = http.server.HTTPServer(("127.0.0.1", 0), sy._DashboardHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        responses = {}
+        for path in ("/api/status", "/api/briefing"):
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+            conn.request("GET", path)
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            responses[path] = json.loads(response.read())
+            conn.close()
+        self.assertEqual(responses["/api/status"][0]["ended_tasks"][0]["id"], task_id)  # verdict shown
+        self.assertEqual(responses["/api/briefing"]["sessions"][0]["liveness"], "dead")
+        self.assertFalse(self.edits_path().exists())
+        self.assertEqual((store.path.read_bytes(), sy.status_path(self.project).read_bytes()), before)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sy.main(["tasks", "list"]), 0)  # the terminal listing still sweeps
+        self.assertTrue(self.edits_path().exists())
+        self.assertEqual(store.read()["sessions"][0]["state"], "ended")
+
+
+
 class WebDashboard(StatusAndRegistry):
     def test_browser_views_filter_escape_and_completion(self):
         if not sy.shutil.which("node"):
@@ -895,6 +1736,21 @@ assert.equal(currentTask(rows[0]).source_path,'/live');
 // If briefing data is unavailable, prefer running work among multiple reported-current tasks.
 portfolioData=null;render();
 assert.ok($('content').innerHTML.includes('Live Codex task'));
+// Ended tasks leave the unfinished list but stay visible as history; unverified owners are labeled.
+rows=[{name:'repo',path:'/tmp/e',project_status:'Working',unfinished_count:1,history:[],last_completed:null,
+ tasks:[{id:'live',state:'running',liveness:'unknown',summary:'Sandboxed run',is_current:true}],
+ ended_tasks:[{id:'gone',state:'ended',last_state:'running',end_reason:'owner <process> exited',summary:'Abrupt run'}]}];
+portfolioData={next_action:'Review',decisions:[],requests:[],projects:[],
+ sessions:[{id:'s',task_id:'live',source_path:'/tmp/e',provider:'codex',pid:1,live:false,liveness:'unknown'}]};
+render();
+assert.ok($('content').innerHTML.includes('running (unverified)'));
+assert.ok($('coordination').innerHTML.includes('unverified'));
+location.hash='#'+encodeURIComponent('/tmp/e');render();
+assert.ok($('content').innerHTML.includes('Unfinished tasks (1)'));
+assert.ok($('content').innerHTML.includes('Ended without completion (1)'));
+assert.ok($('content').innerHTML.includes('owner &lt;process&gt; exited'));
+assert.ok($('content').innerHTML.includes('was running'));
+location.hash='';
 
 
 

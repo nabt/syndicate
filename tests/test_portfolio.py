@@ -2,7 +2,10 @@ import concurrent.futures
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -304,6 +307,11 @@ class Coordination(unittest.TestCase):
         old_id = json.loads(sy.status_path(source).read_text())['current']['task_id']
         sy.write_status_stub(source, sy.os.getpid(), 'Current Codex work')
         current_id = json.loads(sy.status_path(source).read_text())['current']['task_id']
+        # A superseded running task is now closed as ended; keep an attention
+        # task (as the agent may report one) to show current ownership still wins.
+        status = json.loads(sy.status_path(source).read_text())
+        status['tasks'][0]['state'] = 'blocked'
+        sy.status_path(source).write_text(json.dumps(status))
         store = sy.coordination_store()
         owner = store.start_session(str(source), current_id, 'codex', sy.os.getpid())
         rows = sy.gather_statuses()
@@ -414,3 +422,164 @@ class Coordination(unittest.TestCase):
             self.assertEqual(json.loads(run(['sessions', '--json']))[0]['id'], owner['id'])
             self.assertIn(str(source), json.loads(run(['briefing', '--json']))['briefs'])
         self.assertEqual(before, sy.status_path(source).read_bytes())
+
+
+HAS_PROC = Path('/proc').is_dir()
+
+
+@unittest.skipUnless(HAS_PROC, 'needs /proc process identities (Linux)')
+class OwnerLiveness(unittest.TestCase):
+    """Tri-state ownership: only host-visible proof yields 'dead'."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.namespace = sy.portfolio.process_namespace()
+        proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.dead_identity = sy.portfolio.process_identity(proc.pid)
+        proc.kill()
+        proc.wait()
+        self.dead_pid = proc.pid
+
+    def test_alive_dead_and_reused_pid_in_same_namespace(self):
+        live = sy.portfolio.owner_liveness
+        me = os.getpid()
+        self.assertEqual(live(me, sy.portfolio.process_identity(me), self.namespace), 'alive')
+        self.assertEqual(live(self.dead_pid, self.dead_identity, self.namespace), 'dead')
+        self.assertEqual(live(me, sy.portfolio.boot_id() + ':1', self.namespace), 'dead')  # reused PID
+
+    def test_missing_evidence_is_unknown(self):
+        live = sy.portfolio.owner_liveness
+        self.assertEqual(live(self.dead_pid, self.dead_identity, 'pid:[1]'), 'unknown')  # sandbox-hidden
+        self.assertEqual(live(self.dead_pid, self.dead_identity, None), 'unknown')
+        self.assertEqual(live(2, None, self.namespace), 'unknown')  # legacy bare PID
+        self.assertEqual(live(None, self.dead_identity, self.namespace), 'unknown')
+        with patch.object(sy.portfolio, 'process_namespace', return_value=None):
+            self.assertEqual(live(self.dead_pid, self.dead_identity, self.namespace), 'unknown')
+        with patch.object(sy.portfolio, 'process_identity', return_value=None), \
+             patch.object(sy.portfolio, 'process_gone', return_value=False):
+            self.assertEqual(live(self.dead_pid, self.dead_identity, self.namespace), 'unknown')
+
+    def test_reboot_needs_the_same_machine_or_namespace(self):
+        live = sy.portfolio.owner_liveness
+        here = sy.portfolio.machine_id()
+        with patch.object(sy.portfolio, 'machine_id', return_value='machine-a'):
+            # Same machine, new boot: a reboot ended the owner, even from another namespace.
+            self.assertEqual(live(self.dead_pid, 'previous-boot:123', 'pid:[1]', 'machine-a'), 'dead')
+            # Another machine sharing this home directory has a different boot_id: not proof.
+            self.assertEqual(live(self.dead_pid, 'previous-boot:123', self.namespace, 'machine-b'), 'unknown')
+            # No recorded machine-id: only within the same namespace.
+            self.assertEqual(live(self.dead_pid, 'previous-boot:123', self.namespace, None), 'dead')
+            self.assertEqual(live(self.dead_pid, 'previous-boot:123', 'pid:[1]', None), 'unknown')
+        with patch.object(sy.portfolio, 'machine_id', return_value=None):
+            self.assertEqual(live(self.dead_pid, 'previous-boot:123', 'pid:[1]', 'machine-a'), 'unknown')
+            self.assertEqual(live(self.dead_pid, 'previous-boot:123', self.namespace, 'machine-a'), 'dead')
+        record = sy.portfolio.owner_record(os.getpid())
+        self.assertEqual(record['machine_id'], here)
+        self.assertEqual(sy.portfolio.record_liveness(record), 'alive')
+
+    def test_process_gone_confirms_missing_proc_entries_with_kill(self):
+        gone = sy.portfolio.process_gone
+        self.assertTrue(gone(self.dead_pid))
+        self.assertFalse(gone(os.getpid()))
+        real_read = Path.read_text
+
+        def hidden(path, *args, **kwargs):  # hidepid: /proc/<pid> missing for a live process
+            if str(path) == f'/proc/{self.dead_pid}/stat':
+                raise FileNotFoundError(path)
+            return real_read(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', hidden):
+            with patch.object(sy.portfolio.os, 'kill', side_effect=PermissionError):
+                self.assertFalse(gone(self.dead_pid))
+            with patch.object(sy.portfolio.os, 'kill', return_value=None):
+                self.assertFalse(gone(self.dead_pid))
+            with patch.object(sy.portfolio.os, 'kill', side_effect=ProcessLookupError):
+                self.assertTrue(gone(self.dead_pid))
+
+    def test_lock_probe_is_tri_state_and_never_creates_files(self):
+        import fcntl
+        path = self.root / 'session.lock'
+        self.assertEqual(sy.portfolio.probe_lock(path), 'unknown')
+        self.assertFalse(path.exists())
+        path.touch()
+        self.assertEqual(sy.portfolio.probe_lock(path), 'free')
+        with path.open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(sy.portfolio.probe_lock(path), 'held')
+        self.assertEqual(sy.portfolio.probe_lock(path), 'free')
+
+    def test_reconcile_and_non_strict_snapshot(self):
+        store = sy.portfolio.CoordinationStore(self.root / 'portfolio')
+        store.start_session('/foreign', 'task', 'codex', os.getpid())
+        store.start_session('/gone', 'task', 'codex', os.getpid())
+        request = store.send_request(source_path='/gone', project_path='/gone', task_id='task', key='k', message='m')
+        data = store.read()
+        data['sessions'][0].update(pid=self.dead_pid, process_identity=self.dead_identity, process_namespace='pid:[1]')
+        data['sessions'][1].update(pid=self.dead_pid, process_identity=self.dead_identity)
+        sy.runtime.atomic_json(store.path, data)
+        with self.assertRaises(sy.portfolio.PortfolioError):
+            store.snapshot()
+        view = store.snapshot(strict=False)
+        self.assertEqual([s['liveness'] for s in view['sessions']], ['unknown', 'dead'])
+        dead = lambda session: store.session_liveness(session) == 'dead'
+        self.assertEqual(store.reconcile(dead), [data['sessions'][1]['id']])
+        after = store.read()
+        self.assertEqual([s['state'] for s in after['sessions']], ['active', 'ended'])
+        self.assertEqual(after['sessions'][1]['reason'], 'owner process exited')
+        self.assertEqual(after['requests'][0]['state'], 'failed')
+        before = store.path.read_bytes()
+        self.assertEqual(store.reconcile(dead), [])
+        self.assertEqual(store.path.read_bytes(), before)
+
+    def test_superseding_a_dead_session_fails_its_queued_requests(self):
+        store = sy.portfolio.CoordinationStore(self.root / 'portfolio')
+        first = store.start_session('/source', 'task', 'codex', os.getpid())
+        store.send_request(source_path='/source', project_path='/source', task_id='task', key='k', message='m')
+        data = store.read()
+        data['sessions'][0].update(pid=self.dead_pid, process_identity=self.dead_identity)
+        sy.runtime.atomic_json(store.path, data)
+        store.start_session('/source', 'task', 'codex', os.getpid())
+        after = store.read()
+        self.assertEqual(after['sessions'][0]['id'], first['id'])
+        self.assertEqual((after['sessions'][0]['state'], after['sessions'][0]['reason']), ('ended', 'superseded'))
+        self.assertEqual(after['requests'][0]['state'], 'failed')
+
+
+class OwnerLivenessWithoutProc(unittest.TestCase):
+    """No /proc (e.g. macOS): ps start times confirm live owners, never dead ones."""
+
+    def test_ps_identity_is_alive_when_it_matches_and_otherwise_unknown(self):
+        live = sy.portfolio.owner_liveness
+        identity = 'ps:Mon Nov 16 10:00:00 2026'
+        with patch.object(sy.portfolio, 'process_namespace', return_value=None), \
+             patch.object(sy.portfolio, 'boot_id', return_value=None):
+            with patch.object(sy.portfolio, 'process_identity', return_value=identity):
+                self.assertEqual(live(4242, identity, None), 'alive')
+                self.assertEqual(live(4242, identity, 'pid:[1]'), 'unknown')  # recorded elsewhere
+            with patch.object(sy.portfolio, 'process_identity', return_value='ps:Tue Nov 17 10:00:00 2026'):
+                self.assertEqual(live(4242, identity, None), 'unknown')  # reused or hidden: never dead
+            with patch.object(sy.portfolio, 'process_identity', return_value=None):
+                self.assertEqual(live(4242, identity, None), 'unknown')  # ps can be filtered
+        with patch.object(sy.portfolio, 'process_namespace', return_value='pid:[1]'), \
+             patch.object(sy.portfolio, 'process_identity', return_value=identity):
+            self.assertEqual(live(4242, identity, None), 'unknown')  # mixed environments
+
+    def test_lock_probe_rejects_fifos_without_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'session.lock'
+            os.mkfifo(path)
+            self.assertEqual(sy.portfolio.probe_lock_detail(path), ('unknown', None))
+            with self.assertRaises(sy.portfolio.UnsafeLockError):
+                sy.portfolio.open_lock(path, create=True)
+
+
+@unittest.skipUnless(HAS_PROC, 'needs /proc process identities (Linux)')
+class StrictSessionReboot(unittest.TestCase):
+    def test_foreign_namespace_reboot_needs_a_matching_machine(self):
+        session = dict(state='active', pid=4242, process_identity='previous-boot:1', process_namespace='pid:[1]')
+        with patch.object(sy.portfolio, 'machine_id', return_value='machine-a'):
+            self.assertFalse(sy.portfolio.CoordinationStore.session_live({**session, 'machine_id': 'machine-a'}))
+            for other in ('machine-b', None):
+                with self.assertRaisesRegex(sy.portfolio.PortfolioError, 'PID namespace'):
+                    sy.portfolio.CoordinationStore.session_live({**session, 'machine_id': other})

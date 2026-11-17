@@ -11,6 +11,7 @@ docs/configuration.md.
 from __future__ import annotations
 
 import argparse
+import errno
 import http.server
 import json
 import os
@@ -47,8 +48,13 @@ CLIS = ("claude", "codex")
 LOCAL = ".syndicate"
 ROLE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 RELAY_SANDBOX = "workspace-write"
-STATUS_STATES = ("running", "waiting_on_user", "done")
+STATUS_STATES = ("running", "waiting_on_user", "done", "ended")
 MAX_STATUS_HISTORY = 200
+# Closed without completion: the owning session ended while the task still
+# claimed to be in progress. Distinct from done, which asserts completion.
+ENDED = "ended"
+DONE_STATES = ("done", "completed")
+LOCK_ATTEMPTS = 20  # x 50ms: tolerate momentary shared probes of session.lock
 
 CONFIG_DEFAULTS = {
     "codex-tui.show_tooltips": "false",
@@ -644,30 +650,26 @@ def write_status_stub(project: Path, pid: int, summary: str) -> None:
                 history = prior[-MAX_STATUS_HISTORY:]
         except (json.JSONDecodeError, OSError):
             pass
+    owner = owner_identity(pid)
     data = {
-        "pid": pid,
+        **owner,
         "state": "running",
         "current": {"round": None, "role": "orchestrator", "summary": summary},
         "history": history,
         "tasks": tasks + [{"id": uuid.uuid4().hex, "summary": summary,
-                           "state": "running", "updated_at": now_iso(), "pid": pid}],
+                           "state": "running", "updated_at": now_iso(), **owner}],
     }
     data["current"]["task_id"] = data["tasks"][-1]["id"]
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
-def is_pid_alive(pid) -> bool:
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists, just owned by someone else
-    except OSError:
-        return False
-    return True
+def owner_identity(pid) -> dict:
+    """PID plus reuse-proof start identity, and the PID namespace and machine it was read on."""
+    return portfolio.owner_record(pid)
+
+
+# Launcher-recorded ownership facts. Agents must preserve them like pid.
+OWNER_FIELDS = ("process_identity", "process_namespace", "machine_id", "lock_owned", "lock_inode", "cli_owner")
 
 
 def read_status(project_path: str) -> dict | None:
@@ -694,9 +696,17 @@ def project_tasks(status: dict) -> list[dict]:
         task["is_current"] = task.get("id") == current.get("task_id")
     active = next((t for t in tasks if t["is_current"]), None)
     if active is not None:
+        own_pid = active.get("pid")
         active.update(state=status.get("state", active.get("state")),
                       progress=current.get("summary"), pid=status.get("pid"),
                       updated_at=status.get("_mtime") or active.get("updated_at"))
+        # Owner identity is only meaningful together with the PID it was read for.
+        if isinstance(status.get("process_identity"), str) and status.get("pid") is not None:
+            active.update({key: status.get(key) for key in OWNER_FIELDS})
+            active["lock_owned"] = status.get("lock_owned") is True
+        elif own_pid != active.get("pid"):
+            for key in OWNER_FIELDS:
+                active.pop(key, None)
         if active.get("state") in ("done", "completed") and not active.get("completed_at"):
             active["completed_at"] = active.get("updated_at")
     elif not tasks and current.get("summary"):
@@ -706,25 +716,221 @@ def project_tasks(status: dict) -> list[dict]:
     return tasks
 
 
-def gather_statuses() -> list[dict]:
-    """One row per registered project. A project whose status file says 'running'
-    but whose pid is no longer alive is reported as 'stale', not 'running' — this
-    is what catches a session that died without reporting back."""
+def portfolio_dir() -> Path:
+    return REGISTRY_PATH.parent / "portfolio"
+
+
+def project_lock_path(project) -> Path:
+    return Path(project) / LOCAL / "session.lock"
+
+
+def lock_probe(source, cache=None) -> tuple[str, tuple | None]:
+    """(state, inode) for a project's session.lock (never the Chief lock); cached per sweep."""
+    if cache is not None and source in cache:
+        return cache[source]
+    probe = (("unknown", None) if portfolio.is_chief_record(portfolio_dir(), path=source)
+             else portfolio.probe_lock_detail(project_lock_path(source)))
+    if cache is not None:
+        cache[source] = probe
+    return probe
+
+
+def lock_held(source, cache=None) -> bool:
+    return lock_probe(source, cache)[0] == "held"
+
+
+def lock_released(source, record: dict, cache=None) -> bool:
+    """True only if the owner held session.lock for its lifetime (lock_owned),
+    and the very inode it acquired (lock_inode) is now free. A replaced, unsafe,
+    or unreadable lock file proves nothing."""
+    expect = record.get("lock_inode")
+    if record.get("lock_owned") is not True or not isinstance(expect, list) or len(expect) != 2:
+        return False
+    state, inode = lock_probe(source, cache)
+    return state == "free" and inode is not None and list(inode) == expect
+
+
+def cli_owners(*records) -> list[dict]:
+    """Recorded supervised-CLI child owners (deduplicated) from task/status/session records."""
+    seen, owners = set(), []
+    for record in records:
+        owner = record.get("cli_owner") if isinstance(record, dict) else None
+        if isinstance(owner, dict):
+            key = (owner.get("pid"), owner.get("process_identity"))
+            if key not in seen:
+                seen.add(key)
+                owners.append(owner)
+    return owners
+
+
+def combine_owners(launcher: str, children: list[dict]) -> tuple[str, bool]:
+    """Combine the launcher's verdict with its recorded CLI children.
+
+    Any owner alive -> alive; a child that cannot be verified -> unknown;
+    otherwise the launcher's verdict. The flag is True when every recorded
+    child is verifiably dead (or none was recorded): only then may a released
+    project lock prove the session is over.
+    """
+    verdicts = [portfolio.record_liveness(child) for child in children]
+    if launcher == "alive" or "alive" in verdicts:
+        return "alive", False
+    if "unknown" in verdicts:
+        return "unknown", False
+    return launcher, True
+
+
+def task_owner(task: dict) -> dict:
+    """The owner an automatic closure applies to; a resumed task gets a new owner."""
+    return {"pid": task.get("pid"), "session_id": task.get("session_id")}
+
+
+def task_verdict(task: dict, status: dict, source: str, sessions: list[dict], locks: dict) -> tuple[str, str | None]:
+    """Tri-state liveness for a running (or superseded waiting) task record.
+
+    'dead' requires definitive evidence: a later launch superseded it under
+    the project lock, its coordination session ended, every recorded owner
+    (launcher and supervised CLI child) is proven gone in this PID namespace
+    (or by a reboot of this machine), or the launcher held session.lock for
+    its lifetime and that same inode is now free with no CLI child possibly
+    alive. A held project lock always defers judgment of the current task.
+    """
+    state = task.get("state")
+    current = status.get("current") if isinstance(status.get("current"), dict) else {}
+    current_id = current.get("task_id")
+    current_session = current.get("session_id")
+    pid = task.get("pid")
+    launcher_pid = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+    # The current owner session may take over an earlier task; it is then judged
+    # by that session's liveness, not as superseded.
+    claimed = bool(current_session) and task.get("session_id") == current_session
+    if not task.get("is_current") and not claimed:
+        # Only cmd_run appends tasks, and only while holding session.lock, so an
+        # earlier launcher-owned task with another PID was superseded by it.
+        # Sandboxed launches can share a PID (often 2); differing start identities
+        # still prove different launchers.
+        other_owner = pid != status.get("pid") or (
+            isinstance(task.get("process_identity"), str) and isinstance(status.get("process_identity"), str)
+            and task["process_identity"] != status["process_identity"])
+        if state in ("running", "waiting_on_user") and current_id and launcher_pid and other_owner:
+            return "dead", f"superseded by task {current_id}"
+    if state != "running":
+        # A current waiting_on_user task keeps its question (and stays resumable
+        # by a handoff) until a later launch supersedes it.
+        return "unknown", None
+
+    def held():
+        return bool(task.get("is_current") or claimed) and lock_held(source, locks)
+
+    session = None
+    if task.get("session_id"):
+        session = next((s for s in sessions if s.get("id") == task["session_id"]
+                        and s.get("source_path") == source), None)
+    if session is None:
+        session = next((s for s in reversed(sessions) if s.get("source_path") == source
+                        and s.get("task_id") == task.get("id")), None)
+    children = cli_owners(task, session)
+    launcher = "unknown"
+    if session is not None:
+        if session.get("state") != "active":
+            # Ended by its launcher after stopping the CLI, or by a sweep that proved it.
+            return ("unknown", None) if held() else ("dead", session.get("reason") or "session exited")
+        launcher = portfolio.CoordinationStore.session_liveness(session)
+    if launcher == "unknown":
+        launcher = portfolio.record_liveness(task)
+    verdict, children_gone = combine_owners(launcher, children)
+    if verdict == "alive":
+        return "alive", None
+    if verdict == "dead":
+        return ("unknown", None) if held() else ("dead", "owner process exited")
+    if task.get("is_current") and children_gone and lock_released(source, task, locks):
+        return "dead", "owner process exited (project lock released)"
+    return "unknown", None
+
+
+def reconcile_sessions(write: bool = True) -> list[dict]:
+    """End coordination sessions whose owners are definitively gone, exactly as
+    end_session does (queued requests fail). Chief records are never touched.
+    With write=False nothing is ended (read-only views). Returns the session
+    list, or [] when coordination state is unavailable."""
+    store = coordination_store()
+    pdir = portfolio_dir()
+    locks: dict = {}
+
+    def verdict(session):
+        source = session.get("source_path")
+        if not isinstance(source, str) or portfolio.is_chief_record(pdir, path=source, record=session):
+            return False
+        status = read_status(source) or {}
+        current = status.get("current") if isinstance(status.get("current"), dict) else {}
+        owns_current = current.get("task_id") == session.get("task_id")
+        same_session = owns_current and current.get("session_id") == session.get("id")
+        liveness, children_gone = combine_owners(store.session_liveness(session),
+                                                 cli_owners(session, status if same_session else None))
+        if liveness == "alive":
+            return False
+        if liveness == "dead":
+            # A held lock means the process tree, or a relaunch, may still own the task.
+            return not (owns_current and lock_held(source, locks))
+        return same_session and children_gone and lock_released(source, status, locks)
+
+    if write:
+        try:
+            store.reconcile(verdict)
+        except (portfolio.PortfolioError, OSError):
+            pass  # unreadable or read-only coordination state: report, never crash
+    try:
+        return store.read()["sessions"]
+    except (portfolio.PortfolioError, OSError):
+        return []
+
+
+def persist_task_closures(closures: list[tuple[str, str, dict]]) -> None:
+    """Record automatic closures in the independent task-edits overlay, which an
+    agent's own status.json writes cannot overwrite. Idempotent per owner."""
+    try:
+        with registry_lock():
+            path = REGISTRY_PATH.parent / "task-edits.json"
+            edits = runtime.read_json(path)
+            changed = False
+            for source, task_id, closure in closures:
+                entry = edits.setdefault(source, {}).setdefault(task_id, {})
+                if "state" in entry or (entry.get("auto_end") or {}).get("owner") == closure["owner"]:
+                    continue  # explicit edits stay authoritative
+                entry["auto_end"] = closure
+                changed = True
+            if changed:
+                runtime.atomic_json(path, edits)
+    except OSError:
+        pass  # e.g. a read-only sandbox view; the next host sweep persists it
+
+
+def gather_statuses(sweep: bool = True) -> list[dict]:
+    """One row per registered project, reconciling stale ownership on the way.
+
+    A running task whose owner is definitively gone is closed as 'ended'
+    (never 'done') through the task-edits overlay; one whose owner cannot be
+    verified from here (another PID namespace, no identity) stays as reported
+    with liveness 'unknown'. Chief of Staff records are never evaluated.
+    With sweep=False (web GET handlers) the same verdicts are shown but
+    nothing is written."""
     rows = []
     overrides = runtime.read_json(REGISTRY_PATH.parent / "task-edits.json")
+    sessions = reconcile_sessions(write=sweep)
+    locks: dict = {}
+    closures = []
+    pdir = portfolio_dir()
     for entry in load_registry():
         status = read_status(entry.get("path", ""))
         source = entry["path"]
+        # Decided by the resolved source path only; status content cannot claim it.
+        chief = portfolio.is_chief_record(pdir, path=source)
         row = {"path": entry.get("group_path", source), "name": "Generic tasks" if entry.get("group_path") else entry.get("name") or Path(source).name,
                "status_available": status is not None}
         if status is None:
             row.update(state="unknown", current=None, history=[], updated_at=None)
         else:
-            state = status.get("state") if status.get("state") in STATUS_STATES else "unknown"
-            if state == "running" and not is_pid_alive(status.get("pid")):
-                state = "stale"
             row.update(
-                state=state,
+                state=status.get("state") if status.get("state") in STATUS_STATES else "unknown",
                 current=status.get("current"),
                 history=status.get("history") if isinstance(status.get("history"), list) else [],
                 updated_at=status.get("_mtime"),
@@ -732,9 +938,30 @@ def gather_statuses() -> list[dict]:
         tasks = project_tasks(status or {})
         for task in tasks:
             task["source_path"] = source
-            task.update(overrides.get(source, {}).get(task.get("id"), {}))
+            edit = dict(overrides.get(source, {}).get(task.get("id"), {}))
+            auto = edit.pop("auto_end", None)
+            raw_state, owner = task.get("state"), task_owner(task)
+            if (not chief and "state" not in edit
+                    and raw_state in ("running", "waiting_on_user")):
+                verdict, reason = task_verdict(task, status, source, sessions, locks)
+                if raw_state == "running":
+                    task["liveness"] = verdict
+                if verdict == "dead" and not (isinstance(auto, dict) and auto.get("owner") == owner):
+                    auto = {"state": ENDED, "last_state": raw_state, "ended_at": now_iso(),
+                            "end_reason": reason, "owner": owner}
+                    closures.append((source, task.get("id"), auto))
+            task.update(edit)
+            if (not chief and isinstance(auto, dict) and "state" not in edit and auto.get("owner") == owner
+                    and auto.get("last_state") == raw_state):
+                task.update(state=ENDED, last_state=raw_state, ended_at=auto.get("ended_at"),
+                            end_reason=auto.get("end_reason"))
+                task.pop("liveness", None)
+            if task.get("is_current") and row["state"] == "running" and task.get("state") == ENDED:
+                row["state"] = ENDED
         row["all_tasks"] = tasks
         rows.append(row)
+    if closures and sweep:
+        persist_task_closures(closures)
     grouped = {}
     for row in rows:
         grouped.setdefault(row["path"], {**row, "all_tasks": [], "history": []})
@@ -748,25 +975,50 @@ def gather_statuses() -> list[dict]:
     rows = []
     for row in grouped.values():
         tasks = row.pop("all_tasks")
-        for task in tasks:
-            if task.get("state") == "running" and not is_pid_alive(task.get("pid")):
-                task["state"] = "stale"
-        unfinished = [t for t in tasks if t.get("state") not in ("done", "completed")]
-        completed = sorted((t for t in tasks if t.get("state") in ("done", "completed")),
+        # Per group, not copied from its first member: any unverifiable current owner.
+        row.pop("liveness", None)
+        if any(t.get("is_current") and t.get("state") == "running" and t.get("liveness") == "unknown" for t in tasks):
+            row["liveness"] = "unknown"
+        unfinished = [t for t in tasks if t.get("state") not in (*DONE_STATES, ENDED)]
+        completed = sorted((t for t in tasks if t.get("state") in DONE_STATES),
                            key=lambda t: t.get("completed_at") or t.get("updated_at") or "", reverse=True)
-        attention = {"waiting_on_user", "blocked", "failed", "stale", "unknown"}
+        ended = sorted((t for t in tasks if t.get("state") == ENDED),
+                       key=lambda t: t.get("ended_at") or t.get("updated_at") or "", reverse=True)
+        attention = {"waiting_on_user", "blocked", "failed", "unknown"}
         unfinished.sort(key=lambda t: (0 if t.get("state") in attention else 1 if t.get("state") == "running" else 2))
         label = ("Needs attention" if any(t.get("state") in attention for t in unfinished)
                  else "Working" if any(t.get("state") == "running" for t in unfinished)
                  else "Queued" if unfinished else "Complete" if completed
-                 else "No tasks" if row.get("status_available") or not status_path(Path(row["path"])).exists()
+                 else "No tasks" if ended or row.get("status_available") or not status_path(Path(row["path"])).exists()
                  else "Needs attention")
         row.update(tasks=unfinished, unfinished_count=len(unfinished),
                    last_completed=completed[0] if completed else None, project_status=label,
-                   completed_tasks=completed)
+                   completed_tasks=completed, ended_tasks=ended)
         rows.append(row)
     priority = {"Needs attention": 0, "Working": 1, "Queued": 2, "Complete": 3, "No tasks": 4}
     return sorted(rows, key=lambda r: (priority[r["project_status"]], r["name"].lower(), r["path"]))
+
+
+def reconcile_stale() -> list[dict] | None:
+    """Safe-point sweep before launching or listing ownership; never blocks the
+    caller. Returns the swept rows, or None if the sweep failed."""
+    try:
+        return gather_statuses()
+    except Exception:  # a failed sweep must never prevent a launch or listing
+        return None
+
+
+def assignment_rows() -> list[dict]:
+    """Rows for mapping live sessions to their projects: one sweep, or a
+    read-only view if the sweep fails, so assignments are never lost and a
+    duplicate team is not launched. [] only if neither can be read."""
+    rows = reconcile_stale()
+    if rows is not None:
+        return rows
+    try:
+        return gather_statuses(sweep=False)
+    except Exception:
+        return []
 
 
 def decision_store():
@@ -777,15 +1029,22 @@ def coordination_store():
     return portfolio.CoordinationStore(REGISTRY_PATH.parent / "portfolio")
 
 
-def project_briefing():
-    return portfolio.briefing(gather_statuses(), decision_store().read(), coordination_store().snapshot(),
+def session_label(session) -> str:
+    """Unverifiable ownership (e.g. another PID namespace) is not reported as inactive."""
+    return ("active" if session.get("live") else
+            "unverified" if session.get("liveness") == "unknown" else "inactive")
+
+
+def project_briefing(sweep: bool = True):
+    rows = gather_statuses(sweep=sweep)
+    return portfolio.briefing(rows, decision_store().read(), coordination_store().snapshot(strict=False),
                               portfolio.chief_status(REGISTRY_PATH.parent / "portfolio"))
 
 
-def task_project(source, task_id):
-    for row in gather_statuses():
+def task_project(source, task_id, rows=None):
+    for row in gather_statuses() if rows is None else rows:
         if any(t.get("id") == task_id and t.get("source_path") == str(source)
-               for t in row["tasks"] + row["completed_tasks"]):
+               for t in row["tasks"] + row["completed_tasks"] + row.get("ended_tasks", [])):
             return row["path"]
     return str(source)
 
@@ -936,9 +1195,10 @@ def launch_tmux(argv, directory, name, headless=False):
 
 def cmd_task(args):
     project = execution_project(args.project or str(Path.cwd()))
+    rows = assignment_rows()  # one sweep, reused for every live session
     for session in coordination_store().snapshot()['sessions']:
         if session['live'] and (session['source_path'] == str(project)
-                               or task_project(Path(session['source_path']), session['task_id']) == str(project)):
+                               or task_project(Path(session['source_path']), session['task_id'], rows) == str(project)):
             print(f"Team already running: {session['id']} / task {session['task_id']}")
             return 0
     args.dir = str(project)
@@ -946,7 +1206,8 @@ def cmd_task(args):
 
 
 def cmd_sessions(args):
-    records = coordination_store().snapshot()["sessions"]
+    reconcile_stale()
+    records = coordination_store().snapshot(strict=False)["sessions"]
     if args.project:
         target = str(resolve_project(args.project))
         records = [record for record in records if record["source_path"] == target
@@ -960,7 +1221,7 @@ def cmd_sessions(args):
         portfolio_print(json.dumps(records, indent=2))
     else:
         for record in records:
-            portfolio_print(f"{record['id']} [{('active' if record['live'] else 'inactive')}] {record['provider']} / PID {record['pid']}")
+            portfolio_print(f"{record['id']} [{session_label(record)}] {record['provider']} / PID {record['pid']}")
             portfolio_print(f"  {record['source_path']} / task {record['task_id']}")
         if not records:
             portfolio_print("No sessions recorded.")
@@ -1076,7 +1337,12 @@ def cmd_messages(args):
 
 
 @contextmanager
-def project_session(project, provider):
+def project_session(project, provider, outcome=None):
+    """Own the current task's coordination session for one supervised run.
+
+    On a normal exit a task the agent left 'running' is closed as 'ended',
+    unless the caller marked outcome['handoff'] (the run stopped for a
+    resumable handoff), which keeps the task resumable."""
     status = read_status(str(project)) or {}
     task_id = (status.get("current") or {}).get("task_id")
     if not task_id:
@@ -1084,6 +1350,7 @@ def project_session(project, provider):
         return
     store = coordination_store()
     session = store.start_session(str(project), task_id, provider, os.getpid())
+    close = True
     try:
         status["current"]["session_id"] = session["id"]
         for task in status.get("tasks", []):
@@ -1092,8 +1359,36 @@ def project_session(project, provider):
         status.pop("_mtime", None)
         runtime.atomic_json(status_path(project), status)
         yield session
+    except Exception:
+        close = False  # cmd_run records the launch failure as 'failed'
+        raise
     finally:
         store.end_session(session["id"])
+        if close and not (outcome or {}).get("handoff"):
+            close_owned_task(project, task_id)
+
+
+def close_owned_task(project, task_id, reason="session exited") -> bool:
+    """On supervised exit, close the task this session owned if the agent left it
+    'running': state 'ended' (not done), keeping last_state, ended_at and
+    end_reason. Agent-written done/failed/blocked/waiting_on_user states are
+    preserved. Called after the CLI process group has been stopped, so it cannot
+    race the agent's own status writes. Never applies to Chief records."""
+    if portfolio.is_chief_record(portfolio_dir(), path=project):
+        return False
+    status = read_status(str(project))
+    current = (status or {}).get("current")
+    if (not status or not isinstance(current, dict)
+            or current.get("task_id") != task_id or status.get("state") != "running"):
+        return False
+    stamp = now_iso()
+    status["state"] = ENDED
+    for task in status.get("tasks") if isinstance(status.get("tasks"), list) else []:
+        if isinstance(task, dict) and task.get("id") == task_id:
+            task.update(state=ENDED, last_state="running", ended_at=stamp, end_reason=reason, updated_at=stamp)
+    status.pop("_mtime", None)
+    runtime.atomic_json(status_path(project), status)
+    return True
 
 
 def chief_instructions(workspace):
@@ -1255,7 +1550,7 @@ def cmd_decisions(args):
         # Respect dashboard assignments without changing the task's source identity.
         for row in gather_statuses():
             if any(t.get("id") == task_id and t.get("source_path") == str(source)
-                   for t in row["tasks"] + row["completed_tasks"]):
+                   for t in row["tasks"] + row["completed_tasks"] + row.get("ended_tasks", [])):
                 target = Path(row["path"])
         result = store.request(source_path=str(source), project_path=str(target), task_id=task_id,
                                key=args.key, question=args.question, context=args.context,
@@ -1295,7 +1590,7 @@ def cmd_briefing(args):
                 for value in brief[field]:
                     portfolio_print(f"  {field.replace('_', ' ').title()}: {value}")
         for session in project.get("sessions", [])[-1:]:
-            portfolio_print(f"  Session: {session['id']} / {'active' if session['live'] else 'inactive'}")
+            portfolio_print(f"  Session: {session['id']} / {session_label(session)}")
     portfolio_print("\nDECISION INBOX")
     for decision in data["decisions"]:
         portfolio_print(f"{decision['id']} [{decision['state']}] {Path(decision['project_path']).name}: {decision['question']}")
@@ -1440,12 +1735,14 @@ def render_dashboard(rows: list[dict], *, width: int = 100, color: bool = False,
                         lines.extend(wrapped(f"{field.replace('_', ' ').title()}: {value}", "  "))
             for session in coordination["sessions"]:
                 if session["source_path"] == row.get("path"):
-                    lines.extend(wrapped(f"Session: {session['id']} / {'active' if session['live'] else 'inactive'} / {session['provider']}", "  "))
+                    lines.extend(wrapped(f"Session: {session['id']} / {session_label(session)} / {session['provider']}", "  "))
             report = current(row)
             lines.extend(wrapped(f"Provider: {report.get('provider') or 'unknown'} / report: {report.get('state') or row.get('state', 'unknown')} / updated: {report.get('updated_at') or row.get('updated_at') or 'unknown'}", "  "))
             tasks = row.get("tasks") or ([current(row)] if current(row) else [])
             for task in tasks:
                 prefix = "Last completed" if not row.get("tasks") and row.get("last_completed") else task.get("state", "Current")
+                if task.get("liveness") == "unknown":
+                    prefix += " (unverified)"
                 lines.extend(wrapped(f"{prefix}: {task.get('summary') or 'No task details reported'}", "  "))
                 if task.get("progress") and task["progress"] != task.get("summary"):
                     lines.extend(wrapped(task["progress"], "    "))
@@ -1454,6 +1751,10 @@ def render_dashboard(rows: list[dict], *, width: int = 100, color: bool = False,
                     lines.extend(wrapped(", ".join(role) if isinstance(role, list) else role, "    "))
             if not tasks:
                 lines.extend(wrapped("No tasks reported", "  "))
+            ended = row.get("ended_tasks") or []
+            if ended:
+                lines.extend(wrapped(f"Ended without completion: {len(ended)} (latest: {ended[0].get('summary') or 'untitled'}"
+                                     f" / {ended[0].get('end_reason') or 'session ended'})", "  "))
             lines.append("")
     lines.extend(wrapped("! needs attention   > working   ~ queued   + complete   - no tasks"))
     return "\n".join(lines)
@@ -1503,7 +1804,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                     selected = REGISTRY_PATH.parent / "generic-tasks" if args.project == "generic" else Path(args.project).expanduser().resolve()
                     rows = [r for r in rows if r["name"] == args.project or r["path"] == str(selected)]
                 decisions = [] if args.list else decision_store().read()
-                coordination = dict(briefs={}, sessions=[], requests=[]) if args.list else coordination_store().snapshot()
+                coordination = dict(briefs={}, sessions=[], requests=[]) if args.list else coordination_store().snapshot(strict=False)
                 if args.project:
                     paths = {row["path"] for row in rows}
                     decisions = [d for d in decisions if d["project_path"] in paths]
@@ -1544,7 +1845,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path == "/api/briefing":
             try:
-                body = json.dumps(project_briefing()).encode()
+                body = json.dumps(project_briefing(sweep=False)).encode()  # GET never writes
                 code = 200
             except portfolio.PortfolioError as error:
                 body = json.dumps({"error": str(error)}).encode()
@@ -1556,7 +1857,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path == "/api/status":
-            body = json.dumps(gather_statuses()).encode()
+            body = json.dumps(gather_statuses(sweep=False)).encode()  # GET never writes
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -1606,15 +1907,51 @@ def cmd_run(args: argparse.Namespace) -> int:
     args.dir = str(project)
     args.project_path = str(target) if target else None
     (project / LOCAL).mkdir(parents=True, exist_ok=True)
-    with (project / LOCAL / "session.lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SyndicateError("another Syndicate orchestrator already owns this project")
-        if any(session["source_path"] == str(project) and session["live"]
-               for session in coordination_store().snapshot()["sessions"]):
+    reconcile_stale()
+    lock_path = project_lock_path(project)
+    try:
+        lock_fd, lock_info = portfolio.open_lock(lock_path, create=True)
+    except portfolio.UnsafeLockError as error:
+        raise SyndicateError(f"refusing unsafe project lock: {error}; remove it and launch again") from None
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+            raise SyndicateError(f"refusing project lock {lock_path}: it or {LOCAL}/ is a symbolic link "
+                                 "or not a directory; remove it and launch again") from None
+        raise SyndicateError(f"cannot open project lock {lock_path}: {error.strerror or error}") from None
+    try:
+        for attempt in range(LOCK_ATTEMPTS):
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                # A dashboard's momentary shared probe must not fail a launch.
+                if attempt == LOCK_ATTEMPTS - 1:
+                    raise SyndicateError(
+                        f"another Syndicate orchestrator already owns this project: {lock_path} is locked. "
+                        "If no orchestrator is running, a leftover process may still hold it; identify it with "
+                        f"'fuser -v {shlex.quote(str(lock_path))}' or 'lsof {shlex.quote(str(lock_path))}'") from None
+                time.sleep(0.05)
+        # The lock is close-on-exec and never passed to the CLI: only this
+        # launcher (or its supervisor) holds it. The supervised CLI child is
+        # recorded as an additional owner instead (cli_owner).
+        args.session_lock_fd = lock_fd
+        owner = {**owner_identity(os.getpid()), "lock_owned": True,
+                 "lock_inode": [lock_info.st_dev, lock_info.st_ino], "cli_owner": None}
+        sessions = [session for session in coordination_store().snapshot()["sessions"]
+                    if session["source_path"] == str(project)]
+        if any(session["live"] for session in sessions):
             raise SyndicateError("another active session already owns this project")
         prior = read_status(str(project)) or {}
+        # Without lock inheritance, a CLI whose supervisor crashed is found by identity.
+        # Only the launcher-written coordination copy can refuse a launch: the
+        # status copy is agent-writable and could name any live process.
+        orphan = next((child for child in cli_owners(*[s for s in sessions if s["state"] == "active"])
+                       if portfolio.record_liveness(child) == "alive"), None)
+        if orphan:
+            pid = orphan.get("pid")
+            raise SyndicateError(f"a CLI from an earlier launch (PID {pid}) may still run in this project; "
+                                 f"inspect it with 'ps -o pid,args -p {pid}' and 'ls -l /proc/{pid}/cwd' "
+                                 "before launching again")
         resume = getattr(args, "handoff_path", None)
         snapshot = runtime.read_json(Path(resume) / "status.json") if resume else {}
         existing_id = (prior.get("current") or {}).get("task_id")
@@ -1627,7 +1964,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             task["needs_project"] = not explicit and not git(project, "rev-parse", "--show-toplevel")
         else:
             status = prior
-            status.update(pid=os.getpid(), state="running")
+            status.update(state="running")
+        status.update(owner)
+        for task in status.get("tasks") if isinstance(status.get("tasks"), list) else []:
+            if isinstance(task, dict) and task.get("id") == (status.get("current") or {}).get("task_id"):
+                task.update(owner, state="running")
+                for key in ("ended_at", "end_reason", "last_state"):
+                    task.pop(key, None)  # a resumed task is running again, not ended
         status.pop("_mtime", None)
         runtime.atomic_json(status_path(project), status)
         while True:
@@ -1642,6 +1985,49 @@ def cmd_run(args: argparse.Namespace) -> int:
                 raise
             if result is not None:
                 return result
+    finally:
+        os.close(lock_fd)
+
+
+def record_cli_owner(project, session, pid) -> None:
+    """Record the supervised CLI child on the status, its current task, and the
+    coordination session. Either copy is enough to stop a released lock from
+    being read as proof that the session ended."""
+    owner = owner_identity(pid)
+    stored = False
+    if session:
+        try:
+            coordination_store().record_cli_owner(session["id"], owner)
+            stored = True
+        except (portfolio.PortfolioError, OSError) as error:
+            print(f"syndicate: could not record CLI owner in coordination state: {error}", file=sys.stderr)
+    status = read_status(str(project))
+    if not status:
+        return
+    task_id = (status.get("current") or {}).get("task_id")
+    tasks = [task for task in (status.get("tasks") if isinstance(status.get("tasks"), list) else [])
+             if isinstance(task, dict) and task.get("id") == task_id]
+    status["cli_owner"] = owner
+    for task in tasks:
+        task["cli_owner"] = owner
+    status.pop("_mtime", None)
+    try:
+        runtime.atomic_json(status_path(project), status)
+        return
+    except OSError as error:
+        print(f"syndicate: could not record CLI owner in status: {error}", file=sys.stderr)
+    if stored:
+        return
+    # Neither copy names the live child, so a later free lock would not prove
+    # the session ended: best-effort withdraw the lock as ownership evidence.
+    status["cli_owner"] = None
+    status["lock_owned"] = False
+    for task in tasks:
+        task.update(cli_owner=None, lock_owned=False)
+    try:
+        runtime.atomic_json(status_path(project), status)
+    except OSError:
+        pass  # liveness then rests on the launcher's PID and start identity
 
 
 def run_session(args: argparse.Namespace) -> int | None:
@@ -1666,14 +2052,18 @@ def run_session(args: argparse.Namespace) -> int | None:
     for w in team.warnings:
         print(f"syndicate: {w}", file=sys.stderr)
     require_clis({r.cli for r in team.roles.values()})
-    with project_session(project, team.host):
+    outcome = {}
+    exec_cli = team.config["handoff"] == "off"
+    with project_session(project, team.host, outcome) as session:
         status = read_status(str(project)) or {}
         if status:
-            status.update(state="running", pid=os.getpid())
+            # exec keeps this PID and start time, so the recorded identity covers
+            # the CLI; the lock closes at exec and proves nothing there.
+            status.update(state="running", pid=os.getpid(), lock_owned=not exec_cli and status.get("lock_owned") is True)
             task_id = (status.get("current") or {}).get("task_id")
             for task in status.get("tasks", []):
                 if task.get("id") == task_id:
-                    task["provider"] = team.host
+                    task.update(provider=team.host, lock_owned=status["lock_owned"])
             status.pop("_mtime", None)
             runtime.atomic_json(status_path(project), status)
         note = ensure_excluded(project)
@@ -1684,7 +2074,7 @@ def run_session(args: argparse.Namespace) -> int | None:
         if team.host == "claude" and args.print:
             # Headless Claude gives up on still-running subagents after 600s; a team run is longer.
             os.environ.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "0")
-        if team.config["handoff"] == "off":
+        if exec_cli:
             os.chdir(project)
             os.execvp(argv[0], argv)
         runtime.start_monitor(SCRIPT)
@@ -1692,10 +2082,14 @@ def run_session(args: argparse.Namespace) -> int | None:
         task = args.rest[0] if args.rest else "Interactive session; see checkpoint and session output for requests."
         print(f"syndicate: monitoring account limits; handoff at {reserve:g}% remaining. "
               "Unavailable telemetry pauses work after 60s.", file=sys.stderr)
+        # The supervisor alone holds session.lock; the CLI child is recorded as an
+        # additional owner so a supervisor crash is not mistaken for the end.
         result, handoff = runtime.supervise(argv, project, providers, reserve, task, team.host, headless=args.print,
+                                           on_start=lambda pid: record_cli_owner(project, session, pid),
                                            live=None if getattr(args, 'no_live', False) else dict(directory=REGISTRY_PATH.parent / 'portfolio', **inbox))
         if handoff is None:
             return result
+        outcome["handoff"] = True  # resumable: never close the task as ended
         print(f"\nHandoff: {handoff}")
         target = runtime.choose_target(team.host, not args.print and sys.stdin.isatty())
         if target is None:
@@ -1811,7 +2205,7 @@ def cmd_setup_codex_gate(args: argparse.Namespace) -> int:
 
 def cmd_tasks(args: argparse.Namespace) -> int:
     rows = gather_statuses()
-    tasks = [(r, t) for r in rows for t in r["tasks"] + r["completed_tasks"]]
+    tasks = [(r, t) for r in rows for t in r["tasks"] + r["completed_tasks"] + r.get("ended_tasks", [])]
     if args.action == "list":
         if args.project:
             target = str(resolve_project(args.project))
@@ -1820,7 +2214,10 @@ def cmd_tasks(args: argparse.Namespace) -> int:
             print(json.dumps([{**t, "project_path": r["path"], "project_name": r["name"]} for r, t in tasks], indent=2))
             return 0
         for row, task in tasks:
-            print(f"{task['id']}  [{task.get('state', 'unknown')}] {row['name']}  {task.get('summary', '')}\n  source: {task['source_path']}")
+            state = task.get('state', 'unknown') + (" (unverified)" if task.get("liveness") == "unknown" else "")
+            print(f"{task['id']}  [{state}] {row['name']}  {task.get('summary', '')}\n  source: {task['source_path']}")
+            if task.get("state") == ENDED:
+                print(f"  ended: {task.get('end_reason') or 'session ended'} (was {task.get('last_state') or 'unknown'})")
         return 0
     matches = [(r, t) for r, t in tasks if t.get("id") == args.task_id and
                (not args.source or t["source_path"] == str(Path(args.source).expanduser().resolve()))]
@@ -1840,6 +2237,11 @@ def cmd_tasks(args: argparse.Namespace) -> int:
     if args.state:
         changes["state"] = args.state
         changes["completed_at"] = now_iso() if args.state == "done" else None
+        if args.state == ENDED:
+            changes.update(ended_at=now_iso(), end_reason="closed manually",
+                           last_state=task.get("last_state") if task.get("state") == ENDED else task.get("state"))
+        else:
+            changes.update(ended_at=None, end_reason=None)
     if not changes:
         raise SyndicateError("provide --project, --summary, or --state")
     changes["updated_at"] = now_iso()
@@ -2010,7 +2412,8 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     edit.add_argument("--source", help="source directory, required for ambiguous task IDs")
     edit.add_argument("--project", help="assign to repo name/path or generic")
     edit.add_argument("--summary")
-    edit.add_argument("--state", choices=("queued", "running", "waiting_on_user", "blocked", "failed", "done"))
+    edit.add_argument("--state", choices=("queued", "running", "waiting_on_user", "blocked", "failed", "done", ENDED),
+                      help="ended: closed without completion (use done only for finished work)")
     edit.set_defaults(fn=cmd_tasks)
     p = team_actions.add_parser("init", help="create .syndicate/ in a project and exclude it from git")
     p.add_argument("--project", dest="dir", default=".")
@@ -2090,9 +2493,10 @@ def main(argv: list[str]) -> int:
                 directory = execution_project(project or getattr(args, 'dir', '.'))
                 name = re.sub(r'[^\w-]', '-', directory.name) + '-work'
                 if args.fn == cmd_task:
+                    rows = assignment_rows()  # one sweep, reused for every live session
                     for session in coordination_store().snapshot()['sessions']:
                         if session['live'] and (session['source_path'] == str(directory)
-                                                or task_project(Path(session['source_path']), session['task_id']) == str(directory)):
+                                                or task_project(Path(session['source_path']), session['task_id'], rows) == str(directory)):
                             print(f"Team already running: {session['id']} / task {session['task_id']}")
                             return 0
                 else:

@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -388,3 +389,225 @@ class ChiefVisibility(ProjectCase):
         self.assertIn('CHIEF OF STAFF / waiting', output)
         self.assertIn('Checkpoint unavailable', output)
         self.assertIn('no registered projects', output)
+
+
+class ChiefExclusion(ProjectCase):
+    """Stale-session sweeps never detect, end, close, or touch Chief of Staff records."""
+
+    def setUp(self):
+        super().setUp()
+        self.portfolio = sy.REGISTRY_PATH.parent / 'portfolio'
+        self.workspace = self.portfolio / 'workspace'
+        self.local = self.workspace / '.syndicate'
+        self.local.mkdir(parents=True)
+        self.lock = self.portfolio / 'chief-of-staff.lock'
+        self.endpoint = self.portfolio / 'live' / 'chief-run.json'
+
+    def dead_owner(self):
+        proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        identity = sy.portfolio.process_identity(proc.pid)
+        proc.kill()
+        proc.wait()
+        return proc.pid, identity
+
+    def chief_status(self, directory, pid, identity):
+        namespace = sy.portfolio.process_namespace()
+        local = directory / '.syndicate'
+        local.mkdir(parents=True, exist_ok=True)
+        sy.runtime.atomic_json(local / 'status.json', dict(
+            pid=pid, process_identity=identity, process_namespace=namespace, lock_owned=True,
+            provider='codex', state='running', session_id='chief-session',
+            current=dict(role='chief-of-staff', summary='Briefing', task_id='chief-task', session_id='chief-coord'),
+            tasks=[dict(id='older', state='running', pid=2, summary='Earlier Chief run'),
+                   dict(id='chief-task', state='running', pid=pid, process_identity=identity,
+                        process_namespace=namespace, summary='Briefing')]))
+        return local / 'status.json'
+
+    def chief_records(self):
+        """Chief state that a careless sweep would judge stale: dead PIDs everywhere."""
+        pid, identity = self.dead_owner()
+        status = self.chief_status(self.workspace, pid, identity)
+        sy.register_project(self.workspace)  # never done by Syndicate; excluded regardless
+        store = sy.coordination_store()
+        store.start_session(str(self.workspace), 'chief-task', 'codex', os.getpid())
+        store.send_request(source_path=str(self.workspace), project_path=str(self.workspace),
+                           task_id='chief-task', key='chief', message='Chief request')
+        store.start_session('/elsewhere/flagged', 'flagged-task', 'claude', os.getpid())
+        data = store.read()
+        for session in data['sessions']:
+            session.update(pid=pid, process_identity=identity)
+        data['sessions'][1]['chief'] = True
+        sy.runtime.atomic_json(store.path, data)
+        sy.runtime.atomic_json(self.endpoint, dict(schema_version=1, run_id='chief-run', active=True, chief=True,
+                                                   source_path=str(self.workspace), session_id='chief-session'))
+        self.lock.write_text(f'{pid}\n')
+        return [status, self.lock, self.endpoint]
+
+    def chief_coordination(self):
+        data = sy.coordination_store().read()
+        return ([s for s in data['sessions'] if s['source_path'] == str(self.workspace)],
+                [r for r in data['requests'] if r['source_path'] == str(self.workspace)])
+
+    def edits(self):
+        return sy.runtime.read_json(sy.REGISTRY_PATH.parent / 'task-edits.json')
+
+    def test_guard_identifies_every_chief_record_shape(self):
+        directory = self.portfolio
+        guard = sy.portfolio.is_chief_record
+        self.assertTrue(guard(directory, path=self.workspace))
+        self.assertTrue(guard(directory, path=self.local / 'status.json'))
+        self.assertTrue(guard(directory, path=str(self.portfolio / 'other' / '..' / 'workspace')))
+        self.assertTrue(guard(directory, record=dict(source_path=str(self.workspace), task_id='t')))
+        # A chief marker alone never exempts a record; Chief live endpoints are
+        # protected because sweeps never touch live endpoints at all.
+        self.assertFalse(guard(directory, record=dict(chief=True, source_path='/repo')))
+        self.assertFalse(guard(directory, path=self.project, record=dict(current=dict(role='orchestrator'))))
+        self.assertFalse(guard(directory, path=self.portfolio / 'workspace-other'))
+        # A symlink into the Chief workspace resolves to it: still protected.
+        link = self.project / 'chief-link'
+        link.symlink_to(self.workspace, target_is_directory=True)
+        self.assertTrue(guard(directory, path=link))
+        # Errors fail closed (treated as the Chief).
+        self.assertTrue(guard(directory, path='/repo\0nul'))
+
+    def test_guard_ignores_agent_writable_claims(self):
+        guard = sy.portfolio.is_chief_record
+        directory = self.portfolio
+        self.assertFalse(guard(directory, record=dict(current=dict(role='chief-of-staff'))))
+        self.assertFalse(guard(directory, record=dict(role='chief-of-staff', source_path=str(self.project))))
+        self.assertFalse(guard(directory, path=self.project, record=dict(chief=True)))
+        self.assertFalse(guard(directory, record=dict(chief=True, source_path=str(self.project))))
+        # `..` cannot escape lexically: workspace/../project is outside the workspace.
+        self.assertFalse(guard(directory, path=f'{self.workspace}/../{self.project.name}-outside'))
+        self.assertFalse(guard(directory, record=dict(source_path=f'{self.workspace}/../elsewhere')))
+
+    def test_chief_status_registered_as_project_with_dead_pid_is_never_swept(self):
+        files = self.chief_records()
+        before = [f.read_bytes() for f in files]
+        rows = sy.gather_statuses()
+        sy.reconcile_stale()
+        self.assertEqual([f.read_bytes() for f in files], before)
+        self.assertNotIn(str(self.workspace), self.edits())
+        tasks = [t for r in rows for t in r['tasks'] + r['ended_tasks'] if t['source_path'] == str(self.workspace)]
+        self.assertEqual({t['state'] for t in tasks}, {'running'})
+        self.assertFalse(any('liveness' in t or 'end_reason' in t for t in tasks))
+        self.assertFalse(sy.close_owned_task(self.workspace, 'chief-task'))
+        self.assertEqual([f.read_bytes() for f in files], before)
+
+    @unittest.skipUnless(Path('/proc').is_dir(), 'needs /proc process identities')
+    def test_role_marked_status_outside_workspace_is_not_exempt(self):
+        """A project status cannot exempt itself by claiming the Chief role or flag."""
+        elsewhere = self.project / 'copied-chief'
+        pid, identity = self.dead_owner()
+        status = self.chief_status(elsewhere, pid, identity)
+        data = json.loads(status.read_text())
+        data['chief'] = True
+        status.write_text(json.dumps(data))
+        sy.register_project(elsewhere)
+        before = status.read_bytes()
+        rows = sy.gather_statuses()
+        self.assertEqual(status.read_bytes(), before)  # the agent-owned file is never rewritten by sweeps
+        ended = next(r for r in rows if r['path'] == str(elsewhere))['ended_tasks']
+        self.assertIn('chief-task', [t['id'] for t in ended])
+        self.assertIn(str(elsewhere), self.edits())
+        self.assertTrue(sy.close_owned_task(elsewhere, 'chief-task'))
+
+    def test_real_chief_workspace_is_excluded_whatever_its_status_claims(self):
+        files = self.chief_records()
+        data = json.loads(files[0].read_text())
+        data.pop('chief', None)
+        data['current']['role'] = 'orchestrator'  # an agent rewrote its role
+        files[0].write_text(json.dumps(data))
+        before = [f.read_bytes() for f in files]
+        sessions, requests = self.chief_coordination()
+        rows = sy.gather_statuses()
+        sy.reconcile_stale()
+        self.assertEqual([f.read_bytes() for f in files], before)
+        self.assertNotIn(str(self.workspace), self.edits())
+        tasks = [t for r in rows for t in r['tasks'] + r['ended_tasks'] if t['source_path'] == str(self.workspace)]
+        self.assertEqual({t['state'] for t in tasks}, {'running'})
+        self.assertFalse(sy.close_owned_task(self.workspace, 'chief-task'))
+        self.assertEqual(self.chief_coordination(), (sessions, requests))
+
+    @unittest.skipUnless(Path('/proc').is_dir(), 'needs /proc process identities')
+    def test_flagged_coordination_session_outside_workspace_is_not_exempt(self):
+        self.chief_records()
+        sy.gather_statuses()
+        flagged = next(s for s in sy.coordination_store().read()['sessions'] if s['source_path'] == '/elsewhere/flagged')
+        self.assertEqual((flagged['state'], flagged['reason']), ('ended', 'owner process exited'))
+
+    def test_chief_coordination_sessions_with_dead_pids_stay_active(self):
+        self.chief_records()
+        sessions, requests = self.chief_coordination()
+        sy.gather_statuses()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sy.main(['sessions', '--all']), 0)
+        # Even a verdict that condemns everything cannot end a Chief session.
+        sy.coordination_store().reconcile(lambda session: True)
+        self.assertEqual(self.chief_coordination(), (sessions, requests))
+        self.assertEqual({s['state'] for s in sessions}, {'active'})
+        self.assertEqual(requests[0]['state'], 'queued')
+
+    def test_chief_endpoint_lock_and_tmux_are_never_touched(self):
+        files = self.chief_records()
+        before = [f.read_bytes() for f in files]
+        # A project whose lock must be probed proves the probe hook is exercised.
+        sy.register_project(self.project)
+        sy.write_status_stub(self.project, 2**30, 'Project work')
+        status = json.loads(sy.status_path(self.project).read_text())
+        status.update(process_identity='x:1', process_namespace='pid:[sandbox]', lock_owned=True, lock_inode=[0, 0])
+        sy.status_path(self.project).write_text(json.dumps(status))
+        probed, commands = [], []
+        real_open, real_run, real_popen = sy.portfolio.open_lock, subprocess.run, subprocess.Popen
+
+        def probe(path, *args, **kwargs):
+            probed.append(Path(path))
+            return real_open(path, *args, **kwargs)
+
+        def run(argv, *args, **kwargs):
+            commands.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+
+        def popen(argv, *args, **kwargs):
+            commands.append(list(argv))
+            return real_popen(argv, *args, **kwargs)
+        with self.lock.open('a') as held:  # a live Chief owner holds its lock
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(sy.portfolio, 'open_lock', side_effect=probe), \
+                 patch.object(subprocess, 'run', side_effect=run), \
+                 patch.object(subprocess, 'Popen', side_effect=popen), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                sy.gather_statuses()
+                sy.reconcile_stale()
+                self.assertEqual(sy.main(['sessions']), 0)
+                self.assertEqual(sy.main(['briefing', '--json']), 0)
+        self.assertFalse(any(arg == 'tmux' or 'chief-of-staff-work' in str(arg) for argv in commands for arg in argv))
+        self.assertIn(self.project / '.syndicate' / 'session.lock', probed)
+        self.assertFalse(any(path == self.lock or self.workspace in path.parents for path in probed))
+        self.assertEqual([f.read_bytes() for f in files], before)
+
+    @unittest.skipUnless(Path('/proc').is_dir(), 'needs /proc process identities')
+    def test_mixed_sweep_closes_projects_and_leaves_chief_byte_identical(self):
+        files = self.chief_records()
+        sessions, requests = self.chief_coordination()
+        before = [f.read_bytes() for f in files]
+        sy.register_project(self.project)
+        proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        sy.write_status_stub(self.project, proc.pid, 'Project work')
+        task_id = json.loads(sy.status_path(self.project).read_text())['current']['task_id']
+        store = sy.coordination_store()
+        project_session = store.start_session(str(self.project), task_id, 'codex', proc.pid)
+        store.send_request(source_path=str(self.project), project_path=str(self.project),
+                           task_id=task_id, key='project', message='Project request')
+        proc.kill()
+        proc.wait()
+        rows = sy.gather_statuses()
+        data = store.read()
+        ended = next(s for s in data['sessions'] if s['id'] == project_session['id'])
+        self.assertEqual((ended['state'], ended['reason']), ('ended', 'owner process exited'))
+        self.assertEqual(next(r for r in data['requests'] if r['source_path'] == str(self.project))['state'], 'failed')
+        project_row = next(r for r in rows if r['path'] == str(self.project))
+        self.assertEqual(project_row['ended_tasks'][0]['id'], task_id)
+        self.assertEqual([f.read_bytes() for f in files], before)
+        self.assertEqual(self.chief_coordination(), (sessions, requests))
+        self.assertEqual(list(self.edits()), [str(self.project)])

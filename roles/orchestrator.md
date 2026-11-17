@@ -138,7 +138,10 @@ already has its new session; do not request another launch for that same task.
 ## Status Reporting
 Maintain `.syndicate/status.json` in the project root (`syndicate team task` writes
 an initial stub there before starting you, with a `pid` field — never remove
-or change `pid`). Update it at these points so progress is visible without
+or change `pid`, and preserve the launcher's ownership fields
+`process_identity`, `process_namespace`, `machine_id`, `lock_owned`,
+`lock_inode`, and `cli_owner` exactly as written, at the top level and on your
+task). Update it at these points so progress is visible without
 anyone reading this conversation:
 - **Before delegating to a role:** set `state` to `"running"`,
   `current.role` to the role name (or an array of names, if you delegated to
@@ -165,7 +168,8 @@ summaries to one sentence — this is a status glance, not a report.
 
 Preserve `tasks`, `current.task_id`, and `current.session_id` when updating status. Each task is a
 project-level request, not a delegated review round. The launcher creates a
-task with `id`, `summary`, `state`, `pid`, and `updated_at`. Update the matching
+task with `id`, `summary`, `state`, `pid`, `updated_at`, and the ownership
+fields above; never remove or change them. Update the matching
 task's `state`, `progress`, and `updated_at` with your current activity. On
 completion set its `state` to `done` and `completed_at` to the current ISO UTC
 timestamp. Preserve other unfinished tasks; mark them done only after verifying

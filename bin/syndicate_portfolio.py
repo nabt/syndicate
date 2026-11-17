@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+from stat import S_ISREG
 import uuid
 
 import syndicate_runtime as runtime
@@ -231,7 +232,7 @@ def briefing(rows, decisions, coordination=None, chief=None):
     inbox = pending(decisions)
     projects = []
     assignments = {task_identity(task, row['path']): row['path'] for row in rows
-                   for task in row.get('tasks', []) + row.get('completed_tasks', [])
+                   for task in row.get('tasks', []) + row.get('completed_tasks', []) + row.get('ended_tasks', [])
                    + ([row['last_completed']] if row.get('last_completed') else [])}
     for row in rows:
         current = current_task(row, coordination['sessions'])
@@ -244,7 +245,8 @@ def briefing(rows, decisions, coordination=None, chief=None):
                              task=current.get('summary'), progress=current.get('progress'),
                              task_id=current.get('id'), source_path=current.get('source_path', row['path']), provider=(current_owners[-1]['provider'] if current_owners else current.get('provider')) or 'unknown',
                              pid=current.get('pid'), updated_at=current.get('updated_at') or row.get('updated_at'),
-                             report_state=current.get('state', 'unknown')))
+                             report_state=current.get('state', 'unknown'),
+                             liveness=current.get('liveness')))
     first = next((d for d in inbox if d['state'] == 'open'), None)
     if first:
         next_action = f"Answer decision {first['id']}: {first['question']}"
@@ -290,6 +292,220 @@ def process_identity(pid):
             return 'ps:' + ' '.join(result[:-1]) if len(result) >= 6 and not result[-1].startswith('Z') else None
         except (OSError, ValueError, TypeError, subprocess.SubprocessError):
             return None
+
+
+def boot_id():
+    try:
+        return Path('/proc/sys/kernel/random/boot_id').read_text().strip() or None
+    except OSError:
+        return None
+
+
+def machine_id():
+    """Host identity, so a boot_id change can be told apart from another machine."""
+    for path in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
+        try:
+            value = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if value:
+            return value
+    return None
+
+
+def owner_record(pid):
+    """Launcher-recorded owner facts: PID, reuse-proof start identity, and the
+    PID namespace and machine it was read on."""
+    valid = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+    return dict(pid=pid, process_identity=process_identity(pid) if valid else None,
+                process_namespace=process_namespace(), machine_id=machine_id())
+
+
+def process_gone(pid):
+    """True only when this /proc view definitively shows no running process.
+
+    ENOENT under /proc is confirmed with kill(pid, 0), which is answered in
+    the caller's PID namespace and is not affected by hidepid; a permission
+    error means the process exists.
+    """
+    try:
+        Path('/proc/self/stat').read_text()
+    except OSError:
+        return False  # /proc unavailable: absence proves nothing
+    try:
+        pid = int(pid)
+        stat = Path(f'/proc/{pid}/stat').read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False  # PermissionError: exists but hidden or foreign-owned
+        return False
+    except (OSError, ValueError, TypeError):
+        return False
+    try:
+        return stat.rsplit(')', 1)[1].split()[0] in ('Z', 'X')
+    except IndexError:
+        return False
+
+
+def owner_liveness(pid, identity, namespace, machine=None):
+    """Tri-state owner check: 'alive', 'dead', or 'unknown'.
+
+    'dead' needs host-visible proof: a different boot of the same machine,
+    or a same-namespace /proc view in which the recorded start identity no
+    longer matches. A foreign PID namespace, unreadable /proc, missing
+    identity, or a ps view (which a sandbox can filter) is never 'dead' --
+    sandbox-hidden processes are never treated as exited.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return 'unknown'
+    if not isinstance(identity, str) or not identity:
+        return 'unknown'
+    current_namespace = process_namespace()
+    same_namespace = bool(namespace) and namespace == current_namespace
+    if identity.startswith('ps:'):
+        # No /proc (e.g. macOS): ps start time can confirm a live owner, but a
+        # missing or different entry is not proof of exit.
+        if not namespace and not current_namespace and process_identity(pid) == identity:
+            return 'alive'
+        return 'unknown'
+    boot = boot_id()
+    if boot and ':' in identity and not identity.startswith(boot + ':'):
+        here = machine_id()
+        if isinstance(machine, str) and machine and here:
+            return 'dead' if machine == here else 'unknown'  # reboot vs another host
+        return 'dead' if same_namespace else 'unknown'
+    if not same_namespace:
+        return 'unknown'
+    current = process_identity(pid)
+    if current is not None:
+        return 'alive' if current == identity else 'dead'  # mismatch: reused PID
+    return 'dead' if process_gone(pid) else 'unknown'
+
+
+def record_liveness(record):
+    """owner_liveness for a dict carrying owner_record fields."""
+    if not isinstance(record, dict):
+        return 'unknown'
+    return owner_liveness(record.get('pid'), record.get('process_identity'),
+                          record.get('process_namespace'), record.get('machine_id'))
+
+
+class UnsafeLockError(OSError):
+    pass
+
+
+_O = lambda name: getattr(os, name, 0)  # noqa: E731 - flags absent on some platforms
+
+
+def open_lock(path, create=False):
+    """Open an flock file without following links or blocking. Returns (fd, stat).
+
+    The parent directory is opened O_DIRECTORY|O_NOFOLLOW and the file through
+    dir_fd, read-only and non-blocking (a FIFO opens immediately), so a planted
+    symlink or FIFO can neither redirect nor hang the caller. The file must be
+    a regular file owned by the current user with a single link; anything else
+    raises UnsafeLockError. flock works on the read-only descriptor, which is
+    close-on-exec and never handed to a child process.
+    """
+    path = Path(path)
+    directory = os.open(path.parent, os.O_RDONLY | _O('O_DIRECTORY') | _O('O_NOFOLLOW') | _O('O_CLOEXEC'))
+    try:
+        flags = os.O_RDONLY | _O('O_NOFOLLOW') | _O('O_CLOEXEC') | _O('O_NONBLOCK') | (os.O_CREAT if create else 0)
+        fd = os.open(path.name, flags, 0o600, dir_fd=directory)
+    finally:
+        os.close(directory)
+    try:
+        info = os.fstat(fd)
+        if not S_ISREG(info.st_mode):
+            raise UnsafeLockError(f'{path} is not a regular file')
+        if info.st_uid != os.getuid():
+            raise UnsafeLockError(f'{path} is not owned by the current user')
+        if info.st_nlink != 1:
+            raise UnsafeLockError(f'{path} has {info.st_nlink} hard links')
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, info
+
+
+def probe_lock_detail(path):
+    """('held' | 'free' | 'unknown', (st_dev, st_ino) or None).
+
+    A shared, non-blocking probe never creates the file and holds it only
+    momentarily; launchers retry briefly so a probe cannot fail them. Any
+    unsafe or unreadable lock file is 'unknown'.
+    """
+    try:
+        fd, info = open_lock(path)
+    except OSError:
+        return 'unknown', None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 'held', (info.st_dev, info.st_ino)
+        except OSError:
+            return 'unknown', None
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return 'free', (info.st_dev, info.st_ino)
+    finally:
+        os.close(fd)
+
+
+def probe_lock(path, expect=None):
+    """'held', 'free', or 'unknown'. With expect=(st_dev, st_ino), 'free' is
+    reported only for that inode: a replaced lock file proves nothing."""
+    state, inode = probe_lock_detail(path)
+    if state == 'free' and expect is not None:
+        try:
+            expected = tuple(int(v) for v in expect)
+        except (TypeError, ValueError):
+            return 'unknown'
+        if len(expected) != 2 or inode != expected:
+            return 'unknown'
+    return state
+
+
+CHIEF_ROLE = 'chief-of-staff'
+
+
+def _within(path, root):
+    """True if path is root or below it, lexically normalized and resolved.
+
+    `..` cannot escape (paths are normalized before comparison) and symlinks
+    are resolved; any error fails closed (treated as within)."""
+    try:
+        raw = os.path.abspath(os.path.expanduser(os.fspath(path)))
+        root = os.fspath(root)
+        candidates = {os.path.normpath(raw), os.path.realpath(raw)}
+        roots = {os.path.normpath(os.path.abspath(root)), os.path.realpath(root)}
+        return any(left == right or left.startswith(right.rstrip(os.sep) + os.sep)
+                   for left in candidates for right in roots)
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return True  # cannot rule out the Chief workspace: treat as protected
+
+
+def is_chief_record(directory, *, path=None, record=None):
+    """The single Chief of Staff guard for stale detection and cleanup.
+
+    Decided only from launcher-controlled facts, never from agent-writable
+    status content (a 'chief' flag, 'role', or current.role is ignored):
+    - the given path, or a record's launcher-written source_path, resolved
+      under <directory>/workspace (the real Chief workspace is always
+      excluded, whatever its status file says).
+    Path errors fail closed. Such records are never judged stale, ended, or
+    modified by sweeps. Chief live endpoints need no check here: sweeps never
+    read or touch live endpoints at all.
+    """
+    workspace = Path(directory) / 'workspace'
+    paths = [path]
+    if isinstance(record, dict):
+        paths.append(record.get('source_path'))
+    return any(isinstance(p, (str, Path)) and str(p) and _within(p, workspace) for p in paths)
 
 
 BRIEF_LIST_FIELDS = ('constraints', 'decisions', 'dependencies', 'next_steps')
@@ -375,13 +591,9 @@ class CoordinationStore:
             return False
         namespace = session.get('process_namespace')
         if namespace and namespace != process_namespace():
-            # A reboot is an actual dead owner, not a sandbox visibility error.
-            try:
-                boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
-            except OSError:
-                boot = None
-            identity = session.get('process_identity')
-            if boot and identity and ':' in identity and not identity.startswith(boot + ':'):
+            # A reboot of this machine is an actual dead owner, not a sandbox
+            # visibility error; from another namespace that is the only proof.
+            if record_liveness(session) == 'dead':
                 return False
             raise PortfolioError('Cannot validate session ownership from this PID namespace; '
                                  'rerun this command outside the sandbox with approval')
@@ -395,23 +607,62 @@ class CoordinationStore:
                 if previous['source_path'] == source_path and previous['state'] == 'active':
                     if self.session_live(previous):
                         raise PortfolioError('An active session already owns this source')
-                    previous.update(state='ended', ended_at=now(), reason='superseded')
+                    self._end(data, previous, 'superseded')
             session = dict(id=uuid.uuid4().hex, source_path=source_path, task_id=task_id,
-                           provider=provider, pid=pid, process_identity=process_identity(pid),
-                           process_namespace=process_namespace(),
+                           provider=provider, **owner_record(pid),
                            state='active', started_at=now())
             data['sessions'].append(session)
             return dict(session)
+
+    @staticmethod
+    def _end(data, session, reason):
+        session.update(state='ended', ended_at=now(), reason=reason)
+        for request in data['requests']:
+            if request['session_id'] == session['id'] and request['state'] == 'queued':
+                request.update(state='failed', reason='Target session ended before acknowledgment', updated_at=now())
 
     def end_session(self, session_id, reason='session exited'):
         with self.edit() as data:
             session = next((s for s in data['sessions'] if s['id'] == session_id), None)
             if not session:
                 raise PortfolioError('Session not found')
-            session.update(state='ended', ended_at=now(), reason=reason)
-            for request in data['requests']:
-                if request['session_id'] == session_id and request['state'] == 'queued':
-                    request.update(state='failed', reason='Target session ended before acknowledgment', updated_at=now())
+            self._end(data, session, reason)
+
+    @staticmethod
+    def session_liveness(session):
+        """Never raises: 'dead' for ended records, otherwise owner_liveness."""
+        if session.get('state') != 'active':
+            return 'dead'
+        return record_liveness(session)
+
+    def record_cli_owner(self, session_id, owner):
+        """Record the supervised CLI child as an additional owner of an active
+        session, so a supervisor crash is not mistaken for the session's end."""
+        with self.edit() as data:
+            session = next((s for s in data['sessions'] if s['id'] == session_id), None)
+            if session and session['state'] == 'active':
+                session['cli_owner'] = dict(owner)
+
+    def reconcile(self, verdict, reason='owner process exited'):
+        """End active sessions that verdict(session) proves dead, like end_session.
+
+        verdict is re-evaluated under the store lock and must return True only
+        on definitive evidence. Chief records are excluded by the caller's
+        verdict and again here. Returns ended session IDs; writes nothing when
+        no session qualifies, so repeated sweeps are idempotent.
+        """
+        candidates = [s['id'] for s in self.read()['sessions']
+                      if s['state'] == 'active' and verdict(s)]
+        if not candidates:
+            return []
+        ended = []
+        with self.edit() as data:
+            for session in data['sessions']:
+                if (session['id'] in candidates and session['state'] == 'active'
+                        and not is_chief_record(self.directory, record=session) and verdict(session)):
+                    self._end(data, session, reason)
+                    ended.append(session['id'])
+        return ended
 
     def send_request(self, *, source_path, project_path, task_id, key, message):
         if not all(isinstance(v, str) and v.strip() for v in (source_path, project_path, task_id, key, message)):
@@ -473,17 +724,23 @@ class CoordinationStore:
             request['history'].append(dict(action='retry', at=request['updated_at']))
             return dict(request)
 
-    def snapshot(self):
+    def snapshot(self, strict=True):
+        """strict keeps the explicit foreign-namespace error for ownership commands;
+        read-only views pass strict=False and get liveness 'unknown' instead."""
         data = self.read()
         for session in data['sessions']:
-            session['live'] = self.session_live(session)
+            session['liveness'] = self.session_liveness(session)
+            session['live'] = self.session_live(session) if strict else session['liveness'] == 'alive'
         sessions = {s['id']: s for s in data['sessions']}
         for request in data['requests']:
             if request['state'] != 'queued':
                 request['delivery_state'] = request['state']
                 continue
             target = sessions.get(request['session_id'])
-            if request['session_id'] and (not target or not target['live']):
+            if target and not target['live'] and target['liveness'] == 'unknown':
+                request.update(delivery_state='unverified',
+                               reason='Target session ownership cannot be verified from this environment')
+            elif request['session_id'] and (not target or not target['live']):
                 request.update(delivery_state='failed', reason='Target session is no longer active')
             elif target:
                 request['delivery_state'] = 'awaiting_acknowledgment'

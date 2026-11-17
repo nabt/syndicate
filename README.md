@@ -212,6 +212,7 @@ syndicate tasks list --project generic
 syndicate tasks list --json
 syndicate tasks edit TASK_ID --project graphcue
 syndicate tasks edit TASK_ID --summary "Updated task title" --state done
+syndicate tasks edit TASK_ID --state ended   # close without claiming completion
 ```
 
 Task edits change dashboard metadata; they do not move files, stop processes,
@@ -222,11 +223,23 @@ again. For ambiguous IDs (such as legacy `legacy` IDs), add
 `--source /original/working/directory`. A handoff resumed in its original
 directory retains its task ID instead of creating another unfinished task.
 
-A project whose status still says `running` but whose process has died shows
-up as `stale` rather than silently looking active forever — the dashboard
-checks the recorded PID is actually still alive. This is also why you should
-trust the dashboard over a status file you read by hand: a crashed or killed
-session leaves no other signal that it stopped.
+Sessions that end, exit abruptly, or lose their owner do not look active
+forever. A normal exit closes a task still marked `running` as `ended` (a run
+that stops for a resumable handoff is left resumable), and the terminal
+dashboard, `briefing`, `tasks list`, `sessions`, `team task`, and launches
+reconcile crashed or killed sessions automatically. The web dashboard's API
+only shows the same verdicts and never writes. `ended` means closed without
+completion (with `end_reason` and `last_state`); it leaves the unfinished and
+Needs attention lists but stays visible as history, and is never reported as
+`done`. Tasks are judged gone only from definitive evidence: a reuse-proof
+process identity checked in the same PID namespace, an ended session record, a
+later launch that superseded the task, a reboot of the same machine, or the
+project session lock released by the launcher that took it. Where none of that
+is available (for example a sandbox in another PID namespace), owners show as
+`unverified` instead of stale and nothing is written for them. The Chief of
+Staff is never swept. Trust the dashboard over a status file you read by hand:
+a crashed session leaves no other signal that it stopped. See
+[docs/chief-of-staff.md](docs/chief-of-staff.md#closing-ended-sessions-and-stale-tasks).
 
 ## Review gate
 

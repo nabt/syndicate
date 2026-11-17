@@ -254,9 +254,13 @@ does not discard the earlier event. `has_more` indicates another bounded batch.
 
 Host process ownership checks must run outside PID-isolated sandboxes, with
 normal approval. New session records retain their PID namespace so an isolated
-reader gets an explicit validation error instead of falsely reporting a dead
-owner. Older records lack this guard; refresh them outside the sandbox or
-restart their sessions. Invisible processes do not prove a team has stopped.
+ownership command (acknowledge, fail, retry, send) gets an explicit validation
+error instead of falsely reporting a dead owner. Views (dashboards,
+`briefing`, `sessions`) do not fail there: they show such owners as
+`unverified` and write nothing for them; only namespace-independent proof is
+acted on there (see [Closing ended sessions and stale
+tasks](#closing-ended-sessions-and-stale-tasks)). Invisible processes do not
+prove a team has stopped.
 
 ## Using the workspace
 
@@ -300,8 +304,10 @@ answers. No new browser write endpoints or session-control commands are added.
 Both dashboards show pending decisions above projects. Console `--details`
 adds context, options, recommendations, answers, and deadlines. New project
 sessions record their provider; older reports display `unknown` when absent.
-The briefing preserves reported task state and timestamps, including stale
-process reports; it does not infer active progress from an old report.
+The briefing preserves reported task state and timestamps; it does not infer
+active progress from an old report. Running tasks whose owner cannot be
+verified from the current environment carry `liveness: "unknown"` and are
+labeled `running (unverified)`, never `stale`.
 
 ## Chief visibility
 
@@ -357,10 +363,91 @@ not an automatically enforced execution graph.
 
 New project launches register a unique session token, source directory, task,
 provider, PID, and process start identity. The token is published in
-`current.session_id` and the task record. Sessions close when supervised runs
-exit; exec-based launches and abrupt exits are recognized through process
-liveness/start identity checks. Reused PIDs do not count as the original owner.
-Legacy sessions without ownership records are not inferred to be active.
+`current.session_id` and the task record. New task records and the top-level
+status also record `process_identity`, `process_namespace`, `machine_id`,
+`lock_owned`, `lock_inode`, and `cli_owner`; agents must preserve these like
+`pid`. Reused PIDs do not count as the original owner. Legacy sessions without
+ownership records are not inferred to be active.
+
+The project `.syndicate/session.lock` is held only by the launcher (or its
+supervisor), never by the CLI: it is opened read-only, close-on-exec,
+non-blocking, and without following symbolic links, and a launch refuses a
+lock that is not a regular file owned by the user with a single link. On an
+exec-based launch (`handoff = off`) the lock is released at exec, so the status
+records `lock_owned: false` and ownership rests on the launcher's PID and start
+identity, which exec preserves. On a supervised launch the supervisor records
+the lock's inode (`lock_inode`) and its CLI child as `cli_owner`, on the status,
+the task, and the coordination session. If the supervisor crashes while the CLI
+survives, the live child keeps the task `alive`, and a new launch in that
+project is refused until the child exits. Only the coordination session's copy
+(written by the launcher) can refuse a launch; the agent-writable status copy
+cannot. If a launch reports that another
+orchestrator owns the project but none is running, identify the process
+holding the lock with `fuser -v .syndicate/session.lock` or
+`lsof .syndicate/session.lock`.
+
+### Closing ended sessions and stale tasks
+
+A supervised run that exits normally ends its session and, if the agent left
+its task `running`, closes the task as `ended`: closed without completion,
+with `last_state`, `ended_at`, and `end_reason` (for example `session exited`).
+A run that stops for a handoff is not closed; the task stays resumable.
+Agent-written `done`, `failed`, `blocked`, and `waiting_on_user` states are kept.
+`ended` never means `done`; `last_completed` still reports only completed work.
+Resuming a handoff resets its task to `running` and clears the end fields.
+
+Abrupt exits (SIGKILL, closed tmux panes, exec-based launches) and ownerless
+records are reconciled automatically whenever the host launcher reaches a safe
+point: `team task` start, launches, the terminal dashboard, `briefing`,
+`tasks list`, and `sessions`. The web dashboard's `/api/status` and
+`/api/briefing` compute the same verdicts but never write. A coordination
+session is marked `ended` with reason `owner process exited`, and its queued
+requests fail exactly as on a normal exit. Running task records are closed as
+`ended` through `~/.syndicate/task-edits.json`, so an agent's own `status.json`
+writes cannot race them. A closure applies only to the owner and state it
+closed: an explicit `tasks edit --state` always wins, and an agent that writes
+a different state, or a handoff resume or current session that takes the task
+over (a new `pid` or `session_id`), intentionally overrides it. Sweeps are
+idempotent.
+
+Liveness is `alive`, `dead`, or `unknown`, from every recorded owner (the
+launcher and, for supervised runs, its CLI child):
+
+| Evidence | Verdict |
+| --- | --- |
+| Any owner's PID and start identity match (same PID namespace; or, without `/proc`, a matching `ps` start time) | `alive` |
+| A recorded CLI child cannot be verified (another namespace, no identity) | `unknown` |
+| Session record already ended | `dead`, unless the project lock is held |
+| Recorded identity taken in this PID namespace no longer matches, or the PID is gone (confirmed by `kill(pid, 0)`) | `dead`, unless the project lock is held |
+| Boot ID changed and the recorded `machine_id` matches this machine | `dead` (from any namespace) |
+| Boot ID changed, no recorded `machine_id` | `dead` only in the same namespace, else `unknown` |
+| An older running or waiting task with another launcher PID or identity than the current one | `dead` (superseded) |
+| `lock_owned` launcher, the recorded `lock_inode` is free, and no CLI child could be alive | `dead` (from any namespace) |
+| Lock replaced (other inode), FIFO, symlink, unreadable, or not owned | no proof (`unknown`) |
+| Another PID namespace, unreadable `/proc`, a legacy bare PID, or `ps` showing nothing | `unknown` |
+
+So writes can happen from another PID namespace only on namespace-independent
+proof: an ended session record, a superseding launch, a reboot of the same
+machine, or a released project lock with no possibly-live CLI child. A held
+project lock always defers judgment of the current task. `unknown` writes
+nothing and is never shown as stale. A `waiting_on_user` task keeps its
+question while it is current, so a handoff can still resume it; it is closed as
+`ended` (with `last_state: waiting_on_user`) only once a later launch
+supersedes it. Decision inbox records are never changed. Use
+`tasks edit TASK_ID --state ended` to close a task manually without claiming
+completion.
+
+Chief of Staff state is excluded from all of this, decided only from
+launcher-controlled facts. Anything whose resolved path is under
+`~/.syndicate/portfolio/workspace` (symbolic links resolved, `..` normalized,
+path errors treated as the Chief) is never evaluated, ended, or modified by a
+sweep, whatever its status file claims and even when it appears in
+`projects.json`; this covers the Chief status, its coordination sessions, and
+its tasks. Chief live endpoints (whose `chief` marker the Chief launcher
+writes), `chief-of-staff.lock`, and the `chief-of-staff-work` tmux session are
+never touched. A project status elsewhere cannot exempt itself by claiming
+`chief: true` or `current.role: chief-of-staff`. Sweeps only update records:
+they never signal processes or kill tmux sessions.
 
 Requests are durable messages, not injected keystrokes or executable commands.
 They target a source/task and bind to the current live session when available.
