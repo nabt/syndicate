@@ -81,7 +81,19 @@ commands and maintains its own checkpoint; it does not implement project work
 or directly delegate to specialists.
 
 Quota supervision uses the existing monitor and defaults to a 10% reserve;
-`--reserve` changes it. If monitoring stops the session, the launcher saves a
+`--reserve` changes it. Chief sessions enforce the most recent real usage
+reading, including stale readings or readings awaiting reset confirmation.
+Unknown or missing usage never stops a Chief, including headless runs and runs
+with `--no-live`. A recorded value at or below the reserve still stops it;
+a reset time passing does not replenish recorded capacity. Project sessions
+retain their freshness fail-safe.
+
+Claude's statusline may stop updating while the Chief waits for its inbox. It
+may also stop updating during active work: in that case consumption can cross
+the reserve without detection until the next real reading. The Chief continues
+under this policy; there is no guarantee of preserving the reserve without
+telemetry, and no capacity is inferred from silence or an expected reset.
+If monitoring stops the session, the launcher saves a
 handoff and returns status 75 without starting another provider:
 
 ```sh

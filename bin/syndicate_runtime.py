@@ -149,6 +149,18 @@ def availability(observation, now=None):
     return "current", min(w["remaining_percent"] for w in windows)
 
 
+def supervision_usage(observation, chief=False, now=None):
+    """Chief enforces recorded usage even when freshness cannot be established.
+
+    This does not establish current availability or infer a quota reset.
+    Project sessions retain the freshness-based fail-safe policy.
+    """
+    if chief:
+        windows = observation.get("windows") or []
+        return "last observed", min((w["remaining_percent"] for w in windows), default=None)
+    return availability(observation, now)
+
+
 def reset_events(previous, current, notified, now):
     """Return deduplicated due/confirmed notices; never infer fresh capacity."""
     events = []
@@ -365,7 +377,7 @@ def stop_group(proc, known=None):
 
 
 def supervise(argv, project, providers, threshold, task, host, headless=False, live=None, pass_fds=(),
-              on_start=None):
+              on_start=None, chief=False):
     """Proxy a CLI terminal while keeping monitoring outside the model loop.
 
     on_start(pid), if given, is called once the CLI child has been started,
@@ -375,7 +387,7 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
     (local / "runs").mkdir(parents=True, exist_ok=True, mode=0o700)
     atomic_json(local / "run.json", {"id": run_id, "task": task, "provider": host, "started_at": time.time()})
     for provider in providers:
-        state, remaining = availability(read_json(STATE / f"{provider}.json"))
+        state, remaining = supervision_usage(read_json(STATE / f"{provider}.json"), chief=chief)
         if remaining is not None and remaining <= threshold:
             reason = f"{provider}: {remaining:g}% account usage remaining (reserve {threshold:g}%); no CLI launched"
             return 75, create_handoff(project, host, task, reason, run_id)
@@ -475,13 +487,13 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
                             sys.stderr.flush()
                         notices_offset = notices.tell()
                 for provider in providers:
-                    state, remaining = availability(read_json(STATE / f"{provider}.json"), now)
+                    state, remaining = supervision_usage(read_json(STATE / f"{provider}.json"), chief=chief, now=now)
                     if remaining is not None:
                         unknown_since.pop(provider, None)
                         if remaining <= threshold:
                             reason = f"{provider}: {remaining:g}% account usage remaining (reserve {threshold:g}%)"
                             break
-                    else:
+                    elif not chief:
                         since = unknown_since.setdefault(provider, now)
                         if now - since >= UNKNOWN_GRACE_SECONDS:
                             reason = f"{provider}: usage {state} for {UNKNOWN_GRACE_SECONDS:g} seconds; cannot enforce the reserve"

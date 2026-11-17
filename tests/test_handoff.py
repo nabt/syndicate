@@ -39,6 +39,18 @@ class Quotas(unittest.TestCase):
         self.assertEqual(rt.availability(data, 200), ("awaiting reset confirmation", None))
         self.assertEqual(rt.availability(data, 500), ("stale", None))
 
+    def test_chief_uses_recorded_usage_without_claiming_fresh_capacity(self):
+        for provider, payload in (
+            ("claude", {"rate_limits": {"five_hour": {"used_percentage": 90, "resets_at": 200}}}),
+            ("codex", {"rateLimits": {"primary": {"usedPercent": 90, "resetsAt": 200}}}),
+        ):
+            observation = rt.normalize(provider, payload, now=100)
+            for now in (101, 200, 500):
+                with self.subTest(provider=provider, now=now):
+                    self.assertEqual(rt.supervision_usage(observation, chief=True, now=now), ("last observed", 10))
+                    self.assertEqual(rt.supervision_usage(observation, now=now), rt.availability(observation, now))
+        self.assertEqual(rt.supervision_usage({}, chief=True), ("last observed", None))
+
     def test_reset_notices_require_evidence_and_are_deduplicated(self):
         old = rt.normalize("claude", {"rate_limits": {"five_hour": {"used_percentage": 95, "resets_at": 200}}}, now=100)
         notices = {}
@@ -103,6 +115,16 @@ class Handoffs(ProjectCase):
         launch.assert_not_called()
         self.assertEqual(result, 75)
         self.assertEqual(path, Path("snapshot"))
+
+    def test_chief_stale_low_preflight_never_launches_even_after_reset(self):
+        observation = rt.normalize("claude", {"rate_limits": {
+            "five_hour": {"used_percentage": 91, "resets_at": 200}}}, now=100)
+        rt.atomic_json(rt.STATE / "claude.json", observation)
+        with patch.object(rt.subprocess, "Popen") as launch, patch.object(rt, "create_handoff", return_value=Path("snapshot")):
+            result, path = rt.supervise(["false"], self.project, {"claude"}, 10,
+                                        "task", "claude", headless=True, chief=True)
+        launch.assert_not_called()
+        self.assertEqual((result, path), (75, Path("snapshot")))
 
     def test_reserve_validation_and_skill_injection(self):
         self.config("handoff-reserve = 20\n")
@@ -179,6 +201,41 @@ class RuntimeIntegration(ProjectCase):
         with patch("sys.stdout", self.out), patch("sys.stderr", self.err):
             return rt.supervise([sys.executable, "-c", code], self.project,
                                 {"claude"}, 10, "Finish feature", "claude", headless=True)
+
+    def test_usage_policy_in_running_loop(self):
+        # Advance the supervisor clock beyond the real grace interval without
+        # making the child wait minutes. The child exits successfully if kept alive.
+        for chief in (True, False):
+            for condition in ("stale", "unknown", "awaiting reset confirmation", "low"):
+                with self.subTest(chief=chief, condition=condition):
+                    observed = 100 if condition == "stale" else 1000
+                    observation = {} if condition == "unknown" else rt.normalize("claude", {
+                        "rate_limits": {"five_hour": {"used_percentage": 20,
+                            "resets_at": 900 if condition == "awaiting reset confirmation" else 999999}}}, now=observed)
+                    rt.atomic_json(self.state / "claude.json", observation)
+                    def started(pid):
+                        if condition == "low":
+                            # The new low reading must stop the running CLI,
+                            # even though it is already stale and reset is due.
+                            rt.atomic_json(self.state / "claude.json", rt.normalize("claude", {
+                                "rate_limits": {"five_hour": {"used_percentage": 90,
+                                    "resets_at": 200}}}, now=100) if chief else rt.normalize("claude", {
+                                "rate_limits": {"five_hour": {"used_percentage": 90}}}, now=1000))
+                    clock = iter(range(1000, 10000, 61))
+                    with patch.object(rt.time, "time", side_effect=lambda: next(clock)), \
+                         patch("sys.stdout", self.out), patch("sys.stderr", self.err):
+                        result, handoff = rt.supervise([sys.executable, "-c", "import time; time.sleep(0.8)"],
+                            self.project, {"claude"}, 10, "test policy", "claude",
+                            headless=True, chief=chief, on_start=started)
+                    if chief and condition != "low":
+                        self.assertEqual(result, 0)
+                        self.assertIsNone(handoff)
+                    else:
+                        self.assertIsNotNone(handoff)
+                        reason = (handoff / "handoff.md").read_text()
+                        self.assertIn("reserve", reason)
+                        if condition == "stale":
+                            self.assertIn("usage stale", reason)
 
     def test_supervised_cli_inherits_chief_lock(self):
         rt.save_observation("claude", {"rate_limits": {"five_hour": {"used_percentage": 20}}})

@@ -99,13 +99,19 @@ Syndicate launches, and provider configuration directories are not modified.
   This replaces the status line for that Syndicate session only. Headless
   Claude and Claude-backed headless relays do not provide this status-line
   feed themselves. They need a fresh observation from an interactive Claude
-  session; otherwise managed execution pauses. There is no undocumented
+  session; otherwise managed project execution pauses. There is no undocumented
   credential scraping or private quota API fallback.
-- **Unknown or stale data:** observations expire after 180 seconds. After
+- **Unknown or stale data (project sessions):** observations expire after 180 seconds. After
   60 continuous seconds without usable data for any assigned provider,
   Syndicate stops and saves a handoff rather than assume there is capacity.
   This startup grace lets interactive Claude produce its first observation.
   It also means initial work can start before a quota is known.
+- **Chief of Staff exception:** missing, stale, or awaiting-reset telemetry
+  never triggers a Chief shutdown. Preflight and running supervision enforce
+  the latest recorded percentages, even after their expected reset. If an
+  active statusline stops updating, consumption past the reserve goes undetected
+  until the next reading; silence does not prove capacity. This applies with
+  `--no-live` and in headless mode too. See [Chief quota policy](chief-of-staff.md).
 - **Profiles:** observations describe the CLIs' default local account profiles,
   shared across projects. Custom account/profile overrides are not supported
   by this monitor. Do not use a different account for the worker and reader.
