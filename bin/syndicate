@@ -23,9 +23,10 @@ import sys
 import time
 import tempfile
 import signal
+import stat
 import tomllib
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -464,7 +465,7 @@ You are a relay for the `{role.name}` role, which runs on the {role.cli} CLI in 
 <the brief>
 SYNDICATE_BRIEF
 
-3. If the sandbox denies scratch creation or the child CLI's network connection, request normal approval to run this exact command outside the sandbox. Explain the denied operation; do not broaden the relay sandbox or change the command. If approval is unavailable, report the failure to the orchestrator so it can request approval.
+3. If the sandbox denies scratch creation, the specialist lease write, or the child CLI's network connection, request normal approval to run this exact command outside the sandbox. Explain the denied operation; do not broaden the relay sandbox or change the command. If approval is unavailable, report the failure to the orchestrator so it can request approval.
 4. Reply with the command's output verbatim as your final answer. For other failures, report the error verbatim. Do not retry a different way or do the work yourself.
 """
 
@@ -1192,7 +1193,9 @@ def launch_tmux(argv, directory, name, headless=False):
     command = shlex.join([sys.executable, str(SCRIPT), '_in-tmux', *argv])
     base = ['tmux', 'new-session', '-d', '-s', name, '-c', str(directory)]
     # A tmux server may predate the user's current configuration environment.
-    for key in ('XDG_CONFIG_HOME', 'SYNDICATE_RUNTIME', 'PATH'):
+    # SYNDICATE_RUN_ID is reset too, so a server started inside an earlier run
+    # cannot leak a stale run id into this session.
+    for key in ('XDG_CONFIG_HOME', 'SYNDICATE_RUNTIME', 'PATH', runtime.RUN_ENV):
         base += ['-e', f'{key}={os.environ.get(key, "")}']
     if not headless:
         result = subprocess.run([*base, command], capture_output=True, text=True)
@@ -2166,10 +2169,13 @@ def run_session(args: argparse.Namespace) -> int | None:
             os.chdir(project)
             os.execvp(argv[0], argv)
         runtime.start_monitor(SCRIPT)
-        providers = {r.cli for r in team.roles.values()}
+        # Only the host is enforced for the whole run. A delegated provider is
+        # enforced while one of its specialists runs (run-role gate and lease).
+        providers = {team.host}
         task = args.rest[0] if args.rest else "Interactive session; see checkpoint and session output for requests."
-        print(f"syndicate: monitoring account limits; handoff at {reserve:g}% remaining. "
-              "Unavailable telemetry pauses work after 60s.", file=sys.stderr)
+        print(f"syndicate: monitoring {team.host} account limits; handoff at {reserve:g}% remaining, "
+              "judged by the latest recorded reading. Stale or missing telemetry is reported, not enforced; "
+              "delegated specialists are checked at launch and while they run.", file=sys.stderr)
         # The supervisor alone holds session.lock; the CLI child is recorded as an
         # additional owner so a supervisor crash is not mistaken for the end.
         result, handoff = runtime.supervise(argv, project, providers, reserve, task, team.host, headless=args.print,
@@ -2179,18 +2185,62 @@ def run_session(args: argparse.Namespace) -> int | None:
             return result
         outcome["handoff"] = True  # resumable: never close the task as ended
         print(f"\nHandoff: {handoff}")
-        target = runtime.choose_target(team.host, not args.print and sys.stdin.isatty())
+        target = runtime.choose_target(team.host, not args.print and sys.stdin.isatty(),
+                                       limited=runtime.limited_provider(project, handoff))
         if target is None:
             return 75  # resumable temporary interruption; not successful completion
         require_clis({target})
-        state, remaining = runtime.availability(runtime.read_json(runtime.STATE / f"{target}.json"))
+        # A stale or awaiting-reset reading still counts: an expected reset is not capacity.
+        remaining = runtime.latest_reading(runtime.read_json(runtime.STATE / f"{target}.json"))
         if remaining is not None and remaining <= reserve:
-            print(f"syndicate: {target} also has only {remaining:g}% remaining; leaving work stopped.", file=sys.stderr)
+            print(f"syndicate: {target} last recorded only {remaining:g}% remaining; leaving work stopped. "
+                  f"A passed reset time does not count as restored capacity; {runtime.forget_hint(target)}.",
+                  file=sys.stderr)
             return 75
         args.runtime = target
         args.all_runtime = target
         args.handoff_path = str(handoff)
         return None  # cmd_run retains the project lock while starting the confirmed target
+
+
+def specialist_gate(team: Team, role: Role, warn: bool = True) -> None:
+    """Refuse to launch a specialist whose provider is at or below the reserve.
+
+    Decides with the latest real reading (stale or awaiting-reset readings
+    count). No reading at all fails loudly: the supervisor could not enforce
+    the reserve for this provider. No gate applies with handoff = off.
+    warn=False suppresses the stale-telemetry warning (refusals still apply),
+    for the inner tmux run whose launcher already printed it.
+    """
+    if team.config["handoff"] == "off":
+        return
+    provider = role.cli
+    reserve = float(team.config["handoff-reserve"])
+    observation = runtime.read_json(runtime.STATE / f"{provider}.json")
+    remaining = runtime.latest_reading(observation)
+    refused = f"refusing to launch the {role.name} specialist on {provider}; no {provider} CLI was launched. "
+    move = (f"move this role to another runtime ('{role.name} = {'codex' if provider == 'claude' else 'claude'}' "
+            "in .syndicate/syndicate.conf, or relaunch the team with --all-runtime)")
+    if remaining is None:
+        if provider == "claude":
+            guidance = ("Run an interactive Claude session through Syndicate to publish usage, check "
+                        f"'syndicate limits', or {move}.")
+        else:
+            error = runtime.read_json(runtime.STATE / "monitor.json").get("codex_error")
+            guidance = ((f"The account monitor reports: {error}. " if error else "") +
+                        f"Check 'syndicate limits' (it starts the account monitor), or {move}.")
+        raise SyndicateError(refused + f"No {provider} usage reading has been recorded, so the "
+                             f"{reserve:g}% reserve cannot be enforced. " + guidance)
+    when = runtime.format_time(runtime.observed_time(observation), missing="at an unknown time")
+    if remaining <= reserve:
+        raise SyndicateError(refused + f"The last {provider} reading (observed {when}) shows {remaining:g}% "
+                             f"account usage remaining, at or below the {reserve:g}% reserve. A passed reset "
+                             f"time does not count as restored capacity; check 'syndicate limits', or {move}. "
+                             f"Recovery: {runtime.forget_hint(provider)}.")
+    state, _ = runtime.availability(observation)
+    if warn and state != "current":
+        print(f"syndicate: WARNING: {provider} usage telemetry is {state}; launching {role.name} on the last "
+              f"reading (observed {when}, {remaining:g}% remaining).", file=sys.stderr)
 
 
 def cmd_run_role(args: argparse.Namespace) -> int:
@@ -2205,6 +2255,159 @@ def cmd_run_role(args: argparse.Namespace) -> int:
         role.cli = args.runtime
     require_clis({role.cli})
     brief = sys.stdin.read() if args.brief == "-" else args.brief
+    lease_held = getattr(args, "lease_held", False)
+    specialist_gate(team, role, warn=not lease_held)  # the tmux launcher already warned
+    with ExitStack() as stack:
+        if not lease_held:
+            enter_specialist_lease(stack, project, team, role)
+        return launch_role(project, team, role, brief)
+
+
+RUN_RECORD_MAX_BYTES = 1 << 20  # run.json holds the task text; anything larger is not a record we wrote
+
+
+def read_run_record(project: Path) -> tuple[str, str | None]:
+    """('missing' | 'invalid' | 'valid', run id) for .syndicate/run.json.
+
+    Opened without following symbolic links (neither .syndicate nor run.json)
+    and non-blocking; it must be a regular file owned by this user, at most
+    RUN_RECORD_MAX_BYTES, holding a JSON object whose id matches the
+    supervisor's run-id format. Never creates or modifies anything.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        directory = os.open(Path(project) / LOCAL, flags | getattr(os, "O_DIRECTORY", 0))
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "invalid", None
+    try:
+        try:
+            fd = os.open("run.json", flags | getattr(os, "O_NONBLOCK", 0), dir_fd=directory)
+        except FileNotFoundError:
+            return "missing", None
+        except OSError:
+            return "invalid", None
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_size > RUN_RECORD_MAX_BYTES):
+                return "invalid", None
+            raw = os.read(fd, RUN_RECORD_MAX_BYTES + 1)
+        except OSError:
+            return "invalid", None
+        finally:
+            os.close(fd)
+    finally:
+        os.close(directory)
+    try:
+        record = json.loads(raw)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return "invalid", None
+    run_id = record.get("id") if isinstance(record, dict) else None
+    return ("valid", run_id) if len(raw) <= RUN_RECORD_MAX_BYTES and runtime.valid_run_id(run_id) else ("invalid", None)
+
+
+def session_lock_state(project: Path) -> str:
+    """'held' | 'free' | 'missing' | 'unknown' for the project's session.lock.
+
+    Uses the validated open of portfolio.open_lock (no symbolic links or
+    FIFOs, regular file owned by this user, single link), never creates or
+    truncates the file, and only attempts a momentary shared non-blocking
+    lock, released at once: 'held' means a supervisor owns the project.
+    """
+    import fcntl
+    try:
+        fd, _ = portfolio.open_lock(project_lock_path(project))
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unknown"
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "held"
+        except OSError:
+            return "unknown"
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return "free"
+    finally:
+        os.close(fd)
+
+
+def supervised_run_id(project: Path, role: Role, problem: str) -> str | None:
+    """Run id of the live supervised run of project when SYNDICATE_RUN_ID is unusable.
+
+    A run is live while its supervisor holds session.lock; .syndicate/run.json
+    then names it (run ids are not secret). None means no supervised run is
+    live. Raises SyndicateError (fail closed) when one may be live but its id
+    or the lock state cannot be established.
+    """
+    # Probe, read, probe: a supervisor that exits and is replaced between the
+    # read and a single probe would otherwise lend this lease a stale run id.
+    lock = session_lock_state(project)
+    record, run_id = read_run_record(project)
+    if record == "missing":
+        return None
+    if lock == "held":
+        lock = session_lock_state(project)
+    if lock in ("free", "missing"):
+        return None
+    refused = (f"refusing to launch the {role.name} specialist, so no {role.cli} CLI was launched: "
+               f"{runtime.RUN_ENV} {problem}, and ")
+    if lock == "unknown":
+        raise SyndicateError(refused + f"the state of {project_lock_path(project)} cannot be determined, so "
+                             "Syndicate cannot tell whether a supervised run is live and would enforce the "
+                             f"{role.cli} reserve. Check that file (it must be a regular file owned by you), "
+                             f"or make sure {runtime.RUN_ENV} reaches run-role (for Codex, its "
+                             "shell_environment_policy must keep it).")
+    if record != "valid":
+        raise SyndicateError(refused + f"a supervised run holds {project_lock_path(project)} but "
+                             f"{Path(project) / LOCAL / 'run.json'} does not name a valid run id, so the lease "
+                             f"could not be attributed to it. Make sure {runtime.RUN_ENV} reaches run-role "
+                             "(for Codex, its shell_environment_policy must keep it).")
+    return run_id
+
+
+def enter_specialist_lease(stack: ExitStack, project: Path, team: Team, role: Role) -> None:
+    """Hold this specialist's lease on stack so the supervisor enforces its provider.
+
+    With handoff on, the lease names the supervised run: SYNDICATE_RUN_ID
+    (set by the supervisor) or, if that is missing or malformed (for example,
+    stripped by a Codex shell_environment_policy), the live run found through
+    run.json and a held session.lock (supervised_run_id). With no supervised
+    run live, no lease is written and a warning says that only the launch
+    gate applied. Failure to write the lease refuses the launch (fail
+    closed): the specialist would run unenforced.
+    """
+    if team.config["handoff"] == "off":
+        return
+    provider = role.cli
+    run_id = os.environ.get(runtime.RUN_ENV, "")
+    if not runtime.valid_run_id(run_id):
+        detail = "is not set" if not run_id else "is malformed"
+        found = supervised_run_id(project, role, detail)
+        if found is None:
+            print(f"syndicate: WARNING: {runtime.RUN_ENV} {detail} and no Syndicate-supervised run is live "
+                  f"for this project; the launch gate applied, but in-run enforcement of the {provider} "
+                  f"reserve is unavailable while {role.name} runs.", file=sys.stderr)
+            return
+        print(f"syndicate: {runtime.RUN_ENV} {detail}; using run id {found} from "
+              f"{Path(project) / LOCAL / 'run.json'} (its supervisor holds the session lock) for the "
+              f"{role.name} specialist lease.", file=sys.stderr)
+        run_id = found
+    try:
+        stack.enter_context(runtime.specialist_lease(project, provider, role.name, run_id))
+    except (OSError, ValueError) as error:
+        raise SyndicateError(
+            f"cannot record the {role.name} specialist lease in {runtime.lease_directory(project)}: {error}; "
+            f"refusing to launch the specialist, so no {provider} CLI was launched. The supervisor needs the "
+            f"lease to enforce the {provider} reserve while it runs. If a sandbox denied the write, rerun this "
+            "exact run-role command outside the sandbox with approval.") from error
+
+
+def launch_role(project: Path, team: Team, role: Role, brief: str) -> int:
     if role.cli == "claude":
         argv = ["claude", "-p", "--agents", json.dumps({role.name: claude_agent(role)}), "--agent", role.name]
         if role.can_write:
@@ -2244,7 +2447,41 @@ def cmd_run_role(args: argparse.Namespace) -> int:
     return subprocess.run(argv, cwd=project, stdin=subprocess.DEVNULL).returncode
 
 
+def forget_reading(provider: str) -> int:
+    """Remove one provider's recorded usage reading, and nothing else.
+
+    Explicit operator recovery for a reading known to be outdated; Syndicate
+    never forgets a reading or infers a reset by itself.
+    """
+    path = runtime.STATE / f"{provider}.json"
+    try:
+        directory = os.open(runtime.STATE, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        print(f"No {provider} usage reading is recorded ({path} does not exist); nothing removed.")
+        return 0
+    except OSError as error:
+        raise SyndicateError(f"cannot open {runtime.STATE} safely: {error}") from None
+    try:
+        try:
+            info = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            print(f"No {provider} usage reading is recorded ({path} does not exist); nothing removed.")
+            return 0
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise SyndicateError(f"refusing to remove {path}: it is not a regular file")
+        os.unlink(path.name, dir_fd=directory)
+    except OSError as error:
+        raise SyndicateError(f"cannot remove {path}: {error}") from None
+    finally:
+        os.close(directory)
+    print(f"Removed {path}. The {provider} reserve cannot be enforced until a new {provider} usage reading "
+          "is recorded.")
+    return 0
+
+
 def cmd_limits(args: argparse.Namespace) -> int:
+    if getattr(args, "forget", None):
+        return forget_reading(args.forget)
     if args.stop:
         runtime.STATE.mkdir(parents=True, exist_ok=True)
         (runtime.STATE / "stop").touch()
@@ -2575,6 +2812,9 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p = cmds.add_parser("limits", help="show account limits and reset notifications; starts the background monitor")
     p.add_argument("--watch", action="store_true", help="keep displaying limits and reset notices")
     p.add_argument("--stop", action="store_true", help="stop the background monitor")
+    p.add_argument("--forget", choices=("claude", "codex"), metavar="PROVIDER",
+                   help="remove the recorded usage reading of PROVIDER (claude or codex) when you know it is "
+                        "outdated; the reserve cannot be enforced for it until a new reading is recorded")
     p.set_defaults(fn=cmd_limits)
     return run, sub
 
@@ -2634,8 +2874,23 @@ def main(argv: list[str]) -> int:
                         if args.runtime:
                             original_argv += ['--runtime', args.runtime]
                         original_argv += ['--', brief]
+            if args.fn == cmd_run_role:
+                # This launcher waits for the tmux-hosted specialist and runs in
+                # the supervised CLI's environment, so it gates and carries the
+                # lease; the inner run (_in-tmux) does not write another.
+                team = resolve_team(directory)
+                role = team.roles.get(args.role)
+                if role and args.role != 'orchestrator':
+                    if args.runtime:
+                        role.cli = args.runtime
+                    specialist_gate(team, role)
+                    with ExitStack() as stack:
+                        enter_specialist_lease(stack, directory, team, role)
+                        return launch_tmux(original_argv, directory, name, headless=True)
             return launch_tmux(original_argv, directory, name,
                                headless=getattr(args, 'print', False) or args.fn == cmd_run_role)
+        if inside_tmux and args.fn == cmd_run_role:
+            args.lease_held = True  # the launcher outside tmux holds it
         return args.fn(args)
     except (SyndicateError, portfolio.PortfolioError) as e:
         print(f"syndicate: {e}", file=sys.stderr)

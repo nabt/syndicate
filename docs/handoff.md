@@ -1,7 +1,7 @@
 # Usage-aware handoffs
 
-Syndicate monitors account usage by default and stops its managed team when any
-observed window reaches **10% remaining**. It saves a handoff and asks whether to
+Syndicate monitors account usage by default and stops its managed team when an
+enforced provider's last recorded window reaches **10% remaining**. It saves a handoff and asks whether to
 leave agent work stopped or continue with the other CLI. Switching requires an
 explicit answer. Non-interactive runs stop with exit code 75 and never switch
 providers automatically.
@@ -23,6 +23,11 @@ syndicate team task --reserve 20 --project ~/code/project "implement the feature
 # Inspect both providers and reset notices
 syndicate limits
 syndicate limits --watch
+
+# Discard a recorded reading you know is outdated (see "Recovering from an
+# outdated low reading" below); the reserve cannot be enforced for that
+# provider until a new reading is recorded
+syndicate limits --forget claude
 
 # Resume later, using Codex for the orchestrator and every specialist
 syndicate team task -x codex --all-runtime codex --project ~/code/project \
@@ -56,9 +61,13 @@ monitor; use `syndicate limits --stop` for that.
    The live worktree, including untracked files, remains in place. The snapshot
    is recovery context, not a complete project backup.
 3. It asks whether to stop or choose a CLI for continuation. You can also
-   choose the current host to move a depleted mixed-team specialist onto it. Pressing Enter, EOF, or non-interactive
-   input leaves work stopped. A target already known to be below the reserve
-   is not launched.
+   choose the current host to move a depleted mixed-team specialist onto it.
+   When a delegated provider (not the host) hit the reserve, the prompt names
+   that provider and offers only the host for every role, never the exhausted
+   provider. Pressing Enter, EOF, or non-interactive
+   input leaves work stopped. A target whose last recorded reading is at or
+   below the reserve is not launched, even if that reading is stale or its
+   reset time has passed; the message names `syndicate limits --forget`.
 4. An approved switch starts a new conversation reading that handoff and uses
    the selected CLI for every role in that run. Saved project assignments are
    unchanged. Outstanding tests and reviews remain outstanding.
@@ -98,27 +107,134 @@ Syndicate launches, and provider configuration directories are not modified.
   times after an API response. See [Claude's status-line documentation](https://code.claude.com/docs/en/statusline).
   This replaces the status line for that Syndicate session only. Headless
   Claude and Claude-backed headless relays do not provide this status-line
-  feed themselves. They need a fresh observation from an interactive Claude
-  session; otherwise managed project execution pauses. There is no undocumented
-  credential scraping or private quota API fallback.
-- **Unknown or stale data (project sessions):** observations expire after 180 seconds. After
-  60 continuous seconds without usable data for any assigned provider,
-  Syndicate stops and saves a handoff rather than assume there is capacity.
-  This startup grace lets interactive Claude produce its first observation.
-  It also means initial work can start before a quota is known.
-- **Chief of Staff exception:** missing, stale, or awaiting-reset telemetry
+  feed themselves; Claude readings only refresh while an interactive Claude
+  session runs through Syndicate. There is no undocumented credential scraping
+  or private quota API fallback.
+- **Which providers are enforced (project sessions):** the host (the
+  orchestrator's CLI) for the whole run. A delegated provider (a specialist
+  launched through `syndicate team run-role`, such as a Claude role under a
+  Codex host) is checked when the specialist launches and enforced only while
+  it runs. An idle assigned provider never stops the team.
+- **Latest real reading:** enforcement uses each provider's most recently
+  recorded percentages (the most constrained window), even when that reading
+  is stale (older than 180 seconds) or its reset time has passed. A passed
+  reset is never treated as restored capacity, and no quota is inferred from
+  tokens or elapsed time. Limitation: consumption after the last reading goes
+  undetected until a new reading arrives, so a silent provider can cross the
+  reserve unnoticed.
+- **Unknown or stale data (project sessions):** stale, awaiting-reset, or
+  missing telemetry never stops a running session by itself. The supervisor
+  warns once per provider per state change: it prints a warning when a
+  provider's telemetry enters a non-current state (for example, `claude usage
+  telemetry is stale (last observed 14:05, 42% remaining); enforcing the
+  reserve with the last real reading`), stays quiet while that state persists
+  or while telemetry is current, and warns again if it later leaves the
+  current state again (stale, then current, then stale prints two warnings).
+  A host with no reading at all launches with a warning: a Claude host is
+  itself the source of Claude telemetry, so refusing would prevent the first
+  reading. Malformed telemetry files (non-numeric, out-of-range, or
+  non-finite values) are treated as no reading.
+- **Delegated launch gate:** before starting a specialist's CLI, `run-role`
+  refuses (non-zero exit, no CLI launched) when that provider's last reading is
+  at or below `handoff-reserve`, or when no reading has ever been recorded. The
+  error names the provider, remaining percentage, reserve, and observation time,
+  or explains how to obtain a reading: run an interactive Claude session through
+  Syndicate, check `syndicate limits` (Codex errors from the monitor are
+  included), or move the role to another runtime / use `--all-runtime`. A
+  refusal at the reserve also names `syndicate limits --forget`. A stale
+  reading above the reserve is accepted with a warning. The gate uses the
+  project configuration's `handoff-reserve`, not a one-run `--reserve`; the
+  running supervisor still applies `--reserve` to the active specialist.
+  `handoff = off` disables the gate.
+- **Specialist leases:** the supervisor starts the CLI with
+  `SYNDICATE_RUN_ID=<run id>` in its environment (Codex's default shell
+  environment policy only drops names containing `KEY`, `SECRET` or `TOKEN`,
+  so the variable reaches `run-role` invoked from Codex shell commands). While
+  a delegated specialist runs, `run-role` keeps a randomly named lease,
+  `.syndicate/specialists/<32 hex>.json` (mode 0600, directory 0700), holding
+  the run id, provider, and role, and holds an exclusive `flock` on it for the
+  specialist's whole lifetime. On exit it unlinks the lease and releases the
+  lock. The supervisor counts a lease as active only while that lock is held
+  by someone else and only when the run id is its own; this works when the
+  specialist runs in another PID namespace (for example, inside the Codex
+  `workspace-write` sandbox). A lease nobody holds (a killed specialist) is
+  removed. Symlinked, FIFO, oversized, malformed, or foreign leases, and a
+  lease directory that is symlinked, owned by another user, or group/world
+  writable, are ignored. Each check reads at most 256 directory entries and
+  examines at most 64 lease files; if the directory holds more, the
+  supervisor warns once per run that leases beyond the cap are not enforced.
+  If lease evaluation fails unexpectedly, the supervisor warns once and keeps
+  enforcing the host; when evaluation works again it prints "specialist lease
+  evaluation recovered" and a later failure warns again.
+- **Lease limitation (SIGKILL):** the lease lives exactly as long as the
+  `run-role` process holding it. SIGTERM and SIGINT unwind it normally (the
+  lease is removed, and a tmux-hosted specialist's session is stopped). If
+  that process is killed with SIGKILL while its child CLI keeps running
+  (including the outer launcher that waits for a tmux-hosted specialist),
+  the kernel releases the lock, the supervisor removes the lease, and that
+  specialist's provider is no longer enforced for the rest of its run.
+- **Lease location:** leases live in the `.syndicate/specialists/`
+  directory of the project `run-role` resolves (the git top level when the
+  project is a repository). In a project that is not a git repository,
+  starting `run-role` from a subdirectory writes the lease where the
+  supervisor does not look; the launch gate still applies, but in-run
+  enforcement does not. Pass `--project` with the project root.
+- **Lease write failure fails closed:** inside a supervised run, if
+  `run-role` cannot record its lease (for example, a sandbox denies writing
+  `.syndicate/specialists/`), it refuses to start the specialist: non-zero
+  exit, "no <provider> CLI was launched", and advice to rerun the exact
+  command outside the sandbox with approval.
+- **Missing run id inside a supervised run:** if `SYNDICATE_RUN_ID` is not
+  set or malformed (for example, a custom Codex `shell_environment_policy`
+  strips it), `run-role` looks for a live supervised run of the project: it
+  reads the run id from `.syndicate/run.json` (not following symbolic links;
+  it must be a regular file owned by you, at most 1 MiB, with an id in the
+  supervisor's format) and confirms the run is live because
+  `.syndicate/session.lock` is currently held (a momentary non-blocking
+  shared lock attempt fails; the lock file is never created, truncated, or
+  held). If so, the lease uses that run id and `run-role` prints a notice
+  that the id came from `run.json` (run ids are not secret). It fails closed
+  (non-zero exit, no CLI launched) when `run.json` exists but the lock state
+  cannot be determined (for example, `session.lock` is a symbolic link, FIFO,
+  hard-linked, or unreadable), or when the lock is held but `run.json` does
+  not name a valid run id. The lock is probed before and after reading
+  `run.json`, so a run that ends in between is not credited with the lease.
+  Because the account is shared, a specialist started without a run id (for
+  example, from a Chief of Staff workspace) while the project's own team is
+  running is attributed to that team's run, whose supervisor may then stop
+  its team at the reserve; the notice says which run id was used.
+- **Outside a supervised run:** when `SYNDICATE_RUN_ID` is not usable and no
+  supervised run is live (no `run.json`, or `session.lock` missing or free;
+  for example, `syndicate team run-role` started by hand), the launch gate
+  still applies, but no lease is written and a warning says in-run
+  enforcement is unavailable for that specialist.
+- **Recovering from an outdated low reading:** a Claude reading only refreshes
+  while an interactive Claude session runs through Syndicate, so a stale
+  reading at or below the reserve would otherwise block Claude host preflight,
+  Claude specialists, and a Claude handoff target indefinitely. If you know it
+  is outdated (for example, the window has since reset), run
+  `syndicate limits --forget claude` (or `codex`). It removes only
+  `~/.syndicate/limits/<provider>.json` (never through a symbolic link) and
+  says so; until a new reading is recorded, the reserve cannot be enforced for
+  that provider (the host launches with a warning; specialists on it are
+  refused for lack of a reading). Syndicate never forgets a reading or infers a
+  reset on its own. The preflight block, the launch-gate refusal, and the
+  post-handoff "leaving work stopped" message all name this command.
+- **Chief of Staff:** missing, stale, or awaiting-reset telemetry
   never triggers a Chief shutdown. Preflight and running supervision enforce
   the latest recorded percentages, even after their expected reset. If an
   active statusline stops updating, consumption past the reserve goes undetected
   until the next reading; silence does not prove capacity. This applies with
-  `--no-live` and in headless mode too. See [Chief quota policy](chief-of-staff.md).
+  `--no-live` and in headless mode too. Unlike project sessions, the Chief does
+  not print telemetry warnings. See [Chief quota policy](chief-of-staff.md).
 - **Profiles:** observations describe the CLIs' default local account profiles,
   shared across projects. Custom account/profile overrides are not supported
   by this monitor. Do not use a different account for the worker and reader.
 
-Monitoring covers providers assigned to the team, even before a particular
-specialist is invoked. For a single-provider run, use both `-x` and
-`--all-runtime` to avoid depending on another provider's telemetry.
+A delegated provider with no recorded reading cannot run specialists: the
+launch gate fails loudly rather than run them unmonitored. For a
+single-provider run, use both `-x` and `--all-runtime` to avoid depending on
+another provider's telemetry.
 
 ## Reset notifications
 

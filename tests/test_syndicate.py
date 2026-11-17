@@ -44,6 +44,17 @@ class ProjectCase(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         (self.project / ".syndicate" / "roles").mkdir(parents=True)
+        # Usage gates read account telemetry; never consult the real ~/.syndicate.
+        state = unittest.mock.patch.object(sy.runtime, "STATE", self.project / "usage-state")
+        state.start()
+        self.addCleanup(state.stop)
+
+    def usage(self, provider, used, observed_at=None):
+        """Record a provider usage reading (used percent) in the patched state."""
+        payload = ({"rate_limits": {"five_hour": {"used_percentage": used}}} if provider == "claude"
+                   else {"rateLimits": {"primary": {"usedPercent": used}}})
+        sy.runtime.atomic_json(sy.runtime.STATE / f"{provider}.json",
+                               sy.runtime.normalize(provider, payload, now=observed_at))
 
     def config(self, text):
         (self.project / ".syndicate" / "syndicate.conf").write_text(text)
@@ -157,6 +168,7 @@ class ConfigParsing(ProjectCase):
     def test_specialist_launch_uses_its_runtime_options(self):
         self.config('codex-model_verbosity = low\nclaude-model = sonnet\n')
         for provider in ('claude', 'codex'):
+            self.usage(provider, 20)  # the launch gate needs a reading above the reserve
             with unittest.mock.patch.object(sy, 'require_clis'), \
                  unittest.mock.patch.object(sy, 'execution_project', return_value=self.project), \
                  unittest.mock.patch.object(sy, 'register_workspace', side_effect=lambda p: p), \
@@ -538,6 +550,7 @@ class LaunchCommands(ProjectCase):
 
     def test_codex_scratch_denial_explains_approval_path(self):
         self.config("default = codex\n")
+        self.usage("codex", 20)  # pass the launch gate to reach scratch creation
         args = argparse.Namespace(dir=str(self.project), role="code-reviewer", runtime=None, brief="review")
         with unittest.mock.patch.object(sy, "require_clis"), \
              unittest.mock.patch.object(sy.tempfile, "TemporaryDirectory", side_effect=PermissionError("denied")):
@@ -546,6 +559,7 @@ class LaunchCommands(ProjectCase):
 
     def test_codex_reviewer_can_write_only_scratch(self):
         self.config("default = codex\n")
+        self.usage("codex", 20)  # the launch gate needs a reading above the reserve
         args = argparse.Namespace(dir=str(self.project), role="code-reviewer", runtime=None, brief="review")
         def run(argv, **kwargs):
             cwd = Path(kwargs["cwd"])
