@@ -40,6 +40,7 @@ class ChiefOfStaff(ProjectCase):
                 run_project.assert_not_called()
                 self.assertEqual(supervise.call_args.args[1], self.workspace)
                 self.assertFalse(supervise.call_args.kwargs['headless'])
+                self.assertTrue(supervise.call_args.kwargs['chief'])
                 prompt = supervise.call_args.args[0][-1]
                 self.assertIn('brief greeting', prompt)
                 self.assertIn('current briefing', prompt)

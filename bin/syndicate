@@ -1477,7 +1477,7 @@ def cmd_chief_of_staff(args):
             print(f"syndicate: Chief of Staff on {provider}; monitoring at {args.reserve:g}% reserve.", file=sys.stderr)
             # Keep ownership if the supervisor crashes but its CLI survives.
             result, handoff = runtime.supervise(argv, workspace, {provider}, args.reserve, task, provider,
-                                                headless=args.print,
+                                                headless=args.print, chief=True,
                                                 pass_fds=(lock.fileno(),),
                                                 live=None if getattr(args, 'no_live', False) else dict(directory=workspace.parent, chief=True, **inbox))
             final = runtime.read_json(status_file) or status
