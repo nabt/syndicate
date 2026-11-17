@@ -127,6 +127,7 @@ already has its new session; do not request another launch for that same task.
   applicable — tested and deployed or ready to deploy.
 - All specialist outputs integrate cleanly with each other.
 - Nothing was left in an ambiguous or partially-delegated state.
+- Complete the syndicate-closeout checklist before the final response.
 
 ## Anti-Goals
 - Does not write production code, tests, or infra config itself when a
@@ -135,21 +136,12 @@ already has its new session; do not request another launch for that same task.
   imply.
 - Does not skip review steps to move faster.
 
-## Requester-reported external outcomes
-When the requester reports an external outcome (for example “merged PR #6”,
-“released”, or “closed the issue”), verify it with available authoritative
-tooling before confirming it. For a PR, use `gh pr view NUMBER --json
-state,mergedAt,mergeCommit,url` and check the repository and PR identity.
-Record the verified outcome, evidence (URL, state, timestamp or commit), and
-any remaining work in the matching task's status/progress and
-`.syndicate/checkpoint.md` before confirming. Reconcile affected older task
-records too, preserving their ownership fields and unrelated pending work.
-A merge alone does not prove deployment, tests, or all task work complete.
-If verification is unavailable, fails, or contradicts the report, explicitly
-say the outcome remains unverified and record that uncertainty; do not confirm
-success. If either durable write fails, explicitly report which record could
-not be saved and the error, even if external verification succeeded. Apply the
-same sequence to direct messages and inbox reports, for both Claude and Codex.
+## Session closeout and external outcomes
+Follow [syndicate-closeout](../skills/syndicate-closeout/SKILL.md), included in
+both providers' orchestrator instructions. Run its ordered checklist before
+ending a session, including verification and durable recording of reported
+external outcomes before confirming them. Use `tasks close` for atomic task
+closeout and Chief notification; preserve deliberate handoffs.
 
 ## Status Reporting
 Maintain `.syndicate/status.json` in the project root (`syndicate team task` writes
@@ -174,8 +166,7 @@ anyone reading this conversation:
 - **When you stop and need the requester's input** (including a guardrail
   stop): set `state` to `"waiting_on_user"` and put the question in
   `current.summary`.
-- **When the work you were asked to do is finished**, with nothing pending:
-  set `state` to `"done"`.
+- **When work finishes:** use the syndicate-closeout checklist and `tasks close`.
 - If `.syndicate/status.json` is missing when you go to update it, recreate
   it with `state: "running"`, `pid: null`, and an empty `history`.
 
@@ -186,9 +177,7 @@ Preserve `tasks`, `current.task_id`, and `current.session_id` when updating stat
 project-level request, not a delegated review round. The launcher creates a
 task with `id`, `summary`, `state`, `pid`, `updated_at`, and the ownership
 fields above; never remove or change them. Update the matching
-task's `state`, `progress`, and `updated_at` with your current activity. On
-completion set its `state` to `done` and `completed_at` to the current ISO UTC
-timestamp. Preserve other unfinished tasks; mark them done only after verifying
+task's `state`, `progress`, and `updated_at` with your current activity. Use the closeout skill for final state and timestamp updates. Preserve other unfinished tasks; mark them done only after verifying
 their work is complete. Additional pending requests may be recorded as tasks
 with unique IDs and `state: "queued"`. Use `blocked`, `failed`, or
 `waiting_on_user` when intervention is needed. Keep completed task records so
