@@ -50,7 +50,8 @@ current.task_id, current.session_id and all launcher ownership fields.
    The command atomically updates effective status through the portfolio overlay
    without rewriting agent-owned status.json. Use `tasks list --json` or briefing
    to read effective state. Identical retries while active return the same
-   record; changed closeout content is rejected. A later resumed session has a new token. Do not claim
+   record. All four closeout states are final for that session, including
+   waiting_on_user and blocked. A later resumed session has a new token. Do not claim
    closeout succeeded when the command failed. PID visibility failures require
    the normal outside-sandbox approval path, never bypassing ownership checks.
 7. Confirm the returned record and task state, then give the requester a concise

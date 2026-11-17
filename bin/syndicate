@@ -680,7 +680,7 @@ def owner_identity(pid) -> dict:
 OWNER_FIELDS = ("process_identity", "process_namespace", "machine_id", "lock_owned", "lock_inode", "cli_owner")
 
 
-def read_status(project_path: str) -> dict | None:
+def read_status(project_path: str, *, current_closeouts: set | None = None) -> dict | None:
     path = Path(project_path) / LOCAL / "status.json"
     if not path.is_file():
         return None
@@ -709,6 +709,8 @@ def read_status(project_path: str) -> dict | None:
                         and (data.get('current') or {}).get('session_id') == record['session_id']):
                     data.update(state=patch['state'])
                     data['current']['summary'] = patch['progress']
+                    if current_closeouts is not None:
+                        current_closeouts.add(record['session_id'])
     data["_mtime"] = mtime_iso(path)
     return data
 
@@ -2074,13 +2076,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             try:
                 result = run_session(args)
             except Exception as error:
-                status = read_status(str(project)) or {}
-                current = status.setdefault("current", {})
-                session_id = current.get("session_id")
-                if session_id and any(task.get("id") == current.get("task_id")
-                                      and task.get("closeout_session") == session_id
-                                      for task in project_tasks(status)):
+                current_closeouts = set()
+                status = read_status(str(project), current_closeouts=current_closeouts) or {}
+                if current_closeouts:
                     raise
+                current = status.setdefault("current", {})
                 status.update(state="failed")
                 current["summary"] = f"Launch failed: {error}"
                 status.pop("_mtime", None)

@@ -202,6 +202,18 @@ class Closeout(ProjectCase):
         self.assertEqual(sy.status_path(self.project).read_bytes(), reports[0])
         self.assertEqual(sy.read_status(str(self.project))['state'], 'done')
 
+    def test_launch_failure_requires_a_committed_closeout_to_skip_failure_write(self):
+        def fail_with_raw_marker():
+            status = json.loads(sy.status_path(self.project).read_text())
+            status['tasks'][-1]['closeout_session'] = self.session_id
+            sy.runtime.atomic_json(sy.status_path(self.project), status)
+            raise OSError('supervisor launch failed')
+
+        with self.assertRaisesRegex(OSError, 'supervisor launch failed'):
+            self.supervise(fail_with_raw_marker)
+        self.assertEqual(sy.read_status(str(self.project))['state'], 'failed')
+        self.assertEqual(self.messages(), [])
+
     def test_concurrent_unrelated_task_addition_survives_commit(self):
         original_update = sy.live.MessageStore.update
         def add_task(store, **fields):

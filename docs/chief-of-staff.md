@@ -627,13 +627,13 @@ of portfolio messages.json. Status readers apply this authoritative overlay to
 the matching task/session immediately, even if the session is still live or
 writes a later raw report. The command
 never rewrites agent-owned status.json, preserving concurrently added tasks and
-history. Raw status.json is the agent's last report; use `tasks list`, `briefing`
-or dashboards for effective state, just as with management task edits. A failed
+history. Use `tasks list`, `briefing` or dashboards for effective state. A failed
 commit changes neither effective state nor inbox. Identical retries while the
 session is active return the same record without a duplicate notification; no
-post-commit repair is necessary. Corrupt inbox data fails loudly. Explicit
-management task edits retain precedence. A resumed session uses a new token so
-old closeouts cannot end it.
+post-commit repair is necessary. A closeout is final for its owning session,
+including waiting_on_user and blocked. Corrupt inbox data fails loudly.
+Explicit management task edits retain precedence. A resumed session uses a
+new token so old closeouts cannot end it.
 
 A supervised project exit with an unclosed running task records ended with
 needs_attention and sends a Chief message. An existing closeout is preserved.
