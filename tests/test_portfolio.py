@@ -532,6 +532,25 @@ class OwnerLiveness(unittest.TestCase):
         self.assertEqual(store.reconcile(dead), [])
         self.assertEqual(store.path.read_bytes(), before)
 
+    def test_request_list_tolerates_hidden_owner_but_ack_requires_approval(self):
+        store = sy.portfolio.CoordinationStore(self.root / 'portfolio')
+        session = store.start_session(str(self.root), 'task', 'codex', os.getpid())
+        request = store.send_request(source_path=str(self.root), project_path=str(self.root),
+                                     task_id='task', key='k', message='review')
+        data = store.read()
+        data['sessions'][0]['process_namespace'] = 'pid:[foreign]'
+        sy.runtime.atomic_json(store.path, data)
+        before = store.path.read_bytes()
+        args = sy.build_parsers()[1].parse_args(['requests', 'list', '-C', str(self.root), '--task', 'task', '--json'])
+        output = io.StringIO()
+        with patch.object(sy, 'coordination_store', return_value=store), contextlib.redirect_stdout(output):
+            self.assertEqual(sy.cmd_requests(args), 0)
+        self.assertEqual(json.loads(output.getvalue())[0]['delivery_state'], 'unverified')
+        with self.assertRaisesRegex(sy.portfolio.PortfolioError, 'outside the sandbox with approval'):
+            store.transition_request(request['id'], 'acknowledge', source_path=str(self.root),
+                                     task_id='task', session_id=session['id'], note='incorporated')
+        self.assertEqual(store.path.read_bytes(), before)
+
     def test_superseding_a_dead_session_fails_its_queued_requests(self):
         store = sy.portfolio.CoordinationStore(self.root / 'portfolio')
         first = store.start_session('/source', 'task', 'codex', os.getpid())

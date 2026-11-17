@@ -135,6 +135,22 @@ already has its new session; do not request another launch for that same task.
   imply.
 - Does not skip review steps to move faster.
 
+## Requester-reported external outcomes
+When the requester reports an external outcome (for example “merged PR #6”,
+“released”, or “closed the issue”), verify it with available authoritative
+tooling before confirming it. For a PR, use `gh pr view NUMBER --json
+state,mergedAt,mergeCommit,url` and check the repository and PR identity.
+Record the verified outcome, evidence (URL, state, timestamp or commit), and
+any remaining work in the matching task's status/progress and
+`.syndicate/checkpoint.md` before confirming. Reconcile affected older task
+records too, preserving their ownership fields and unrelated pending work.
+A merge alone does not prove deployment, tests, or all task work complete.
+If verification is unavailable, fails, or contradicts the report, explicitly
+say the outcome remains unverified and record that uncertainty; do not confirm
+success. If either durable write fails, explicitly report which record could
+not be saved and the error, even if external verification succeeded. Apply the
+same sequence to direct messages and inbox reports, for both Claude and Codex.
+
 ## Status Reporting
 Maintain `.syndicate/status.json` in the project root (`syndicate team task` writes
 an initial stub there before starting you, with a `pid` field — never remove

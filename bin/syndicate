@@ -463,7 +463,8 @@ You are a relay for the `{role.name}` role, which runs on the {role.cli} CLI in 
 <the brief>
 SYNDICATE_BRIEF
 
-3. Reply with the command's output verbatim as your final answer. If the command fails, report the error verbatim. Do not retry a different way or do the work yourself.
+3. If the sandbox denies scratch creation or the child CLI's network connection, request normal approval to run this exact command outside the sandbox. Explain the denied operation; do not broaden the relay sandbox or change the command. If approval is unavailable, report the failure to the orchestrator so it can request approval.
+4. Reply with the command's output verbatim as your final answer. For other failures, report the error verbatim. Do not retry a different way or do the work yourself.
 """
 
 
@@ -526,12 +527,16 @@ def build_codex(team: Team, headless: bool, rest: list[str]) -> list[str]:
         if name == "orchestrator":
             continue
         relays = relays or role.cli != "codex"
-        if role.cli == "codex":
+        if role.cli == "codex" and role.can_write:
             instructions, sandbox = role.body, role.sandbox
         else:
-            instructions, sandbox = relay_prompt(role, team.project), RELAY_SANDBOX
+            instructions = relay_prompt(role, team.project)
+            sandbox = "read-only" if role.cli == "codex" and not role.can_write else RELAY_SANDBOX
         f = gen / f"{name}.toml"
-        f.write_text(f"developer_instructions = {jstr(instructions)}\nsandbox_mode = {jstr(sandbox)}\n")
+        config = f"developer_instructions = {jstr(instructions)}\nsandbox_mode = {jstr(sandbox)}\n"
+        if sandbox == "workspace-write":
+            config += f"[sandbox_workspace_write]\nwritable_roots = [{jstr(str(REGISTRY_PATH.parent / 'portfolio'))}]\n"
+        f.write_text(config)
         keep.add(f.name)
         overrides += [
             "-c", f"agents.{name}.description={jstr(role.description)}",
@@ -876,8 +881,9 @@ def reconcile_sessions(write: bool = True) -> list[dict]:
     if write:
         try:
             store.reconcile(verdict)
-        except (portfolio.PortfolioError, OSError):
-            pass  # unreadable or read-only coordination state: report, never crash
+        except (portfolio.PortfolioError, OSError) as error:
+            print(f"syndicate: could not persist session reconciliation: {error}; "
+                  "rerun outside the sandbox with approval", file=sys.stderr)
     try:
         return store.read()["sessions"]
     except (portfolio.PortfolioError, OSError):
@@ -900,8 +906,9 @@ def persist_task_closures(closures: list[tuple[str, str, dict]]) -> None:
                 changed = True
             if changed:
                 runtime.atomic_json(path, edits)
-    except OSError:
-        pass  # e.g. a read-only sandbox view; the next host sweep persists it
+    except OSError as error:
+        print(f"syndicate: could not persist task closures: {error}; "
+              "rerun outside the sandbox with approval", file=sys.stderr)
 
 
 def gather_statuses(sweep: bool = True) -> list[dict]:
@@ -1235,7 +1242,7 @@ def cmd_sessions(args):
 def cmd_requests(args):
     store = coordination_store()
     if args.action == "list":
-        records = store.snapshot()["requests"]
+        records = store.snapshot(strict=False)["requests"]
         if not args.all:
             records = [r for r in records if r["state"] in ("queued", "failed")]
         if args.project:
@@ -2110,7 +2117,9 @@ def run_session(args: argparse.Namespace) -> int | None:
 
 
 def cmd_run_role(args: argparse.Namespace) -> int:
-    project = register_workspace(execution_project(args.dir))
+    # A specialist is part of an existing project, not a new owner. Registry
+    # registration requires a host-only lock and is unnecessary here.
+    project = execution_project(args.dir)
     team = resolve_team(project)
     role = team.roles.get(args.role)
     if not role or args.role == "orchestrator":
@@ -2125,8 +2134,36 @@ def cmd_run_role(args: argparse.Namespace) -> int:
             argv += ["--permission-mode", "acceptEdits"]
         argv += cli_options('claude', team.config) + ['--', brief]
     else:
-        argv = ["codex", "exec", "-C", str(project), "-s", role.sandbox,
-                "-c", f"developer_instructions={jstr(role.body)}"] + cli_options('codex', team.config) + ['--', brief]
+        # Keep reviewers' repository read-only while allowing test fixtures and
+        # bytecode in a disposable workspace outside the repository. Native
+        # read-only roles use this same path through a relay.
+        scratch_parent = REGISTRY_PATH.parent / "portfolio" / "scratch"
+        try:
+            scratch_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            scratch_dir = tempfile.TemporaryDirectory(prefix=f"{role.name}-", dir=scratch_parent)
+        except OSError as error:
+            raise SyndicateError(f"cannot create specialist scratch workspace: {error}; "
+                                 "rerun this run-role command outside the sandbox with approval") from error
+        with scratch_dir as scratch:
+            cwd = project if role.can_write else Path(scratch)
+            instructions = role.body + (f"\n\nSource project: {project}. Run source checks there; "
+                f"use {scratch} for all temporary files and test outputs. "
+                "Do not edit source files. Before reviewing, read applicable AGENTS.md and "
+                "AGENTS.override.md instructions in the source project's ancestors and root, "
+                "then read nested instruction files applicable to each reviewed source file. "
+                "The scratch working directory does not discover source project instructions automatically."
+                if not role.can_write else "")
+            argv = ["codex", "exec", "--skip-git-repo-check", "-C", str(cwd),
+                    "-s", "workspace-write",
+                    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+                    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+                    "--add-dir", scratch,
+                    "-c", f"developer_instructions={jstr(instructions)}"]
+            if role.can_write:
+                argv += ["--add-dir", str(REGISTRY_PATH.parent / "portfolio")]
+            argv += cli_options('codex', team.config) + ['--', brief]
+            env = dict(os.environ, TMPDIR=scratch, PYTHONDONTWRITEBYTECODE="1")
+            return subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL).returncode
     return subprocess.run(argv, cwd=project, stdin=subprocess.DEVNULL).returncode
 
 
