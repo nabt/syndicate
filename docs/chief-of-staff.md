@@ -86,7 +86,9 @@ reading, including stale readings or readings awaiting reset confirmation.
 Unknown or missing usage never stops a Chief, including headless runs and runs
 with `--no-live`. A recorded value at or below the reserve still stops it;
 a reset time passing does not replenish recorded capacity. Project sessions
-retain their freshness fail-safe.
+apply the same latest-reading rule to their host (and to a delegated provider
+while its specialist runs) but also print telemetry warnings and gate
+specialist launches; see [Usage-aware handoffs](handoff.md#usage-sources-and-limitations).
 
 Claude's statusline may stop updating while the Chief waits for its inbox. It
 may also stop updating during active work: in that case consumption can cross

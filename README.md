@@ -138,8 +138,13 @@ syndicate team task --reserve 20 --project ~/code/some-project "your task"
 syndicate limits --watch
 ```
 
-Unknown usage pauses work after a grace period. Claude telemetry depends on
-an interactive status line; headless Claude cannot supply it on its own.
+The host CLI is enforced for the whole run with its latest recorded reading;
+stale or missing telemetry produces a warning, not a stop. A specialist on the
+other CLI is checked at launch (no reading, or one at the reserve, refuses it)
+and enforced while it runs. Claude telemetry depends on an interactive status
+line; headless Claude cannot supply it on its own. If a recorded reading is
+known to be outdated, `syndicate limits --forget claude` (or `codex`) discards
+it; Syndicate never does this on its own.
 Read [Usage-aware handoffs](docs/handoff.md) for setup, recovery commands,
 provider limitations, and reset notifications.
 
