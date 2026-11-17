@@ -624,7 +624,8 @@ and blocked. Only done/ended receive completed_at; ended never means success.
 
 The task patch and Chief inbox message commit together in one atomic replacement
 of portfolio messages.json. Status readers apply this authoritative overlay to
-the matching task/session unless a newer task write supersedes it. The command
+the matching task/session immediately, even if the session is still live or
+writes a later raw report. The command
 never rewrites agent-owned status.json, preserving concurrently added tasks and
 history. Raw status.json is the agent's last report; use `tasks list`, `briefing`
 or dashboards for effective state, just as with management task edits. A failed
@@ -635,7 +636,11 @@ management task edits retain precedence. A resumed session uses a new token so
 old closeouts cannot end it.
 
 A supervised project exit with an unclosed running task records ended with
-needs_attention and sends a Chief message. Explicit task states, deliberate
+needs_attention and sends a Chief message. An existing closeout is preserved.
+If the session already sent a message with the exit key, the supervisor reuses
+that message and leaves any remaining task reconciliation to the stale-session
+sweep. Exit notification failures are reported on stderr and leave task state
+alone. Explicit task states, deliberate
 handoffs and Chief sessions are preserved. Unknown or sandbox-hidden owners
 remain unverified under the existing liveness rules. Abrupt exits without a
 supervisor still use the existing stale-session reconciliation; they cannot run

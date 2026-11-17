@@ -692,20 +692,18 @@ def read_status(project_path: str) -> dict | None:
         return None
     # The notification and task patch share one authoritative atomic commit.
     # Apply at read time; never overwrite concurrent agent-owned status writes.
+    source = str(Path(project_path).resolve())
     for record in live.MessageStore(portfolio_dir()).read():
         patch = record.get('closeout')
-        if record['source_path'] != str(Path(project_path).resolve()) or not patch:
+        if record['source_path'] != source or not patch:
             continue
         tasks = data.get('tasks') if isinstance(data.get('tasks'), list) else []
         for task in tasks:
             if not isinstance(task, dict):
                 continue
-            try:
-                older = datetime.fromisoformat(task.get('updated_at') or '1970-01-01T00:00:00+00:00') <= datetime.fromisoformat(patch['updated_at'])
-            except (ValueError, TypeError):
-                older = False
-            if (task.get('id') == record['task_id'] and task.get('session_id') == record['session_id']
-                    and older):
+            # A new owner has a new token. Later reports from the same owner
+            # cannot supersede its committed closeout.
+            if task.get('id') == record['task_id'] and task.get('session_id') == record['session_id']:
                 task.update(patch)
                 if ((data.get('current') or {}).get('task_id') == task['id']
                         and (data.get('current') or {}).get('session_id') == record['session_id']):
@@ -1398,7 +1396,7 @@ def commit_closeout(project, task_id, session_id, state, progress, message, *, a
                      end_reason='session exited' if attention else 'closed by owning session')
     record = live.MessageStore(portfolio_dir()).update(
         source_path=str(project), task_id=task_id, session_id=session_id,
-        key='session-closeout', message=message, closeout=patch)
+        key='session-closeout', message=message, closeout=patch, reuse_for_exit=attention)
     return record
 
 
@@ -1450,10 +1448,14 @@ def project_session(project, provider, outcome=None):
     finally:
         store.end_session(session["id"])
         if close and not (outcome or {}).get("handoff"):
-            close_owned_task(project, task_id)
+            try:
+                close_owned_task(project, task_id, session_id=session["id"])
+            except (OSError, portfolio.PortfolioError, SyndicateError) as error:
+                print(f"syndicate: could not record exit closeout for task {task_id}: {error}",
+                      file=sys.stderr)
 
 
-def close_owned_task(project, task_id, reason="session exited") -> bool:
+def close_owned_task(project, task_id, *, session_id=None) -> bool:
     """On supervised exit, close the task this session owned if the agent left it
     'running': state 'ended' (not done), keeping last_state, ended_at and
     end_reason. Agent-written done/failed/blocked/waiting_on_user states are
@@ -1464,10 +1466,12 @@ def close_owned_task(project, task_id, reason="session exited") -> bool:
     status = read_status(str(project))
     current = (status or {}).get("current")
     if (not status or not isinstance(current, dict)
-            or current.get("task_id") != task_id or status.get("state") != "running"):
+            or current.get("task_id") != task_id or status.get("state") != "running"
+            or (session_id is not None and current.get("session_id") != session_id)):
         return False
     task = next((t for t in status.get('tasks', []) if isinstance(t, dict) and t.get('id') == task_id), None)
-    if not task or task.get('state') != 'running':
+    if (not task or task.get('state') != 'running'
+            or (session_id is not None and task.get('session_id') != session_id)):
         return False
     session_id = current.get('session_id') or 'legacy-supervised-exit'
     # Legacy records have no session token; this supervisor owns their exit.
@@ -1477,9 +1481,9 @@ def close_owned_task(project, task_id, reason="session exited") -> bool:
         status.pop('_mtime', None)
         runtime.atomic_json(status_path(project), status)
     progress = f"{task.get('summary') or task_id}: Session exited without closeout; needs attention. Inspect checkpoint and remaining work."
-    commit_closeout(project, task_id, session_id, 'ended', progress,
-                    f'Task {task_id} needs attention: {progress}', attention=True)
-    return True
+    record = commit_closeout(project, task_id, session_id, 'ended', progress,
+                             f'Task {task_id} needs attention: {progress}', attention=True)
+    return bool(record.get('closeout', {}).get('needs_attention'))
 
 
 def chief_instructions(workspace):
@@ -2056,11 +2060,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         else:
             status = prior
             status.update(state="running")
+            status["current"].pop("session_id", None)
         status.update(owner)
         for task in status.get("tasks") if isinstance(status.get("tasks"), list) else []:
             if isinstance(task, dict) and task.get("id") == (status.get("current") or {}).get("task_id"):
                 task.update(owner, state="running")
-                for key in ("ended_at", "end_reason", "last_state"):
+                for key in ("session_id", "closeout_session", "completed_at", "needs_attention",
+                            "ended_at", "end_reason", "last_state"):
                     task.pop(key, None)  # a resumed task is running again, not ended
         status.pop("_mtime", None)
         runtime.atomic_json(status_path(project), status)
@@ -2069,8 +2075,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                 result = run_session(args)
             except Exception as error:
                 status = read_status(str(project)) or {}
+                current = status.setdefault("current", {})
+                session_id = current.get("session_id")
+                if session_id and any(task.get("id") == current.get("task_id")
+                                      and task.get("closeout_session") == session_id
+                                      for task in project_tasks(status)):
+                    raise
                 status.update(state="failed")
-                status.setdefault("current", {})["summary"] = f"Launch failed: {error}"
+                current["summary"] = f"Launch failed: {error}"
                 status.pop("_mtime", None)
                 runtime.atomic_json(status_path(project), status)
                 raise

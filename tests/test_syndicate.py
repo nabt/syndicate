@@ -1818,6 +1818,14 @@ render();
 assert.ok($('content').innerHTML.includes('Live Codex task'));
 assert.ok(!$('content').innerHTML.includes('Old source interrupted'));
 assert.equal(currentTask(rows[0]).source_path,'/live');
+const liveTask=rows[0].tasks.pop();
+rows[0].completed_tasks=[{...liveTask,state:'done',session_id:'owner',
+ closeout_session:'owner',progress:'Verified while live'}];
+render();
+assert.ok($('content').innerHTML.includes('Verified while live'));
+assert.equal(currentTask(rows[0]).state,'done');
+rows[0].tasks.push(liveTask);
+rows[0].completed_tasks=[];
 // If briefing data is unavailable, prefer running work among multiple reported-current tasks.
 portfolioData=null;render();
 assert.ok($('content').innerHTML.includes('Live Codex task'));

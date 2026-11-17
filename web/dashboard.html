@@ -43,11 +43,13 @@ function renderCoordination(selected){
 function currentTask(row){
  const selected=(portfolioData?.projects||[]).find(project=>project.path===row.path);
  const tasks=row.tasks||[];
+ const closed=[...(row.completed_tasks||[]),...(row.ended_tasks||[])].filter(
+  task=>task.closeout_session&&task.closeout_session===task.session_id);
  if(selected?.task_id){
-  const authoritative=tasks.find(task=>task.id===selected.task_id&&(task.source_path||row.path)===(selected.source_path||row.path));
+  const authoritative=[...tasks,...closed].find(task=>task.id===selected.task_id&&(task.source_path||row.path)===(selected.source_path||row.path));
   if(authoritative)return authoritative;
  }
- const reported=tasks.filter(task=>task.is_current);
+ const reported=[...tasks,...closed].filter(task=>task.is_current);
  return reported.find(task=>task.state==='running')||reported[0]||tasks.find(task=>task.state==='running')||tasks[0]||row.last_completed;
 }
 function render(){
