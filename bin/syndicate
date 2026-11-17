@@ -1112,13 +1112,17 @@ def chief_session_lock(probe=False):
     """
     import fcntl
     path = REGISTRY_PATH.parent / 'portfolio' / 'chief-of-staff.lock'
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with path.open('a+') as lock:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, _ = portfolio.open_lock(path, create=True, writable=not probe)
+    except OSError as error:
+        raise SyndicateError(f'cannot open Chief of Staff lock safely: {error}') from None
+    with os.fdopen(fd, 'r+' if not probe else 'r', encoding='ascii', errors='replace') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             lock.seek(0)
-            pid = lock.readline().strip()
+            pid = lock.readline(64).strip()
             detail = f' (PID {pid})' if pid.isdecimal() else ''
             raise SyndicateError(f'another Chief of Staff session is already running{detail}') from None
         try:
@@ -1453,8 +1457,8 @@ def cmd_chief_of_staff(args):
                               inbox=dict(enabled=not args.print and not args.no_live, **inbox)), indent=2))
         return 0
     require_clis({provider})
-    workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
     with chief_session_lock() as lock:
+        workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
         local = workspace / LOCAL
         local.mkdir(parents=True, exist_ok=True, mode=0o700)
         status_file = local / "status.json"

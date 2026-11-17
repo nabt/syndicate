@@ -208,6 +208,85 @@ class ChiefOfStaff(ProjectCase):
                     self.assertEqual(path.read_text(), f'{os.getpid()}\n')
                 self.assertEqual(path.read_text(), '')
 
+    def test_unsafe_chief_locks_are_rejected_without_changing_targets(self):
+        path = self.workspace.parent / 'chief-of-staff.lock'
+        path.parent.mkdir(parents=True)
+        target = self.project / 'precious'
+        target.write_bytes(b'preserve me\n')
+        for kind in ('symlink', 'fifo', 'directory', 'hardlink', 'foreign'):
+            with self.subTest(kind=kind):
+                if kind == 'symlink':
+                    path.symlink_to(target)
+                elif kind == 'fifo':
+                    os.mkfifo(path)
+                elif kind == 'directory':
+                    path.mkdir()
+                elif kind == 'hardlink':
+                    os.link(target, path)
+                else:
+                    path.write_text('saved PID')
+                # Simulate a foreign owner without requiring privileged chown.
+                with patch.object(sy.portfolio.os, 'getuid', return_value=(
+                        os.getuid() + 1 if kind == 'foreign' else os.getuid())):
+                    for probe in (False, True):
+                        with self.assertRaises(sy.SyndicateError):
+                            with sy.chief_session_lock(probe=probe):
+                                self.fail('unsafe lock accepted')
+                    self.assertEqual(sy.portfolio.chief_status(path.parent)['state'], 'unavailable')
+                self.assertEqual(target.read_bytes(), b'preserve me\n')
+                if kind == 'foreign':
+                    self.assertEqual(path.read_text(), 'saved PID')
+                path.rmdir() if kind == 'directory' else path.unlink()
+
+    def test_symlinked_portfolio_parent_is_rejected(self):
+        portfolio = self.workspace.parent
+        portfolio.parent.mkdir(parents=True)
+        target = self.project / 'other-portfolio'
+        target.mkdir()
+        lock = target / 'chief-of-staff.lock'
+        lock.write_text('preserve PID')
+        portfolio.symlink_to(target, target_is_directory=True)
+        for probe in (False, True):
+            with self.assertRaises(sy.SyndicateError):
+                with sy.chief_session_lock(probe=probe):
+                    self.fail('symlink parent accepted')
+        self.assertEqual(sy.portfolio.chief_status(portfolio)['state'], 'unavailable')
+        self.assertEqual(lock.read_text(), 'preserve PID')
+        with patch.object(sy, 'require_clis'), patch.object(sy.runtime, 'supervise') as supervise:
+            self.assertEqual(self.command('-x', 'codex')[0], 1)
+        supervise.assert_not_called()
+        self.assertFalse((target / 'workspace').exists())
+
+    def test_probe_preserves_pid_contents_and_inode(self):
+        path = self.workspace.parent / 'chief-of-staff.lock'
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'not a PID\xff')
+        inode = path.stat().st_ino
+        with sy.chief_session_lock(probe=True):
+            self.assertEqual(path.read_bytes(), b'not a PID\xff')
+        self.assertEqual(path.stat().st_ino, inode)
+        self.assertEqual(path.read_bytes(), b'not a PID\xff')
+
+    def test_fifo_status_and_cli_briefing_finish_within_timeout(self):
+        path = self.workspace.parent / 'chief-of-staff.lock'
+        path.parent.mkdir(parents=True)
+        os.mkfifo(path)
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                "import syndicate_portfolio as p; "
+                "assert p.chief_status(sys.argv[2])['state'] == 'unavailable'")
+        subprocess.run([sys.executable, '-c', code, str(sy.SCRIPT.parent), str(path.parent)],
+                       check=True, timeout=5, capture_output=True)
+        # Run the real CLI with an isolated user-wide registry location.
+        code = ("import importlib.machinery,importlib.util,sys; from pathlib import Path; "
+                "loader=importlib.machinery.SourceFileLoader('chief_cli',sys.argv[1]); "
+                "spec=importlib.util.spec_from_loader(loader.name,loader); "
+                "m=importlib.util.module_from_spec(spec); sys.modules[loader.name]=m; "
+                "loader.exec_module(m); m.REGISTRY_PATH=Path(sys.argv[2]); "
+                "sys.exit(m.main(['briefing','--json']))")
+        result = subprocess.run([sys.executable, '-c', code, str(sy.SCRIPT), str(sy.REGISTRY_PATH)],
+                                check=True, timeout=5, capture_output=True, text=True)
+        self.assertEqual(json.loads(result.stdout)['chief']['state'], 'unavailable')
+
     def test_direct_owner_blocks_tmux_and_tmux_child_launches(self):
         with sy.chief_session_lock():
             for argv in (['-x', 'codex'], ['_in-tmux', '-x', 'claude']):
@@ -580,10 +659,14 @@ class ChiefExclusion(ProjectCase):
                 sy.gather_statuses()
                 sy.reconcile_stale()
                 self.assertEqual(sy.main(['sessions']), 0)
+                # Sweeps and session views must never probe Chief ownership.
+                self.assertFalse(any(path == self.lock or self.workspace in path.parents for path in probed))
                 self.assertEqual(sy.main(['briefing', '--json']), 0)
         self.assertFalse(any(arg == 'tmux' or 'chief-of-staff-work' in str(arg) for argv in commands for arg in argv))
         self.assertIn(self.project / '.syndicate' / 'session.lock', probed)
-        self.assertFalse(any(path == self.lock or self.workspace in path.parents for path in probed))
+        # Briefing deliberately reads the Chief lock through the safe opener.
+        self.assertIn(self.lock, probed)
+        self.assertFalse(any(self.workspace in path.parents for path in probed))
         self.assertEqual([f.read_bytes() for f in files], before)
 
     @unittest.skipUnless(Path('/proc').is_dir(), 'needs /proc process identities')

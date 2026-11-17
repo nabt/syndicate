@@ -168,7 +168,8 @@ def chief_status(directory):
                   status_updated_at=None, reason=None,
                   checkpoint=dict(state='unavailable', summary=None, updated_at=None, truncated=False))
     try:
-        with (directory / 'chief-of-staff.lock').open('rb') as lock:
+        fd, _ = open_lock(directory / 'chief-of-staff.lock')
+        with os.fdopen(fd, 'rb') as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -401,20 +402,23 @@ class UnsafeLockError(OSError):
 _O = lambda name: getattr(os, name, 0)  # noqa: E731 - flags absent on some platforms
 
 
-def open_lock(path, create=False):
+def open_lock(path, create=False, writable=False):
     """Open an flock file without following links or blocking. Returns (fd, stat).
 
     The parent directory is opened O_DIRECTORY|O_NOFOLLOW and the file through
-    dir_fd, read-only and non-blocking (a FIFO opens immediately), so a planted
+    dir_fd, non-blocking (a FIFO opens immediately), so a planted
     symlink or FIFO can neither redirect nor hang the caller. The file must be
     a regular file owned by the current user with a single link; anything else
-    raises UnsafeLockError. flock works on the read-only descriptor, which is
-    close-on-exec and never handed to a child process.
+    raises UnsafeLockError. flock works on the default read-only descriptor,
+    close-on-exec by default. Chief uses writable=True for its PID record and
+    explicitly passes the validated descriptor to its CLI child. No open
+    truncates the file; callers must acquire ownership before changing it.
     """
     path = Path(path)
     directory = os.open(path.parent, os.O_RDONLY | _O('O_DIRECTORY') | _O('O_NOFOLLOW') | _O('O_CLOEXEC'))
     try:
-        flags = os.O_RDONLY | _O('O_NOFOLLOW') | _O('O_CLOEXEC') | _O('O_NONBLOCK') | (os.O_CREAT if create else 0)
+        flags = ((os.O_RDWR if writable else os.O_RDONLY) | _O('O_NOFOLLOW') |
+                 _O('O_CLOEXEC') | _O('O_NONBLOCK') | (os.O_CREAT if create else 0))
         fd = os.open(path.name, flags, 0o600, dir_fd=directory)
     finally:
         os.close(directory)
