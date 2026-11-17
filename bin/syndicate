@@ -41,6 +41,7 @@ WEB_DIR = HOME_DIR / "web"
 HANDOFF_SKILL = HOME_DIR / "skills" / "syndicate-handoff" / "SKILL.md"
 CHIEF_ROLE = HOME_DIR / "portfolio" / "chief-of-staff.md"
 PROJECT_SKILL = HOME_DIR / "skills" / "syndicate-project" / "SKILL.md"
+CLOSEOUT_SKILL = HOME_DIR / 'skills' / 'syndicate-closeout' / 'SKILL.md'
 INBOX_SKILL = HOME_DIR / 'skills' / 'syndicate-inbox' / 'SKILL.md'
 SCHEDULER_TOOLS = ['CronCreate', 'CronList', 'CronDelete']
 REGISTRY_PATH = Path.home() / ".syndicate" / "projects.json"
@@ -472,6 +473,7 @@ def orchestrator_body(team: Team) -> str:
     body = team.roles["orchestrator"].body + "\n\n" + split_frontmatter(PROJECT_SKILL.read_text())[1]
     if team.config["handoff"] == "on":
         body += "\n\n" + split_frontmatter(HANDOFF_SKILL.read_text())[1]
+    body += "\n\n" + split_frontmatter(CLOSEOUT_SKILL.read_text())[1]
     return body + live_instructions(team.project)
 
 
@@ -687,6 +689,27 @@ def read_status(project_path: str) -> dict | None:
         return None
     if not isinstance(data, dict):
         return None
+    # The notification and task patch share one authoritative atomic commit.
+    # Apply at read time; never overwrite concurrent agent-owned status writes.
+    for record in live.MessageStore(portfolio_dir()).read():
+        patch = record.get('closeout')
+        if record['source_path'] != str(Path(project_path).resolve()) or not patch:
+            continue
+        tasks = data.get('tasks') if isinstance(data.get('tasks'), list) else []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            try:
+                older = datetime.fromisoformat(task.get('updated_at') or '1970-01-01T00:00:00+00:00') <= datetime.fromisoformat(patch['updated_at'])
+            except (ValueError, TypeError):
+                older = False
+            if (task.get('id') == record['task_id'] and task.get('session_id') == record['session_id']
+                    and older):
+                task.update(patch)
+                if ((data.get('current') or {}).get('task_id') == task['id']
+                        and (data.get('current') or {}).get('session_id') == record['session_id']):
+                    data.update(state=patch['state'])
+                    data['current']['summary'] = patch['progress']
     data["_mtime"] = mtime_iso(path)
     return data
 
@@ -704,7 +727,8 @@ def project_tasks(status: dict) -> list[dict]:
         own_pid = active.get("pid")
         active.update(state=status.get("state", active.get("state")),
                       progress=current.get("summary"), pid=status.get("pid"),
-                      updated_at=status.get("_mtime") or active.get("updated_at"))
+                      updated_at=(active.get("updated_at") if active.get("closeout_session") == current.get("session_id")
+                                  and active.get("closeout_session") else status.get("_mtime") or active.get("updated_at")))
         # Owner identity is only meaningful together with the PID it was read for.
         if isinstance(status.get("process_identity"), str) and status.get("pid") is not None:
             active.update({key: status.get(key) for key in OWNER_FIELDS})
@@ -993,7 +1017,7 @@ def gather_statuses(sweep: bool = True) -> list[dict]:
                        key=lambda t: t.get("ended_at") or t.get("updated_at") or "", reverse=True)
         attention = {"waiting_on_user", "blocked", "failed", "unknown"}
         unfinished.sort(key=lambda t: (0 if t.get("state") in attention else 1 if t.get("state") == "running" else 2))
-        label = ("Needs attention" if any(t.get("state") in attention for t in unfinished)
+        label = ("Needs attention" if any(t.get("state") in attention for t in unfinished) or any(t.get("needs_attention") for t in ended)
                  else "Working" if any(t.get("state") == "running" for t in unfinished)
                  else "Queued" if unfinished else "Complete" if completed
                  else "No tasks" if ended or row.get("status_available") or not status_path(Path(row["path"])).exists()
@@ -1347,6 +1371,53 @@ def cmd_messages(args):
     return 0
 
 
+def commit_closeout(project, task_id, session_id, state, progress, message, *, attention=False):
+    """Commit task fields and Chief notification in one messages.json replacement.
+
+    Callers hold coordination.lock and validate ownership there (or are the
+    exiting supervisor). Status readers overlay this commit without rewriting
+    agent-owned status.json, so concurrent unrelated task writes cannot be lost.
+    """
+    if not progress.strip() or not message.strip():
+        raise SyndicateError('Provide nonempty --progress and --message')
+    status = read_status(str(project))
+    current = (status or {}).get('current') or {}
+    task = next((t for t in (status or {}).get('tasks', []) if t.get('id') == task_id), None)
+    if (not task or current.get('task_id') != task_id or current.get('session_id') != session_id
+            or task.get('session_id') != session_id):
+        raise SyndicateError('Closeout must target the current owning task/session')
+    stamp = portfolio.now()
+    patch = dict(state=state, progress=progress, updated_at=stamp,
+                 completed_at=stamp if state in ('done', 'ended') else None,
+                 closeout_session=session_id, needs_attention=attention)
+    if state == 'ended':
+        patch.update(ended_at=stamp, last_state=task.get('state'),
+                     end_reason='session exited' if attention else 'closed by owning session')
+    record = live.MessageStore(portfolio_dir()).update(
+        source_path=str(project), task_id=task_id, session_id=session_id,
+        key='session-closeout', message=message, closeout=patch)
+    return record
+
+
+def cmd_tasks_close(args):
+    project = Path(args.dir).expanduser().resolve()
+    if portfolio.is_chief_record(portfolio_dir(), path=project):
+        raise SyndicateError('Task closeout does not apply to Chief sessions')
+    store = coordination_store()
+    with store.edit(read_only=True) as data:
+        owner = next((s for s in data['sessions'] if s['id'] == args.session
+                      and (s['source_path'], s['task_id']) == (str(project), args.task_id)), None)
+        if not owner or not store.session_live(owner):
+            raise SyndicateError('Closeout requires the owning active task/session')
+        try:
+            record = commit_closeout(project, args.task_id, args.session, args.state,
+                                     args.progress, args.message)
+        except OSError as error:
+            raise SyndicateError(f'Closeout failed before commit: {error}; retry outside the sandbox with approval') from error
+    portfolio_print(json.dumps(record, indent=2))
+    return 0
+
+
 @contextmanager
 def project_session(project, provider, outcome=None):
     """Own the current task's coordination session for one supervised run.
@@ -1392,13 +1463,19 @@ def close_owned_task(project, task_id, reason="session exited") -> bool:
     if (not status or not isinstance(current, dict)
             or current.get("task_id") != task_id or status.get("state") != "running"):
         return False
-    stamp = now_iso()
-    status["state"] = ENDED
-    for task in status.get("tasks") if isinstance(status.get("tasks"), list) else []:
-        if isinstance(task, dict) and task.get("id") == task_id:
-            task.update(state=ENDED, last_state="running", ended_at=stamp, end_reason=reason, updated_at=stamp)
-    status.pop("_mtime", None)
-    runtime.atomic_json(status_path(project), status)
+    task = next((t for t in status.get('tasks', []) if isinstance(t, dict) and t.get('id') == task_id), None)
+    if not task or task.get('state') != 'running':
+        return False
+    session_id = current.get('session_id') or 'legacy-supervised-exit'
+    # Legacy records have no session token; this supervisor owns their exit.
+    if not current.get('session_id') or not task.get('session_id'):
+        current['session_id'] = session_id
+        task['session_id'] = session_id
+        status.pop('_mtime', None)
+        runtime.atomic_json(status_path(project), status)
+    progress = f"{task.get('summary') or task_id}: Session exited without closeout; needs attention. Inspect checkpoint and remaining work."
+    commit_closeout(project, task_id, session_id, 'ended', progress,
+                    f'Task {task_id} needs attention: {progress}', attention=True)
     return True
 
 
@@ -2442,12 +2519,20 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
             command.add_argument("--answer-revision", type=int, required=True,
                                  help="answer_revision incorporated by the owning team")
         command.set_defaults(fn=cmd_decisions)
-    p = cmds.add_parser("tasks", help="list and edit project task assignments")
+    p = cmds.add_parser("tasks", help="list, edit and close project tasks")
     actions = p.add_subparsers(dest="action", required=True)
     listing = actions.add_parser("list")
     listing.add_argument("--project", help="repo name/path or generic")
     listing.add_argument("--json", action="store_true", help="include IDs, source paths, and assignment metadata")
     listing.set_defaults(fn=cmd_tasks)
+    close = actions.add_parser('close', help='atomically close the owned task in the status overlay and notify Chief of Staff')
+    close.add_argument('task_id')
+    close.add_argument('-C', '--dir', default='.')
+    close.add_argument('--session', required=True)
+    close.add_argument('--state', required=True, choices=('done', 'ended', 'waiting_on_user', 'blocked'))
+    close.add_argument('--progress', required=True)
+    close.add_argument('--message', required=True)
+    close.set_defaults(fn=cmd_tasks_close)
     edit = actions.add_parser("edit")
     edit.add_argument("task_id")
     edit.add_argument("--source", help="source directory, required for ambiguous task IDs")

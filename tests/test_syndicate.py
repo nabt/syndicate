@@ -939,16 +939,17 @@ class StaleSessions(ProjectCase):
         task_id = self.current_task_id()
         with sy.project_session(self.project, "codex") as session:
             self.assertTrue(sy.coordination_store().snapshot()["sessions"][0]["live"])
-        status = json.loads(sy.status_path(self.project).read_text())
+        status = sy.read_status(str(self.project))
         task = status["tasks"][-1]
         self.assertEqual(status["state"], "ended")
         self.assertEqual((task["id"], task["state"], task["last_state"], task["end_reason"]),
                          (task_id, "ended", "running", "session exited"))
         self.assertTrue(task["ended_at"])
-        self.assertNotIn("completed_at", task)
+        self.assertTrue(task["completed_at"])
+        self.assertTrue(task["needs_attention"])
         self.assertEqual(sy.coordination_store().read()["sessions"][0]["state"], "ended")
         row = sy.gather_statuses()[0]
-        self.assertEqual((row["unfinished_count"], row["last_completed"], row["project_status"]), (0, None, "No tasks"))
+        self.assertEqual((row["unfinished_count"], row["last_completed"], row["project_status"]), (0, None, "Needs attention"))
         self.assertEqual(row["ended_tasks"][0]["id"], task_id)
         self.assertEqual(row["ended_tasks"][0]["session_id"], session["id"])
 
@@ -1013,7 +1014,7 @@ class StaleSessions(ProjectCase):
         self.assertTrue(seen["lock_owned"])
         for key in ("status_child", "task_child", "session_child"):
             self.assertEqual((seen[key]["pid"], seen[key]["process_identity"]), (child.pid, identity))
-        status = json.loads(sy.status_path(self.project).read_text())
+        status = sy.read_status(str(self.project))
         self.assertEqual(status["state"], "ended")
         self.assertEqual(status["lock_inode"], [lock_path.stat().st_dev, seen["inode"]])
         self.assertEqual(status["process_identity"], sy.portfolio.process_identity(os.getpid()))

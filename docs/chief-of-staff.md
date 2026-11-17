@@ -610,3 +610,31 @@ Acknowledgment, failure, retry and send retain their ownership checks. When thos
 checks cannot see host PIDs, rerun outside the sandbox with normal approval;
 never infer a dead owner from hidden PIDs. Reconciliation write failures print
 an explicit error and approval path, rather than silently claiming persistence.
+
+## Reliable session closeout
+
+Both provider orchestrators load `skills/syndicate-closeout/SKILL.md` and run
+its ordered checklist before ending. `syndicate tasks close TASK_ID -C SOURCE
+--session SESSION_ID --state done --progress "Evidence and remaining work"
+--message "Outcome and requester next action"` validates active source/task/session
+ownership under the coordination lock. States are done, ended, waiting_on_user
+and blocked. Only done/ended receive completed_at; ended never means success.
+
+The task patch and Chief inbox message commit together in one atomic replacement
+of portfolio messages.json. Status readers apply this authoritative overlay to
+the matching task/session unless a newer task write supersedes it. The command
+never rewrites agent-owned status.json, preserving concurrently added tasks and
+history. Raw status.json is the agent's last report; use `tasks list`, `briefing`
+or dashboards for effective state, just as with management task edits. A failed
+commit changes neither effective state nor inbox. Identical retries while the
+session is active return the same record without a duplicate notification; no
+post-commit repair is necessary. Corrupt inbox data fails loudly. Explicit
+management task edits retain precedence. A resumed session uses a new token so
+old closeouts cannot end it.
+
+A supervised project exit with an unclosed running task records ended with
+needs_attention and sends a Chief message. Explicit task states, deliberate
+handoffs and Chief sessions are preserved. Unknown or sandbox-hidden owners
+remain unverified under the existing liveness rules. Abrupt exits without a
+supervisor still use the existing stale-session reconciliation; they cannot run
+an exit hook. The safety net does not imply implementation or test success.

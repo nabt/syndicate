@@ -30,6 +30,38 @@ def endpoint_edit(path):
             runtime.atomic_json(path, record)
 
 
+CLOSEOUT_KEYS = {'state', 'progress', 'updated_at', 'completed_at', 'closeout_session',
+                 'needs_attention', 'ended_at', 'last_state', 'end_reason'}
+
+
+def valid_closeout(record):
+    if 'closeout' not in record:
+        return True
+    patch = record['closeout']
+    if (not isinstance(patch, dict) or set(patch) - CLOSEOUT_KEYS
+            or not {'state', 'progress', 'updated_at', 'completed_at',
+                    'closeout_session', 'needs_attention'} <= set(patch)
+            or patch['state'] not in ('done', 'ended', 'waiting_on_user', 'blocked')
+            or patch['closeout_session'] != record.get('session_id')
+            or not isinstance(patch['needs_attention'], bool)
+            or not all(isinstance(patch.get(k), str) and patch[k].strip()
+                       for k in ('progress', 'updated_at'))):
+        return False
+    try:
+        for key in ('updated_at', 'completed_at', 'ended_at'):
+            value = patch.get(key)
+            if value is not None and portfolio.datetime.fromisoformat(value).tzinfo is None:
+                return False
+        if patch['state'] in ('done', 'ended'):
+            if not isinstance(patch['completed_at'], str):
+                return False
+        elif patch['completed_at'] is not None:
+            return False
+        return all(isinstance(patch[k], str) for k in ('last_state', 'end_reason') if k in patch)
+    except (ValueError, TypeError):
+        return False
+
+
 class MessageStore:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -44,7 +76,7 @@ class MessageStore:
                 not isinstance(r, dict) or
                 not all(isinstance(r.get(k), str) and r[k] for k in
                         ('id', 'key', 'message', 'source_path', 'task_id', 'session_id', 'created_at')) or
-                r.get('state') not in ('pending', 'acknowledged') for r in records
+                (r.get('state') not in ('pending', 'acknowledged') or not valid_closeout(r)) for r in records
             ):
                 raise ValueError('invalid message records')
             return records
@@ -52,6 +84,8 @@ class MessageStore:
             raise portfolio.PortfolioError(f'Cannot read messages: {error}') from error
 
     def update(self, *, message_id=None, **fields):
+        if not message_id and not valid_closeout(fields):
+            raise portfolio.PortfolioError('Invalid closeout payload')
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         with (self.directory / 'messages.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -64,7 +98,9 @@ class MessageStore:
             else:
                 record = next((r for r in records if all(r[k] == fields[k] for k in
                               ('source_path', 'task_id', 'session_id', 'key'))), None)
-                if record and record['message'] != fields['message']:
+                if record and (record['message'] != fields['message'] or
+                               (fields.get('closeout') and any(record.get('closeout', {}).get(k) != fields['closeout'].get(k)
+                                for k in ('state', 'progress', 'needs_attention')))):
                     raise portfolio.PortfolioError('This key identifies another message; use a new key')
                 if not record:
                     record = dict(fields, id=uuid.uuid4().hex, state='pending', created_at=portfolio.now())

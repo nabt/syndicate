@@ -558,13 +558,14 @@ class CoordinationStore:
         return data
 
     @contextmanager
-    def edit(self):
+    def edit(self, *, read_only=False):
         self.directory.mkdir(parents=True, exist_ok=True)
         with (self.directory / 'coordination.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             data = self.read()
             yield data
-            runtime.atomic_json(self.path, data)
+            if not read_only:
+                runtime.atomic_json(self.path, data)
 
     def update_brief(self, project_path, changes, revision=None):
         if not changes or any(k not in ('goal', 'priority', *BRIEF_LIST_FIELDS) for k in changes):
