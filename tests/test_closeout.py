@@ -81,6 +81,139 @@ class Closeout(ProjectCase):
         self.assertEqual(sy.read_status(str(self.project))['state'], 'done')
         self.assertEqual(len(self.messages()), 1)
 
+    def rewrite_running_report(self, updated_at):
+        status = json.loads(sy.status_path(self.project).read_text())
+        status['current']['summary'] = 'Closing out...'
+        next(task for task in status['tasks'] if task['id'] == self.task_id)['updated_at'] = updated_at
+        sy.runtime.atomic_json(sy.status_path(self.project), status)
+
+    def test_live_closeout_wins_over_newer_same_session_report(self):
+        sy.register_project(self.project)
+        self.close()
+        self.rewrite_running_report('2099-01-01T00:00:00Z')
+        args = sy.build_parsers()[1].parse_args(['tasks', 'list', '--json'])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            sy.cmd_tasks(args)
+        task = next(t for t in json.loads(output.getvalue()) if t['id'] == self.task_id)
+        self.assertEqual(task['state'], 'done')
+        self.assertEqual(task['progress'], self.messages()[0]['closeout']['progress'])
+        row, = sy.gather_statuses(sweep=False)
+        self.assertEqual(row['state'], 'done')
+        self.assertEqual(row['completed_tasks'][0]['id'], self.task_id)
+        briefing, = sy.project_briefing()['projects']
+        self.assertEqual((briefing['task_id'], briefing['report_state']), (self.task_id, 'done'))
+
+    def test_briefing_selects_closed_active_task_ahead_of_queued_work(self):
+        sy.register_project(self.project)
+        self.close()
+        briefing, = sy.project_briefing()['projects']
+        self.assertEqual((briefing['task_id'], briefing['report_state']), (self.task_id, 'done'))
+
+    def test_waiting_closeout_survives_stale_session_sweep(self):
+        sy.register_project(self.project)
+        self.close('waiting_on_user')
+        sy.coordination_store().end_session(self.session_id)
+        row, = sy.gather_statuses()
+        task = next(t for t in row['tasks'] if t['id'] == self.task_id)
+        self.assertEqual(task['state'], 'waiting_on_user')
+        self.assertIsNone(task['completed_at'])
+        self.assertNotIn(self.task_id, [task['id'] for task in row['ended_tasks']])
+
+    def test_later_launch_can_supersede_a_waiting_closeout(self):
+        sy.register_project(self.project)
+        self.close('waiting_on_user')
+        sy.coordination_store().end_session(self.session_id)
+        sy.write_status_stub(self.project, 2**30, 'Another task')
+        row, = sy.gather_statuses()
+        task = next(t for t in row['ended_tasks'] if t['id'] == self.task_id)
+        self.assertEqual(task['last_state'], 'waiting_on_user')
+        self.assertEqual(self.messages()[0]['closeout']['state'], 'waiting_on_user')
+
+    def supervise(self, action):
+        sy.coordination_store().end_session(self.session_id)
+        args = sy.build_parsers()[0].parse_args(['--project', str(self.project), 'Closeout regression'])
+
+        def run(_args):
+            with sy.project_session(self.project, 'claude') as session:
+                self.task_id = session['task_id']
+                self.session_id = session['id']
+                action()
+            return 0
+
+        with patch.object(sy, 'run_session', side_effect=run):
+            self.assertEqual(sy.cmd_run(args), 0)
+
+    def send_message(self, key):
+        return sy.live.MessageStore(sy.portfolio_dir()).update(
+            source_path=str(self.project), task_id=self.task_id, session_id=self.session_id,
+            key=key, message='Verified outcome')
+
+    def test_supervised_exit_preserves_existing_closeout(self):
+        for state in ('done', 'ended', 'waiting_on_user', 'blocked'):
+            with self.subTest(state=state):
+                def close_and_report():
+                    self.close(state)
+                    self.rewrite_running_report('2099-01-01T00:00:00Z')
+
+                self.supervise(close_and_report)
+                status = sy.read_status(str(self.project))
+                self.assertEqual(status['state'], state)
+                records = [r for r in self.messages() if r['session_id'] == self.session_id]
+                self.assertEqual([r['closeout']['state'] for r in records], [state])
+
+    def test_later_different_key_message_does_not_break_supervised_exit(self):
+        def close_and_send():
+            self.close()
+            self.send_message('pr33-merge-verified')
+            self.rewrite_running_report('2099-01-01T00:00:00Z')
+
+        self.supervise(close_and_send)
+        self.assertEqual(sy.read_status(str(self.project))['state'], 'done')
+        self.assertEqual([r['key'] for r in self.messages()],
+                         ['session-closeout', 'pr33-merge-verified'])
+
+    def test_supervised_exit_reuses_an_existing_same_key_message(self):
+        existing = []
+        self.supervise(lambda: existing.append(self.send_message('session-closeout')))
+        record, = self.messages()
+        self.assertEqual(record, existing[0])
+        self.assertEqual(sy.read_status(str(self.project))['state'], 'running')
+        row = next(row for row in sy.gather_statuses() if row['path'] == str(self.project))
+        self.assertIn(self.task_id, [task['id'] for task in row['ended_tasks']])
+
+    def test_exit_notification_failure_does_not_record_launch_failure(self):
+        with patch.object(sy.live.MessageStore, 'update', side_effect=OSError('disk full')), \
+                contextlib.redirect_stderr(io.StringIO()) as output:
+            self.supervise(lambda: None)
+        self.assertIn('disk full', output.getvalue())
+        self.assertEqual(sy.read_status(str(self.project))['state'], 'running')
+        self.assertEqual(self.messages(), [])
+
+    def test_supervisor_exception_after_closeout_leaves_raw_report_alone(self):
+        reports = []
+
+        def close_then_fail():
+            self.close()
+            reports.append(sy.status_path(self.project).read_bytes())
+            raise OSError('supervisor cleanup failed')
+
+        with self.assertRaisesRegex(OSError, 'supervisor cleanup failed'):
+            self.supervise(close_then_fail)
+        self.assertEqual(sy.status_path(self.project).read_bytes(), reports[0])
+        self.assertEqual(sy.read_status(str(self.project))['state'], 'done')
+
+    def test_launch_failure_requires_a_committed_closeout_to_skip_failure_write(self):
+        def fail_with_raw_marker():
+            status = json.loads(sy.status_path(self.project).read_text())
+            status['tasks'][-1]['closeout_session'] = self.session_id
+            sy.runtime.atomic_json(sy.status_path(self.project), status)
+            raise OSError('supervisor launch failed')
+
+        with self.assertRaisesRegex(OSError, 'supervisor launch failed'):
+            self.supervise(fail_with_raw_marker)
+        self.assertEqual(sy.read_status(str(self.project))['state'], 'failed')
+        self.assertEqual(self.messages(), [])
+
     def test_concurrent_unrelated_task_addition_survives_commit(self):
         original_update = sy.live.MessageStore.update
         def add_task(store, **fields):
@@ -149,6 +282,28 @@ class Closeout(ProjectCase):
             pass
         self.assertEqual(sy.read_status(str(self.project))['state'], 'running')
         self.assertEqual(self.messages(), [])
+
+    def test_resume_clears_prior_closeout_before_claiming_task(self):
+        self.close('ended')
+        sy.coordination_store().end_session(self.session_id)
+        handoff = self.project / '.syndicate' / 'handoffs' / 'run'
+        handoff.mkdir(parents=True)
+        (handoff / 'status.json').write_text(json.dumps(self.original))
+        args = sy.build_parsers()[0].parse_args(
+            ['--project', str(self.project), '--handoff', str(handoff)])
+
+        def run(_args):
+            with sy.project_session(self.project, 'codex', {'handoff': True}):
+                status = sy.read_status(str(self.project))
+                task = next(t for t in status['tasks'] if t['id'] == self.task_id)
+                self.assertEqual((status['state'], task['state']), ('running', 'running'))
+                self.assertNotEqual(task['session_id'], self.session_id)
+                self.assertNotIn('closeout_session', task)
+                self.assertNotIn('completed_at', task)
+            return 0
+
+        with patch.object(sy, 'run_session', side_effect=run):
+            self.assertEqual(sy.cmd_run(args), 0)
 
     def test_both_providers_load_closeout_even_without_handoff(self):
         self.config('handoff = off\n')

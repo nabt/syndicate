@@ -138,13 +138,15 @@ def task_identity(task, project_path):
 def current_task(row, sessions=()):
     """Current ownership wins over attention ordering; old blockers remain in tasks."""
     tasks = row.get('tasks', [])
+    closed = [task for task in row.get('completed_tasks', []) + row.get('ended_tasks', [])
+              if task.get('closeout_session') and task['closeout_session'] == task.get('session_id')]
     for session in reversed(sessions):
         if session.get('live'):
-            match = next((task for task in tasks if task_identity(task, row.get('path')) ==
+            match = next((task for task in tasks + closed if task_identity(task, row.get('path')) ==
                           (session['source_path'], session['task_id'])), None)
             if match:
                 return match
-    reported = [task for task in tasks if task.get('is_current')]
+    reported = [task for task in tasks + closed if task.get('is_current')]
     reported_current = row.get('current') or {}
     current_id = reported_current.get('task_id') if isinstance(reported_current, dict) else None
     identified = [task for task in tasks if task.get('id') == current_id] if current_id else []

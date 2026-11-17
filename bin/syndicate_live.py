@@ -83,7 +83,7 @@ class MessageStore:
         except (OSError, ValueError) as error:
             raise portfolio.PortfolioError(f'Cannot read messages: {error}') from error
 
-    def update(self, *, message_id=None, **fields):
+    def update(self, *, message_id=None, reuse_for_exit=False, **fields):
         if not message_id and not valid_closeout(fields):
             raise portfolio.PortfolioError('Invalid closeout payload')
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -98,6 +98,8 @@ class MessageStore:
             else:
                 record = next((r for r in records if all(r[k] == fields[k] for k in
                               ('source_path', 'task_id', 'session_id', 'key'))), None)
+                if record and reuse_for_exit:
+                    return dict(record)
                 if record and (record['message'] != fields['message'] or
                                (fields.get('closeout') and any(record.get('closeout', {}).get(k) != fields['closeout'].get(k)
                                 for k in ('state', 'progress', 'needs_attention')))):
