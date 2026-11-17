@@ -64,7 +64,11 @@ launch races. Project teams run independently.
 Normal exit clears the PID record. After a crash, the kernel releases ownership
 when all holders exit; the next session replaces stale or malformed PID contents.
 A reused PID alone never blocks startup. The lock file stays in place to avoid
-inode races between concurrent launchers. A retained `chief-of-staff-work` tmux
+inode races between concurrent launchers. Launches, probes, and status reads
+reject symlink locks, nonregular files (including FIFOs), files owned by another
+user, multiple hardlinks, and a symlinked portfolio parent directory. Opens are
+nonblocking and never truncate; only a validated lock owner writes or clears the
+PID. Unsafe ownership records appear as `unavailable` in views. A retained `chief-of-staff-work` tmux
 session can be replaced automatically only when every pane is dead; live panes
 are never removed automatically.
 
