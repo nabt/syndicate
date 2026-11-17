@@ -364,8 +364,12 @@ def stop_group(proc, known=None):
     proc.wait()
 
 
-def supervise(argv, project, providers, threshold, task, host, headless=False, live=None, pass_fds=()):
-    """Proxy a CLI terminal while keeping monitoring outside the model loop."""
+def supervise(argv, project, providers, threshold, task, host, headless=False, live=None, pass_fds=(),
+              on_start=None):
+    """Proxy a CLI terminal while keeping monitoring outside the model loop.
+
+    on_start(pid), if given, is called once the CLI child has been started,
+    so the caller can record it as an owner of the session."""
     run_id = time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     local = project / ".syndicate"
     (local / "runs").mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -432,6 +436,12 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
     if notice_file.exists():
         notices_offset = notice_file.stat().st_size
     try:
+        # Inside the try: an interrupt while recording the owner still stops the CLI.
+        if on_start is not None:
+            try:
+                on_start(proc.pid)
+            except Exception as error:  # recording ownership must never orphan the CLI
+                print(f"syndicate: could not record the CLI owner: {error}", file=sys.stderr)
         if interactive:
             tty.setraw(sys.stdin)
         with (local / "runs" / f"{run_id}.log").open("wb") as log:

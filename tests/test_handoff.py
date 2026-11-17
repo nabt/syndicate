@@ -192,6 +192,53 @@ class RuntimeIntegration(ProjectCase):
         self.assertEqual(result, 0)
         self.assertIsNone(handoff)
 
+    def test_on_start_gets_child_pid_and_cannot_orphan_the_cli(self):
+        rt.save_observation("claude", {"rate_limits": {"five_hour": {"used_percentage": 20}}})
+        marker = self.project / "child-pid"
+
+        def supervise(code, on_start):
+            with patch("sys.stdout", self.out), patch("sys.stderr", self.err):
+                return rt.supervise([sys.executable, "-c", code], self.project, {"claude"}, 10,
+                                    "Finish feature", "claude", headless=True, on_start=on_start)
+
+        def gone(pid):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            return False
+
+        def kill_leftover(pid):
+            if not gone(pid):
+                os.kill(pid, signal.SIGKILL)
+        seen = []
+        code, handoff = supervise(f"import os,pathlib; pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))",
+                                  seen.append)
+        self.assertEqual((code, handoff), (0, None))
+        self.assertEqual(seen, [int(marker.read_text())])
+        # A failure to record the owner is reported; the CLI keeps running to completion.
+        code, handoff = supervise("pass", lambda pid: (_ for _ in ()).throw(RuntimeError("store down")))
+        self.assertEqual((code, handoff), (0, None))
+        self.err.flush()
+        self.assertIn(b"could not record the CLI owner", self.err.buffer.getvalue())
+        for error in (KeyboardInterrupt, SystemExit):
+            pids = []
+
+            def interrupted(pid):
+                pids.append(pid)
+                self.addCleanup(kill_leftover, pid)
+                raise error()
+            started = time.monotonic()
+            if error is KeyboardInterrupt:
+                _, handoff = supervise("import time; time.sleep(30)", interrupted)
+                self.assertIn("Interrupted by user", (handoff / "handoff.md").read_text())
+            else:
+                with self.assertRaises(SystemExit):
+                    supervise("import time; time.sleep(30)", interrupted)
+            self.assertLess(time.monotonic() - started, 15)
+            self.assertEqual(len(pids), 1)
+            self.assertTrue(gone(pids[0]), f"{error.__name__} in on_start left the CLI running")
+
     def test_headless_output_and_exit_status_preserved(self):
         rt.save_observation("claude", {"rate_limits": {"five_hour": {"used_percentage": 20}}})
         code, handoff = self.run_cli("import sys; print('result'); print('diagnostic', file=sys.stderr)")
