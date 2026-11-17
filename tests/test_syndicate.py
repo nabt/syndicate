@@ -485,12 +485,21 @@ class LaunchCommands(ProjectCase):
         mixed = sy.build_codex(sy.resolve_team(self.project, "codex"), False, [])
         self.assertIn("sandbox_workspace_write.network_access=true", mixed)
 
-    def test_codex_native_reviewer_is_read_only(self):
+    def test_codex_native_reviewer_uses_isolated_relay(self):
         self.config("default = codex\n")
         sy.build_codex(sy.resolve_team(self.project, "codex"), False, [])
         gen = self.project / ".syndicate" / ".generated" / "codex"
-        self.assertIn('sandbox_mode = "read-only"', (gen / "code-reviewer.toml").read_text())
-        self.assertIn('sandbox_mode = "workspace-write"', (gen / "backend-engineer.toml").read_text())
+        self.assertIn("run-role code-reviewer", (gen / "code-reviewer.toml").read_text())
+        import tomllib
+        reviewer = tomllib.loads((gen / "code-reviewer.toml").read_text())
+        self.assertEqual(reviewer["sandbox_mode"], "read-only")
+        self.assertNotIn("sandbox_workspace_write", reviewer)
+        self.assertIn("outside the sandbox", reviewer["developer_instructions"])
+        self.assertIn("request normal approval", reviewer["developer_instructions"])
+        writer = tomllib.loads((gen / "backend-engineer.toml").read_text())
+        self.assertEqual(writer["sandbox_mode"], "workspace-write")
+        self.assertEqual(writer["sandbox_workspace_write"]["writable_roots"],
+                         [str(sy.REGISTRY_PATH.parent / "portfolio")])
 
     def test_codex_removes_stale_agent_files(self):
         self.config("orchestrator = codex\n")
@@ -507,6 +516,61 @@ class LaunchCommands(ProjectCase):
         sy.build_codex(sy.resolve_team(self.project, "codex"), False, [])
         toml = tomllib.loads((self.project / ".syndicate/.generated/codex/data-engineer.toml").read_text())
         self.assertEqual(toml["developer_instructions"], 'line1\n"quoted" \\ back')
+
+    def test_reported_outcome_rule_reaches_both_providers(self):
+        team = sy.resolve_team(self.project)
+        claude = sy.build_claude(team, False, [])
+        prompt = json.loads(claude[claude.index("--agents") + 1])["orchestrator"]["prompt"]
+        codex = sy.build_codex(team, False, [])
+        codex_prompt = next(a for a in codex if a.startswith("developer_instructions="))
+        for payload in (prompt, codex_prompt):
+            for rule in ("Requester-reported external outcomes", "gh pr view NUMBER",
+                         "before confirming", "If either durable write fails",
+                         "matching task's status/progress", "remains unverified"):
+                self.assertIn(rule, payload)
+
+    def test_task_closure_write_failure_is_explicit(self):
+        output = io.StringIO()
+        with unittest.mock.patch.object(sy, "registry_lock", side_effect=PermissionError("denied")), contextlib.redirect_stderr(output):
+            sy.persist_task_closures([("source", "task", {})])
+        self.assertIn("could not persist task closures", output.getvalue())
+        self.assertIn("outside the sandbox with approval", output.getvalue())
+
+    def test_codex_scratch_denial_explains_approval_path(self):
+        self.config("default = codex\n")
+        args = argparse.Namespace(dir=str(self.project), role="code-reviewer", runtime=None, brief="review")
+        with unittest.mock.patch.object(sy, "require_clis"), \
+             unittest.mock.patch.object(sy.tempfile, "TemporaryDirectory", side_effect=PermissionError("denied")):
+            with self.assertRaisesRegex(sy.SyndicateError, "outside the sandbox with approval"):
+                sy.cmd_run_role(args)
+
+    def test_codex_reviewer_can_write_only_scratch(self):
+        self.config("default = codex\n")
+        args = argparse.Namespace(dir=str(self.project), role="code-reviewer", runtime=None, brief="review")
+        def run(argv, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            self.assertNotEqual(cwd, self.project)
+            self.assertEqual(cwd.parent, sy.REGISTRY_PATH.parent / "portfolio/scratch")
+            self.assertTrue(cwd.is_dir())
+            self.assertEqual(argv[argv.index("-C") + 1], str(cwd))
+            roots = [argv[i+1] for i, a in enumerate(argv) if a == "--add-dir"]
+            self.assertEqual(roots, [str(cwd)])
+            self.assertEqual(kwargs["env"]["TMPDIR"], str(cwd))
+            self.assertIn("sandbox_workspace_write.exclude_slash_tmp=true", argv)
+            self.assertIn("sandbox_workspace_write.exclude_tmpdir_env_var=true", argv)
+            instructions = next(a for a in argv if a.startswith("developer_instructions="))
+            self.assertIn(str(self.project), instructions)
+            for rule in ("AGENTS.md", "AGENTS.override.md", "ancestors and root", "nested instruction files"):
+                self.assertIn(rule, instructions)
+            (cwd / "fixture").write_text("test")
+            return subprocess.CompletedProcess(argv, 0)
+        # execution_project invokes git; only mock the specialist subprocess.
+        real_run = subprocess.run
+        def dispatch(argv, **kwargs):
+            return run(argv, **kwargs) if argv[0] == "codex" else real_run(argv, **kwargs)
+        with unittest.mock.patch.object(sy, "require_clis"), unittest.mock.patch.object(sy.subprocess, "run", side_effect=dispatch):
+            self.assertEqual(sy.cmd_run_role(args), 0)
+        self.assertEqual(list((sy.REGISTRY_PATH.parent / "portfolio/scratch").iterdir()), [])
 
 
 class StatusAndRegistry(ProjectCase):
@@ -582,13 +646,13 @@ class StatusAndRegistry(ProjectCase):
         task = sy.gather_statuses()[0]["tasks"][0]
         self.assertFalse(task["needs_project"])
 
-    def test_relay_run_registers_before_cli_failure(self):
+    def test_relay_run_does_not_take_registry_lock(self):
         subprocess.run(["git", "init", "-q", str(self.project)], check=True)
         args = argparse.Namespace(dir=str(self.project), role="backend-engineer", runtime=None, brief="work")
         with unittest.mock.patch.object(sy, "require_clis", side_effect=sy.SyndicateError("missing CLI")):
             with self.assertRaises(sy.SyndicateError):
                 sy.cmd_run_role(args)
-        self.assertEqual(sy.load_registry()[0]["path"], str(self.project))
+        self.assertEqual(sy.load_registry(), [])
 
     def test_handoff_resumes_existing_task(self):
         sy.register_workspace(self.project)
@@ -1090,8 +1154,14 @@ class StaleSessions(ProjectCase):
         row = next(r for r in sy.gather_statuses() if r["tasks"])
         self.assertEqual((row["tasks"][0]["state"], row["tasks"][0]["liveness"]), ("running", "unknown"))
         self.assertFalse(self.edits_path().exists())
-        sy.write_status_stub(self.project, os.getpid(), "later launch")
-        rows = sy.gather_statuses()
+        # The test runner itself can be PID 2 in a sandbox. Use a child so
+        # supersession really has a different PID from the legacy owner.
+        proc, _ = spawn_owner()
+        try:
+            sy.write_status_stub(self.project, proc.pid, "later launch")
+            rows = sy.gather_statuses()
+        finally:
+            reap(proc)
         ended = next(t for r in rows for t in r["ended_tasks"] if t["id"] == "legacy-request")
         self.assertEqual(ended["end_reason"], f"superseded by task {self.current_task_id()}")
         self.assertEqual(ended["last_state"], "running")

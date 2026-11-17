@@ -179,8 +179,10 @@ tools: Read, Edit, Write, Bash, Grep, Glob
 - `tools` is a comma-separated list of Claude Code tool names (`Read, Edit,
   Write, Bash, Grep, Glob, WebFetch, WebSearch, Agent`). It limits the role
   under Claude, and decides its Codex sandbox: any of `Edit`/`Write` gives
-  `workspace-write`, otherwise `read-only`. Omit it and the role gets full
-  tools / `workspace-write`.
+  `workspace-write`. Roles without them run through an isolated Codex relay:
+  the child has a disposable scratch workspace outside the source repository,
+  so tests can write temporary files while source files stay read-only. Omit
+  `tools` and the role gets full tools / `workspace-write`.
 
 ### `.syndicate/roles/<role>.append.md`: add guidance without forking the role
 
@@ -296,3 +298,29 @@ orchestrators can record shared decisions, briefs, and request receipts while
 keeping their project workspace sandbox. Claude orchestrators include Bash for
 these supported CLI workflows. Project role overrides that explicitly restrict
 tools must retain Bash when using coordination commands.
+
+
+Codex specialists do not register the project again: `team run-role` reads the
+existing project configuration without taking the user-wide registry lock.
+Registry-changing commands still require host approval if the sandbox denies
+them; no write access to all of `~/.syndicate` is granted. Generated native
+writing agent configs explicitly retain the portfolio writable root. Read-only
+Codex roles use a read-only relay even when both CLIs are Codex, without granting
+portfolio writes or enabling network access. If the sandbox blocks scratch
+creation or the child CLI's API connection, the relay requests normal approval
+to run the exact `run-role` command outside the sandbox; if approval is unavailable,
+it reports the failure to the orchestrator. Cross-provider relays retain their
+existing workspace and network settings.
+
+A standalone Codex specialist gets a unique temporary workspace under
+`~/.syndicate/portfolio/scratch/`, removed when it exits. `TMPDIR` points there;
+bytecode writes are disabled, and implicit `/tmp` and inherited `TMPDIR` sandbox
+write roots are disabled. A reviewer child has only its scratch workspace
+writable, not the repository or the rest of the portfolio. Run source checks
+against the source path in its instructions and direct outputs to scratch.
+Because its working directory is outside the source project, the child is
+explicitly instructed to read applicable ancestor, root and nested `AGENTS.md`
+and `AGENTS.override.md` files before review. Source project `.codex` configuration
+is not discovered from scratch; configured Syndicate CLI options still apply.
+Source-changing tests need an isolated fixture/copy or explicit host approval.
+Writing specialist children retain the project and portfolio roots.

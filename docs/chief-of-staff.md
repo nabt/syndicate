@@ -590,3 +590,23 @@ and task identity.
 The current launcher loads `roles/*.md` into project teams. The separate
 `chief-of-staff` launch path loads `portfolio/chief-of-staff.md` instead, so it
 does not become a specialist under every project orchestrator.
+
+
+## Recording requester-reported outcomes
+
+Project orchestrators on both providers verify reported external outcomes with
+authoritative tooling before confirming them. For example, a reported PR merge
+is checked with `gh pr view`, then its URL, state, merge time/commit and remaining
+work are recorded in the affected task progress and project checkpoint. Older
+affected task records are reconciled without changing ownership fields. A merge
+does not by itself establish deployment or completion of every task requirement.
+Verification failures or contradictions are recorded as unverified; failed
+status/checkpoint writes are explicitly reported instead of confirming durable
+recording.
+
+`requests list` is a read-only view and tolerates PID namespace isolation:
+unknown target ownership is shown as `unverified`, without changing records.
+Acknowledgment, failure, retry and send retain their ownership checks. When those
+checks cannot see host PIDs, rerun outside the sandbox with normal approval;
+never infer a dead owner from hidden PIDs. Reconciliation write failures print
+an explicit error and approval path, rather than silently claiming persistence.
