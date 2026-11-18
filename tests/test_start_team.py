@@ -60,30 +60,42 @@ class TeamTasks(ProjectCase):
              patch.object(sy.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
             with self.assertRaisesRegex(sy.SyndicateError, 'already exists'):
                 sy.launch_tmux([], self.project, 'example-work')
-            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_count, 2)
 
     def test_dead_chief_tmux_panes_are_recovered(self):
         with patch.object(sy.shutil, 'which', return_value='/usr/bin/tmux'), \
              patch.object(sy.subprocess, 'run', side_effect=[
                  subprocess.CompletedProcess([], 0),
-                 subprocess.CompletedProcess([], 0, '1\n1\n', ''),
+                 subprocess.CompletedProcess([], 0, '$2:1:\n$2:1:\n', ''),
                  subprocess.CompletedProcess([], 0, '', ''),
                  subprocess.CompletedProcess([], 0, '', '')]) as run, \
              patch.object(sy.sys.stdin, 'isatty', return_value=False), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(sy.launch_tmux([], self.project, 'chief-of-staff-work'), 0)
         self.assertEqual(run.call_args_list[2].args[0],
-                         ['tmux', 'kill-session', '-t', '=chief-of-staff-work'])
+                         ['tmux', 'kill-session', '-t', '$2'])
         self.assertEqual(run.call_args_list[3].args[0][1], 'new-session')
 
     def test_live_chief_tmux_pane_is_never_removed(self):
         with patch.object(sy.shutil, 'which', return_value='/usr/bin/tmux'), \
              patch.object(sy.subprocess, 'run', side_effect=[
                  subprocess.CompletedProcess([], 0),
-                 subprocess.CompletedProcess([], 0, '1\n0\n', '')]) as run:
+                 subprocess.CompletedProcess([], 0, '$2:1:1\n$2:0:\n', '')]) as run:
             with self.assertRaisesRegex(sy.SyndicateError, 'already exists'):
                 sy.launch_tmux([], self.project, 'chief-of-staff-work')
         self.assertEqual(run.call_count, 2)
+
+    def test_dead_project_reserve_pane_is_replaced(self):
+        with patch.object(sy.shutil, 'which', return_value='/usr/bin/tmux'), \
+             patch.object(sy.subprocess, 'run', side_effect=[
+                 subprocess.CompletedProcess([], 0),
+                 subprocess.CompletedProcess([], 0, '$3:1:1\n', ''),
+                 subprocess.CompletedProcess([], 0, '', ''),
+                 subprocess.CompletedProcess([], 0, '', '')]) as run, \
+             patch.object(sy.sys.stdin, 'isatty', return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sy.launch_tmux([], self.project, 'example-work'), 0)
+        self.assertEqual(run.call_args_list[2].args[0], ['tmux', 'kill-session', '-t', '$3'])
 
     def test_internal_execution_does_not_nest_tmux(self):
         with patch.object(sy, 'tmux_enabled', return_value=True), \
