@@ -9,8 +9,15 @@ channel, and briefing/inbox views in both dashboards. The Chief of Staff agent r
 For a new task without a running team, the Chief of Staff asks whether you want
 to start a Syndicate team. After approval it runs
 `syndicate team task --project PROJECT "task brief"`, which starts the CLI in a
-detached tmux session named `<project_name>-work`. Use `-x claude` or `-x codex`
-to select a provider. A live team is reused without launching another CLI;
+detached tmux session named `<project_name>-work`. When you ask for the team on
+a specific CLI (for example "start a team on codex"), it runs
+`syndicate team task -x codex --all-runtime codex --project PROJECT "task brief"`
+(or the `claude` equivalent) so the orchestrator and every specialist run on
+that CLI; `-x` alone moves only the orchestrator. The flags must come before the
+brief, because anything after it is passed to the provider CLI and ignored by
+Syndicate.
+Without a requested CLI, both flags are omitted and roles keep their configured
+providers. A live team is reused without launching another CLI;
 an existing tmux name without a verified live team is reported for inspection.
 Tmux is enabled globally by default; set `tmux = off` in the user config to run directly. Unsupported session-name punctuation becomes hyphens.
 Existing teams receive requests through their orchestrator, which decides
