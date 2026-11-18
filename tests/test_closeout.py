@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+from itertools import product
 from unittest.mock import patch
 
 from test_syndicate import ProjectCase, sy
@@ -22,9 +23,12 @@ class Closeout(ProjectCase):
         self.original = status
 
     def close(self, state='done', **overrides):
+        participants = (['--implementation', 'backend-engineer', 'codex', 'implementer-42',
+                         '--review', 'code-reviewer', 'codex', 'reviewer-73'] if state == 'done' else [])
         args = sy.build_parsers()[1].parse_args(['tasks', 'close', self.task_id,
             '-C', str(self.project), '--session', self.session_id, '--state', state,
-            '--progress', 'Verified tests; no remaining work', '--message', 'Completed: evidence'])
+            '--progress', 'Verified tests; no remaining work', '--message', 'Completed: evidence',
+            *participants])
         for key, value in overrides.items():
             setattr(args, key, value)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -42,6 +46,12 @@ class Closeout(ProjectCase):
         self.assertEqual(len(self.messages()), 1)
         task = second['tasks'][0]
         self.assertEqual(task['state'], 'done')
+        self.assertEqual(task['role_participants'], {
+            'implementation': [dict(role='backend-engineer', provider='codex', participant_id='implementer-42')],
+            'review': [dict(role='code-reviewer', provider='codex', participant_id='reviewer-73')],
+        })
+        self.assertEqual(self.messages()[0]['closeout']['role_participants'], task['role_participants'])
+        self.assertIn('code-reviewer (codex, reviewer-73)', self.messages()[0]['message'])
         self.assertTrue(task['completed_at'])
         self.assertEqual(second['state'], 'done')
         self.assertEqual(second['tasks'][1], self.original['tasks'][1])
@@ -53,6 +63,61 @@ class Closeout(ProjectCase):
         self.close('waiting_on_user')
         self.assertIsNone(sy.read_status(str(self.project))['tasks'][0]['completed_at'])
         self.assertEqual(self.messages()[0]['closeout']['state'], 'waiting_on_user')
+
+    def test_done_requires_distinct_specialists_in_distinct_roles(self):
+        for substitutions, error in (
+                (dict(implementation=None, review=None), 'requires actual implementation'),
+                (dict(review=None), 'requires actual implementation'),
+                (dict(review=[['code-reviewer', 'claude', 'IMPLEMENTER-42']]), 'distinct roles and participant IDs'),
+                (dict(review=[['BACKEND-ENGINEER', 'codex', 'reviewer-73']]), 'distinct roles and participant IDs'),
+                (dict(review=[['orchestrator', 'codex', 'reviewer-73']]), 'valid specialist roles')):
+            with self.subTest(substitutions=substitutions):
+                with self.assertRaisesRegex(sy.SyndicateError, error):
+                    self.close(**substitutions)
+        self.assertEqual(self.messages(), [])
+        self.assertEqual(sy.read_status(str(self.project))['state'], 'running')
+
+    def test_unavailable_required_reviewer_closes_as_blocked_with_actual_implementation(self):
+        args = sy.build_parsers()[1].parse_args(
+            ['team', 'run-role', 'code-reviewer', '--project', str(self.project), '--runtime', 'codex', 'Verify'])
+        with patch.object(sy.shutil, 'which', return_value=None), patch.object(sy, 'launch_role') as launch:
+            with self.assertRaisesRegex(sy.SyndicateError, "codex.*not installed") as failure:
+                sy.cmd_run_role(args)
+        launch.assert_not_called()
+
+        reason = str(failure.exception)
+        self.close('blocked', implementation=[['backend-engineer', 'codex', 'implementer-42']],
+                   role_blocker=['code-reviewer', reason])
+        record, = self.messages()
+        task = sy.read_status(str(self.project))['tasks'][0]
+        self.assertEqual(task['role_blocker'], dict(role='code-reviewer', reason=reason))
+        self.assertEqual(task['role_participants']['review'], [])
+        self.assertEqual(task['role_participants']['implementation'][0]['participant_id'], 'implementer-42')
+        self.assertIsNone(task['completed_at'])
+        self.assertEqual(task['state'], 'blocked')
+        self.assertIn('Required role code-reviewer could not start', task['progress'])
+        self.assertIn(reason, record['message'])
+        with self.assertRaisesRegex(sy.portfolio.PortfolioError, 'another message'):
+            self.close('blocked', implementation=[['backend-engineer', 'codex', 'implementer-42']],
+                       role_blocker=['code-reviewer', 'A different launch failure'])
+
+    def test_role_blocker_requires_blocked_state(self):
+        with self.assertRaisesRegex(sy.SyndicateError, 'requires --state blocked'):
+            self.close(role_blocker=['code-reviewer', 'Reviewer could not start'])
+        self.assertEqual(self.messages(), [])
+
+    def test_relay_reports_actual_provider_and_completion_id_only_on_success(self):
+        args = sy.build_parsers()[1].parse_args(
+            ['team', 'run-role', 'code-reviewer', '--project', str(self.project), '--runtime', 'codex', 'Verify'])
+        self.config('default = claude\nhandoff = off\n')
+        with patch.object(sy, 'require_clis'), patch.object(sy, 'launch_role', side_effect=(0, 17)) as launch:
+            with contextlib.redirect_stdout(io.StringIO()) as completed:
+                self.assertEqual(sy.cmd_run_role(args), 0)
+            with contextlib.redirect_stdout(io.StringIO()) as failed:
+                self.assertEqual(sy.cmd_run_role(args), 17)
+        self.assertEqual(launch.call_args.args[2].cli, 'codex')
+        self.assertRegex(completed.getvalue(), r'^Syndicate specialist completed: code-reviewer codex [a-f0-9]{32}\n$')
+        self.assertEqual(failed.getvalue(), '')
 
     def test_foreign_and_hidden_owners_cannot_close(self):
         before = sy.status_path(self.project).read_bytes()
@@ -161,6 +226,56 @@ class Closeout(ProjectCase):
                 records = [r for r in self.messages() if r['session_id'] == self.session_id]
                 self.assertEqual([r['closeout']['state'] for r in records], [state])
 
+    def test_managed_task_cannot_report_completion_or_blocker_via_raw_status(self):
+        for reported_state, omit_flag, bad_token in product(
+                ('done', 'completed', 'blocked'), (False, True), (None, 'task', 'current')):
+            with self.subTest(reported_state=reported_state, omit_flag=omit_flag, bad_token=bad_token):
+                def report_without_closeout():
+                    status = json.loads(sy.status_path(self.project).read_text())
+                    status['state'] = reported_state
+                    task = next(task for task in status['tasks'] if task['id'] == self.task_id)
+                    self.assertTrue(task['delegated_closeout_required'])
+                    if omit_flag:
+                        del task['delegated_closeout_required']
+                    if bad_token == 'task':
+                        task['session_id'] = []
+                    if bad_token == 'current':
+                        status['current']['session_id'] = []
+                    task.update(state=reported_state, completed_at='2026-01-01T00:00:00Z')
+                    sy.runtime.atomic_json(sy.status_path(self.project), status)
+                    effective = sy.read_status(str(self.project))
+                    self.assertEqual(effective['state'], 'running')
+                    effective_task = next(t for t in effective['tasks'] if t['id'] == self.task_id)
+                    self.assertEqual(effective_task['state'], 'running')
+                    self.assertEqual(effective_task['session_id'], self.session_id)
+                    self.assertEqual(effective['current']['session_id'], self.session_id)
+                    self.assertIn('requires closeout', effective['current']['summary'])
+
+                self.supervise(report_without_closeout)
+                status = sy.read_status(str(self.project))
+                self.assertEqual(status['state'], 'ended')
+                task = next(task for task in status['tasks'] if task['id'] == self.task_id)
+                self.assertTrue(task['needs_attention'])
+                records = [r for r in self.messages() if r['session_id'] == self.session_id]
+                self.assertEqual([r['closeout']['state'] for r in records], ['ended'])
+
+    def test_malformed_task_session_does_not_hide_committed_closeout(self):
+        def close_and_report():
+            self.close()
+            path = sy.status_path(self.project)
+            status = json.loads(path.read_text())
+            task = next(t for t in status['tasks'] if t['id'] == self.task_id)
+            task['session_id'] = []
+            sy.runtime.atomic_json(path, status)
+            before = path.read_bytes()
+            self.assertEqual(sy.read_status(str(self.project))['state'], 'done')
+            self.assertEqual(path.read_bytes(), before)
+
+        self.supervise(close_and_report)
+        self.assertEqual(sy.read_status(str(self.project))['state'], 'done')
+        records = [r for r in self.messages() if r['session_id'] == self.session_id]
+        self.assertEqual([r['closeout']['state'] for r in records], ['done'])
+
     def test_later_different_key_message_does_not_break_supervised_exit(self):
         def close_and_send():
             self.close()
@@ -241,6 +356,18 @@ class Closeout(ProjectCase):
         self.close()
         with self.assertRaisesRegex(sy.portfolio.PortfolioError, 'another message'):
             self.close(message='Different outcome')
+        with self.assertRaisesRegex(sy.portfolio.PortfolioError, 'another message'):
+            self.close(review=[['code-reviewer', 'codex', 'different-reviewer']])
+
+    def test_legacy_done_closeout_remains_readable(self):
+        self.close()
+        store = sy.live.MessageStore(sy.portfolio_dir())
+        records = store.read()
+        del records[0]['closeout']['role_participants']
+        store.path.write_text(json.dumps(records))
+        status = sy.read_status(str(self.project))
+        self.assertEqual(status['state'], 'done')
+        self.assertNotIn('role_participants', status['tasks'][0])
 
     def test_new_session_does_not_inherit_old_closeout(self):
         self.close()
@@ -284,7 +411,8 @@ class Closeout(ProjectCase):
         self.assertEqual(self.messages(), [])
 
     def test_resume_clears_prior_closeout_before_claiming_task(self):
-        self.close('ended')
+        self.close('blocked', implementation=[['backend-engineer', 'codex', 'implementer-42']],
+                   role_blocker=['code-reviewer', 'Reviewer could not start'])
         sy.coordination_store().end_session(self.session_id)
         handoff = self.project / '.syndicate' / 'handoffs' / 'run'
         handoff.mkdir(parents=True)
@@ -300,18 +428,30 @@ class Closeout(ProjectCase):
                 self.assertNotEqual(task['session_id'], self.session_id)
                 self.assertNotIn('closeout_session', task)
                 self.assertNotIn('completed_at', task)
+                self.assertNotIn('role_participants', task)
+                self.assertNotIn('role_blocker', task)
+                self.session_id = status['current']['session_id']
+                self.close(review=[['code-reviewer', 'claude', 'reviewer-after-handoff']])
+                task = next(t for t in sy.read_status(str(self.project))['tasks'] if t['id'] == self.task_id)
+                self.assertEqual(task['role_participants']['implementation'][0]['participant_id'], 'implementer-42')
+                self.assertEqual(task['role_participants']['review'][0]['provider'], 'claude')
             return 0
 
         with patch.object(sy, 'run_session', side_effect=run):
             self.assertEqual(sy.cmd_run(args), 0)
 
     def test_both_providers_load_closeout_even_without_handoff(self):
-        self.config('handoff = off\n')
+        self.config('handoff = off\nreview-gate = off\n')
+        self.role_file('orchestrator.md', 'Custom project orchestration instructions.\n')
         for host in ('claude', 'codex'):
             team = sy.resolve_team(self.project, host)
             body = sy.orchestrator_body(team)
+            self.assertTrue(body.startswith('Custom project orchestration instructions.'))
             self.assertIn('# Close a Syndicate session', body)
             self.assertIn('syndicate tasks close', body)
+            self.assertIn('Every project task, including small tasks and non-code deliverables', body)
+            self.assertIn('--role-blocker ROLE', body)
+            self.assertIn('--implementation IMPLEMENTATION_ROLE ACTUAL_PROVIDER IMPLEMENTER_ID', body)
             argv = (sy.build_claude if host == 'claude' else sy.build_codex)(team, False, [])
             self.assertIn('# Close a Syndicate session', ' '.join(argv))
 

@@ -618,9 +618,15 @@ an explicit error and approval path, rather than silently claiming persistence.
 Both provider orchestrators load `skills/syndicate-closeout/SKILL.md` and run
 its ordered checklist before ending. `syndicate tasks close TASK_ID -C SOURCE
 --session SESSION_ID --state done --progress "Evidence and remaining work"
---message "Outcome and requester next action"` validates active source/task/session
-ownership under the coordination lock. States are done, ended, waiting_on_user
-and blocked. Only done/ended receive completed_at; ended never means success.
+--message "Outcome and requester next action" --implementation backend-engineer
+codex IMPLEMENTER_ID --review code-reviewer codex REVIEWER_ID` validates active
+source/task/session ownership under the coordination lock. Done requires
+distinct implementation and review roles and participant IDs. These are the
+orchestrator's attestations of observed specialist work. The CLI validates the
+record shape and distinctness. Use `--state blocked --role-blocker ROLE "launch
+failure"` if a required specialist could not start. Include any participants
+who actually performed work in an incomplete closeout. Only done and ended
+receive a completion timestamp.
 
 The task patch and Chief inbox message commit together in one atomic replacement
 of portfolio messages.json. Status readers apply this authoritative overlay to
@@ -629,9 +635,14 @@ writes a later raw report. The command
 never rewrites agent-owned status.json, preserving concurrently added tasks and
 history. Use `tasks list`, `briefing` or dashboards for effective state. A failed
 commit changes neither effective state nor inbox. Identical retries while the
-session is active return the same record without a duplicate notification; no
-post-commit repair is necessary. A closeout is final for its owning session,
-including waiting_on_user and blocked. Corrupt inbox data fails loudly.
+session is active return the same record without a duplicate notification.
+Changed participant or blocker details conflict with the committed record.
+For newly launched tasks, reported completion and blocked states require a
+matching closeout to take effect. The launcher records this requirement in its
+session record. If a session exits without the required closeout, the task
+ends with a Chief notification that it needs attention. A closeout is final
+for its owning session, including waiting_on_user and blocked. Corrupt inbox
+data fails loudly.
 Explicit management task edits retain precedence. A resumed session uses a
 new token so old closeouts cannot end it.
 

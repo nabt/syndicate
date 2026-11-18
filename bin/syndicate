@@ -466,7 +466,7 @@ You are a relay for the `{role.name}` role, which runs on the {role.cli} CLI in 
 SYNDICATE_BRIEF
 
 3. If the sandbox denies scratch creation, the specialist lease write, or the child CLI's network connection, request normal approval to run this exact command outside the sandbox. Explain the denied operation; do not broaden the relay sandbox or change the command. If approval is unavailable, report the failure to the orchestrator so it can request approval.
-4. Reply with the command's output verbatim as your final answer. For other failures, report the error verbatim. Do not retry a different way or do the work yourself.
+4. Reply with the command's output verbatim as your final answer, including the specialist completion ID on success. For failures, include the exit status and error. Do not retry a different way or do the work yourself.
 """
 
 
@@ -680,6 +680,11 @@ def owner_identity(pid) -> dict:
 OWNER_FIELDS = ("process_identity", "process_namespace", "machine_id", "lock_owned", "lock_inode", "cli_owner")
 
 
+def status_session_id(row: dict) -> str | None:
+    token = row.get('session_id')
+    return token if isinstance(token, str) and token else None
+
+
 def read_status(project_path: str, *, current_closeouts: set | None = None) -> dict | None:
     path = Path(project_path) / LOCAL / "status.json"
     if not path.is_file():
@@ -690,14 +695,51 @@ def read_status(project_path: str, *, current_closeouts: set | None = None) -> d
         return None
     if not isinstance(data, dict):
         return None
+    current = data.get('current')
+    tasks = data.get('tasks') if isinstance(data.get('tasks'), list) else []
+    source = str(Path(project_path).resolve())
+    closeout_states = ('done', 'completed', 'blocked')
+    managed_sessions = None
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        task_id = task.get('id')
+        is_current = isinstance(current, dict) and current.get('task_id') == task_id
+        task_session = status_session_id(task)
+        current_session = status_session_id(current) if is_current else None
+        needs_recovery = is_current and (task_session is None) != (current_session is None)
+        task_reports_closeout = task.get('state') in closeout_states
+        current_reports_closeout = is_current and data.get('state') in closeout_states
+        if not (task_reports_closeout or current_reports_closeout or needs_recovery):
+            continue
+        marked_managed = task.get('delegated_closeout_required') is True
+        session_id = task_session or current_session
+        if isinstance(task_id, str) and session_id and (not marked_managed or needs_recovery):
+            # The launcher records this requirement outside the agent's status.
+            # Sessions from before that record was introduced retain their behavior.
+            if managed_sessions is None:
+                managed_sessions = {
+                    (session['task_id'], session['id']) for session in coordination_store().read()['sessions']
+                    if session['source_path'] == source and session.get('delegated_closeout_required') is True
+                }
+            if (task_id, session_id) in managed_sessions:
+                marked_managed = True
+                if needs_recovery:
+                    # Restore the malformed copy in the effective view only.
+                    current['session_id'] = task['session_id'] = session_id
+        if not marked_managed:
+            continue
+        if task_reports_closeout:
+            task.update(state='running', completed_at=None)
+        if current_reports_closeout:
+            data['state'] = 'running'
+            current['summary'] = 'This state requires closeout with the applicable specialist details.'
     # The notification and task patch share one authoritative atomic commit.
     # Apply at read time; never overwrite concurrent agent-owned status writes.
-    source = str(Path(project_path).resolve())
     for record in live.MessageStore(portfolio_dir()).read():
         patch = record.get('closeout')
         if record['source_path'] != source or not patch:
             continue
-        tasks = data.get('tasks') if isinstance(data.get('tasks'), list) else []
         for task in tasks:
             if not isinstance(task, dict):
                 continue
@@ -1394,7 +1436,8 @@ def cmd_messages(args):
     return 0
 
 
-def commit_closeout(project, task_id, session_id, state, progress, message, *, attention=False):
+def commit_closeout(project, task_id, session_id, state, progress, message, *, attention=False,
+                    role_participants=None, role_blocker=None):
     """Commit task fields and Chief notification in one messages.json replacement.
 
     Callers hold coordination.lock and validate ownership there (or are the
@@ -1403,6 +1446,14 @@ def commit_closeout(project, task_id, session_id, state, progress, message, *, a
     """
     if not progress.strip() or not message.strip():
         raise SyndicateError('Provide nonempty --progress and --message')
+    if state == 'done' and (role_participants is None or not all(role_participants.values())):
+        raise SyndicateError('Done requires actual implementation and independent review participants '
+                             'via --implementation and --review')
+    if role_participants is not None and not live.valid_role_participants(role_participants):
+        raise SyndicateError('Provide valid specialist roles, providers, and participant IDs. '
+                             'Implementation and review must use distinct roles and participant IDs.')
+    if role_blocker is not None and (state != 'blocked' or not live.valid_role_blocker(role_blocker)):
+        raise SyndicateError('--role-blocker requires --state blocked and the unavailable role and reason')
     status = read_status(str(project))
     current = (status or {}).get('current') or {}
     task = next((t for t in (status or {}).get('tasks', []) if t.get('id') == task_id), None)
@@ -1416,6 +1467,18 @@ def commit_closeout(project, task_id, session_id, state, progress, message, *, a
     if state == 'ended':
         patch.update(ended_at=stamp, last_state=task.get('state'),
                      end_reason='session exited' if attention else 'closed by owning session')
+    if role_participants is not None:
+        patch['role_participants'] = role_participants
+        for category, entries in role_participants.items():
+            if entries:
+                people = ', '.join(f"{entry['role']} ({entry['provider']}, {entry['participant_id']})"
+                                   for entry in entries)
+                message += f"\n{category.capitalize()} performed by {people}."
+    if role_blocker is not None:
+        patch['role_blocker'] = role_blocker
+        blocker = f"Required role {role_blocker['role']} could not start. {role_blocker['reason']}"
+        patch['progress'] += f" {blocker}"
+        message += f"\n{blocker}"
     record = live.MessageStore(portfolio_dir()).update(
         source_path=str(project), task_id=task_id, session_id=session_id,
         key='session-closeout', message=message, closeout=patch, reuse_for_exit=attention)
@@ -1432,9 +1495,19 @@ def cmd_tasks_close(args):
                       and (s['source_path'], s['task_id']) == (str(project), args.task_id)), None)
         if not owner or not store.session_live(owner):
             raise SyndicateError('Closeout requires the owning active task/session')
+        role_participants = None
+        if args.implementation or args.review:
+            role_participants = {
+                category: [dict(role=role, provider=provider, participant_id=participant_id)
+                           for role, provider, participant_id in entries]
+                for category, entries in (('implementation', args.implementation or []),
+                                          ('review', args.review or []))
+            }
+        role_blocker = dict(zip(('role', 'reason'), args.role_blocker)) if args.role_blocker else None
         try:
             record = commit_closeout(project, args.task_id, args.session, args.state,
-                                     args.progress, args.message)
+                                     args.progress, args.message, role_participants=role_participants,
+                                     role_blocker=role_blocker)
         except OSError as error:
             raise SyndicateError(f'Closeout failed before commit: {error}; retry outside the sandbox with approval') from error
     portfolio_print(json.dumps(record, indent=2))
@@ -1454,13 +1527,13 @@ def project_session(project, provider, outcome=None):
         yield None
         return
     store = coordination_store()
-    session = store.start_session(str(project), task_id, provider, os.getpid())
+    session = store.start_session(str(project), task_id, provider, os.getpid(), delegated_closeout_required=True)
     close = True
     try:
         status["current"]["session_id"] = session["id"]
         for task in status.get("tasks", []):
             if task.get("id") == task_id:
-                task.update(provider=provider, session_id=session["id"])
+                task.update(provider=provider, session_id=session["id"], delegated_closeout_required=True)
         status.pop("_mtime", None)
         runtime.atomic_json(status_path(project), status)
         yield session
@@ -1480,8 +1553,8 @@ def project_session(project, provider, outcome=None):
 def close_owned_task(project, task_id, *, session_id=None) -> bool:
     """On supervised exit, close the task this session owned if the agent left it
     'running': state 'ended' (not done), keeping last_state, ended_at and
-    end_reason. Agent-written done/failed/blocked/waiting_on_user states are
-    preserved. Called after the CLI process group has been stopped, so it cannot
+    end_reason. Other incomplete states and legacy done or blocked reports are preserved.
+    Called after the CLI process group has been stopped, so it cannot
     race the agent's own status writes. Never applies to Chief records."""
     if portfolio.is_chief_record(portfolio_dir(), path=project):
         return False
@@ -2089,6 +2162,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             if isinstance(task, dict) and task.get("id") == (status.get("current") or {}).get("task_id"):
                 task.update(owner, state="running")
                 for key in ("session_id", "closeout_session", "completed_at", "needs_attention",
+                            "role_participants", "role_blocker",
                             "ended_at", "end_reason", "last_state"):
                     task.pop(key, None)  # a resumed task is running again, not ended
         status.pop("_mtime", None)
@@ -2295,7 +2369,10 @@ def cmd_run_role(args: argparse.Namespace) -> int:
     with ExitStack() as stack:
         if not lease_held:
             enter_specialist_lease(stack, project, team, role)
-        return launch_role(project, team, role, brief)
+        result = launch_role(project, team, role, brief)
+        if result == 0:
+            print(f"Syndicate specialist completed: {role.name} {role.cli} {uuid.uuid4().hex}")
+        return result
 
 
 RUN_RECORD_MAX_BYTES = 1 << 20  # run.json holds the task text; anything larger is not a record we wrote
@@ -2804,6 +2881,12 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     close.add_argument('--state', required=True, choices=('done', 'ended', 'waiting_on_user', 'blocked'))
     close.add_argument('--progress', required=True)
     close.add_argument('--message', required=True)
+    close.add_argument('--implementation', action='append', nargs=3, metavar=('ROLE', 'PROVIDER', 'PARTICIPANT_ID'),
+                       help='specialist that performed implementation; repeat to report multiple participants')
+    close.add_argument('--review', action='append', nargs=3, metavar=('ROLE', 'PROVIDER', 'PARTICIPANT_ID'),
+                       help='independent specialist that performed review and verification; repeat as needed')
+    close.add_argument('--role-blocker', nargs=2, metavar=('ROLE', 'REASON'),
+                       help='required specialist that could not start; use with --state blocked')
     close.set_defaults(fn=cmd_tasks_close)
     edit = actions.add_parser("edit")
     edit.add_argument("task_id")
