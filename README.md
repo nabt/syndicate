@@ -248,10 +248,16 @@ a crashed session leaves no other signal that it stopped. See
 
 ## Review gate
 
-The role docs say work must pass through the code reviewer. The review gate
-enforces it: if the orchestrator delegated work to any build role and never
-invoked `code-reviewer`, finishing is blocked until it does. It's on by default
-and controlled per project with `review-gate = on|off` in `.syndicate/syndicate.conf`.
+Every project task requires delegated implementation and independent review and
+verification by distinct specialists in distinct roles. A completed task records
+the actual role, provider, and participant ID for each specialist. If a required
+role cannot start and no eligible replacement is available, the orchestrator
+closes the task as blocked and records the launch failure.
+
+The optional transcript Stop hook catches build delegations with no matching
+`code-reviewer` invocation. It is on by default and controlled per project with
+`review-gate = on|off` in `.syndicate/syndicate.conf`. Managed closeout requires
+role attribution regardless of the hook setting.
 
 - **Claude Code:** nothing to set up; the hook is passed at launch.
 - **Codex:** run `syndicate setup-codex-gate` once, then open `codex` and accept

@@ -608,7 +608,7 @@ class CoordinationStore:
         return (session['state'] == 'active' and identity is not None
                 and identity == session.get('process_identity'))
 
-    def start_session(self, source_path, task_id, provider, pid):
+    def start_session(self, source_path, task_id, provider, pid, *, delegated_closeout_required=False):
         with self.edit() as data:
             for previous in data['sessions']:
                 if previous['source_path'] == source_path and previous['state'] == 'active':
@@ -618,6 +618,8 @@ class CoordinationStore:
             session = dict(id=uuid.uuid4().hex, source_path=source_path, task_id=task_id,
                            provider=provider, **owner_record(pid),
                            state='active', started_at=now())
+            if delegated_closeout_required:
+                session['delegated_closeout_required'] = True
             data['sessions'].append(session)
             return dict(session)
 

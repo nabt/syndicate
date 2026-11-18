@@ -31,7 +31,36 @@ def endpoint_edit(path):
 
 
 CLOSEOUT_KEYS = {'state', 'progress', 'updated_at', 'completed_at', 'closeout_session',
-                 'needs_attention', 'ended_at', 'last_state', 'end_reason'}
+                 'needs_attention', 'ended_at', 'last_state', 'end_reason',
+                 'role_participants', 'role_blocker'}
+
+
+def valid_specialist_role(role):
+    return (isinstance(role, str) and bool(role) and not any(c.isspace() for c in role)
+            and role.casefold() not in ('orchestrator', 'chief-of-staff'))
+
+
+def valid_role_participants(participants, *, complete=False):
+    if not isinstance(participants, dict) or set(participants) != {'implementation', 'review'}:
+        return False
+    for entries in participants.values():
+        if not isinstance(entries, list) or (complete and not entries):
+            return False
+        if not all(isinstance(entry, dict) and set(entry) == {'role', 'provider', 'participant_id'}
+                   and valid_specialist_role(entry['role']) and entry['provider'] in ('codex', 'claude')
+                   and isinstance(entry['participant_id'], str) and bool(entry['participant_id'])
+                   and not any(c.isspace() for c in entry['participant_id']) for entry in entries):
+            return False
+    implementation, review = participants['implementation'], participants['review']
+    return all(not ({entry[key].casefold() for entry in implementation}
+                    & {entry[key].casefold() for entry in review})
+               for key in ('role', 'participant_id'))
+
+
+def valid_role_blocker(blocker):
+    return (isinstance(blocker, dict) and set(blocker) == {'role', 'reason'}
+            and valid_specialist_role(blocker['role']) and isinstance(blocker['reason'], str)
+            and bool(blocker['reason'].strip()))
 
 
 def valid_closeout(record):
@@ -46,6 +75,12 @@ def valid_closeout(record):
             or not isinstance(patch['needs_attention'], bool)
             or not all(isinstance(patch.get(k), str) and patch[k].strip()
                        for k in ('progress', 'updated_at'))):
+        return False
+    if ('role_participants' in patch and not
+            valid_role_participants(patch['role_participants'], complete=patch['state'] == 'done')):
+        return False
+    if ('role_blocker' in patch and
+            (patch['state'] != 'blocked' or not valid_role_blocker(patch['role_blocker']))):
         return False
     try:
         for key in ('updated_at', 'completed_at', 'ended_at'):
@@ -102,7 +137,8 @@ class MessageStore:
                     return dict(record)
                 if record and (record['message'] != fields['message'] or
                                (fields.get('closeout') and any(record.get('closeout', {}).get(k) != fields['closeout'].get(k)
-                                for k in ('state', 'progress', 'needs_attention')))):
+                                for k in ('state', 'progress', 'needs_attention',
+                                          'role_participants', 'role_blocker')))):
                     raise portfolio.PortfolioError('This key identifies another message; use a new key')
                 if not record:
                     record = dict(fields, id=uuid.uuid4().hex, state='pending', created_at=portfolio.now())

@@ -14,6 +14,9 @@ At the beginning of work and after each specialist returns, update
 completed work, outstanding tasks, active workers, relevant files, tests and
 review results, and the next useful action. Keep it concise and self-contained.
 Record failed or unrun checks honestly. Preserve unresolved user requests.
+Record each specialist's actual role, provider, participant ID, and outcome,
+including any launch failure. Preserve attribution for finished work so that
+the resumed task can include it at closeout.
 This file is the semantic checkpoint if the launcher must interrupt you without
 another model response. Update it before launching a long task as well.
 
@@ -21,7 +24,9 @@ When asked to continue a handoff, read the handoff directory's `handoff.md`,
 `checkpoint.md`, and `status.json`, then inspect the current worktree and diff.
 The snapshot can contain incomplete writes or interrupted tools; verify them.
 A handoff is not completion or review approval. Carry outstanding reviews into
-the new run. Do not assume the old conversation or native agent IDs transferred.
+the new run. Use checkpointed participant IDs as historical evidence for work
+you verified still applies. The old conversation and agent handles may be
+unavailable in the new run.
 
 The launcher asks after saving the snapshot and stopping its managed process
 group. Only an explicit user choice may start another provider. EOF, a timeout,

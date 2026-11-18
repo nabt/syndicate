@@ -83,7 +83,7 @@ the user file.
 | `default` | `claude` \| `codex` | CLI for every role not listed individually. |
 | `orchestrator` | `claude` \| `codex` | CLI that **hosts the session**. Every other role is delegated to from here. |
 | `<role name>` | `claude` \| `codex` | CLI for that one role: any global role, or a project-only role you defined. |
-| `review-gate` | `on` (default) \| `off` | Block finishing until `code-reviewer` has reviewed delegated work. |
+| `review-gate` | `on` (default) \| `off` | Enable the transcript Stop hook for a build delegation without a `code-reviewer` invocation. Managed closeout requires role attribution with either setting. |
 | `inbox-interval` | minutes dividing 60 evenly (default `5`) | Scheduled inbox cadence. Examples: `5`, `10`, `15`, `30`, `60`. |
 | `inbox-transport` | `auto` (default) \| `poll` \| `channel` | `auto`: Codex native queue, Claude native scheduled polling. `channel`: explicit Claude preview channel. |
 
