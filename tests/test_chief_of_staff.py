@@ -355,14 +355,18 @@ class ChiefOfStaff(ProjectCase):
 
     def test_quota_stop_saves_chief_handoff_without_provider_switch(self):
         def stopped(argv, workspace, providers, threshold, task, provider, **kwargs):
-            snapshot = sy.runtime.create_handoff(workspace, provider, task, 'quota reserve', 'test')
+            snapshot = sy.runtime.create_handoff(workspace, provider, task,
+                                                 '10% remaining; no CLI launched', 'test', limited=provider)
             return 75, snapshot
         with patch.object(sy, 'require_clis'), patch.object(sy.runtime, 'start_monitor'), \
              patch.object(sy.runtime, 'supervise', side_effect=stopped), \
-             patch.object(sy.runtime, 'choose_target') as choose:
+             patch.object(sy.runtime, 'choose_target') as choose, \
+             contextlib.redirect_stderr(io.StringIO()) as errors:
             result, output = self.command('-x', 'claude', '-p', 'Coordinate projects')
         self.assertEqual(result, 75)
         self.assertIn('Handoff saved', output)
+        self.assertIn('Syndicate stopped at the Claude usage reserve.\n10% remaining; no CLI launched',
+                      errors.getvalue())
         choose.assert_not_called()
         status = sy.runtime.read_json(self.workspace / '.syndicate' / 'status.json')
         self.assertEqual(status['state'], 'waiting_on_user')
