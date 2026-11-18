@@ -882,7 +882,8 @@ class ProjectUsagePolicy(ProjectCase):
         snapshot.mkdir()
         def stopped(*args, **kwargs):
             rt.atomic_json(self.project / ".syndicate" / "handoff.json",
-                           {"path": str(snapshot), "limited_provider": "claude"})
+                           {"path": str(snapshot), "limited_provider": "claude",
+                            "reason": "claude: 5% remaining while the qa specialist was running"})
             return 75, snapshot
         args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "task"])
         with patch.object(sy, "require_clis"), patch.object(sy, "register_project"), \
@@ -892,6 +893,7 @@ class ProjectUsagePolicy(ProjectCase):
             self.assertEqual(sy.cmd_run(args), 75)
         self.assertEqual(choose.call_args.args[0], "codex")
         self.assertEqual(choose.call_args.kwargs, {"limited": "claude"})
+        self.assertIn("claude: 5% remaining while the qa specialist was running", self.errors())
 
     def test_post_handoff_target_with_stale_low_reading_stays_stopped(self):
         self.reading("codex", 95, observed_at=100)  # stale and long past any reset

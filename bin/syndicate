@@ -1172,17 +1172,18 @@ def chief_session_lock(probe=False):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def report_claude_reserve(args, project, host, handoff):
-    if host != 'claude' or runtime.limited_provider(project, handoff) != 'claude':
-        return
-    record = runtime.read_json(project / LOCAL / 'handoff.json')
-    print(f"\nSyndicate stopped at the Claude usage reserve.\n{record['reason']}.\n"
+def report_usage_reserve(args, project, handoff, reason=None):
+    if reason is None:
+        if runtime.limited_provider(project, handoff) is None:
+            return
+        reason = runtime.read_json(project / LOCAL / 'handoff.json')['reason']
+    print(f"\nSyndicate stopped at the usage reserve.\n{reason.rstrip('.')}.\n"
           f"Handoff saved: {handoff}", file=sys.stderr, flush=True)
     pane = os.environ.get('TMUX_PANE', '')
     if getattr(args, 'inside_tmux', False) and not args.print and re.fullmatch(r'%[0-9]+', pane):
         # Keep only reserve-stopped panes available to the attached or detached user.
         try:
-            subprocess.run(['tmux', 'set-option', '-p', '-t', pane, '@syndicate-claude-reserve', '1',
+            subprocess.run(['tmux', 'set-option', '-p', '-t', pane, '@syndicate-usage-reserve', '1',
                             ';', 'set-option', '-p', '-t', pane, 'remain-on-exit', 'on'],
                            capture_output=True, text=True, check=True)
         except (OSError, subprocess.CalledProcessError) as error:
@@ -1197,7 +1198,7 @@ def launch_tmux(argv, directory, name, headless=False):
     target = '=' + name
     if subprocess.run(['tmux', 'has-session', '-t', target], capture_output=True).returncode == 0:
         panes = subprocess.run(['tmux', 'list-panes', '-s', '-t', target, '-F',
-                                '#{session_id}:#{pane_dead}:#{@syndicate-claude-reserve}'],
+                                '#{session_id}:#{pane_dead}:#{@syndicate-usage-reserve}'],
                                capture_output=True, text=True)
         rows = [line.split(':', 2) for line in (panes.stdout or '').splitlines()]
         if panes.returncode == 0 and rows and all(
@@ -1601,7 +1602,7 @@ def cmd_chief_of_staff(args):
                 runtime.atomic_json(status_file, final)
                 print(f"Chief of Staff stopped. Handoff saved: {handoff}")
                 print("Resume with 'syndicate chief-of-staff --handoff PATH'; use -x only when choosing a provider.")
-                report_claude_reserve(args, workspace, provider, handoff)
+                report_usage_reserve(args, workspace, handoff)
                 return 75
             if result != 0:
                 final["state"] = "failed"
@@ -2220,16 +2221,16 @@ def run_session(args: argparse.Namespace) -> int | None:
         target = runtime.choose_target(team.host, not args.print and sys.stdin.isatty(),
                                        limited=runtime.limited_provider(project, handoff))
         if target is None:
-            report_claude_reserve(args, project, team.host, handoff)
+            report_usage_reserve(args, project, handoff)
             return 75  # resumable temporary interruption; not successful completion
         require_clis({target})
         # A stale or awaiting-reset reading still counts: an expected reset is not capacity.
         remaining = runtime.latest_reading(runtime.read_json(runtime.STATE / f"{target}.json"))
         if remaining is not None and remaining <= reserve:
-            print(f"syndicate: {target} last recorded only {remaining:g}% remaining; leaving work stopped. "
-                  f"A passed reset time does not count as restored capacity; {runtime.forget_hint(target)}.",
-                  file=sys.stderr)
-            report_claude_reserve(args, project, team.host, handoff)
+            report_usage_reserve(args, project, handoff,
+                                 f"{target} last recorded only {remaining:g}% remaining (reserve {reserve:g}%); "
+                                 "leaving work stopped. A passed reset time does not count as restored capacity; "
+                                 f"{runtime.forget_hint(target)}")
             return 75
         args.runtime = target
         args.all_runtime = target
