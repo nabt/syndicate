@@ -66,8 +66,13 @@ the request; never rephrase it as a continuation merely because it shares a
 repository. The orchestrator decides whether it belongs to existing work.
 
 When a new team/session is needed and the requester agrees, run
-`team task --project PROJECT "self-contained task brief"`, optionally with
-`-x claude` or `-x codex` when a provider was specified. This supported launcher
+`team task --project PROJECT "self-contained task brief"`. When the requester
+asks for the team on a specific CLI (for example "start a team on codex"), run
+`team task -x CLI --all-runtime CLI --project PROJECT "self-contained task brief"`
+with the same value (`claude` or `codex`) for both flags so the orchestrator and
+every specialist run on that CLI; `-x` alone moves only the orchestrator. The
+flags must come before the brief; anything after it is passed to the provider
+CLI and ignored by Syndicate. Otherwise omit both flags. This supported launcher
 starts the CLI in a tmux session named `<project_name>-work` by default, or reports
 an existing live team without starting another CLI. Punctuation unsupported in
 tmux names is replaced with hyphens. Never launch the provider directly or use

@@ -56,7 +56,10 @@ task/session; ask a focused question only when the distinction is ambiguous.
 For a new task received inside an existing session, checkpoint the current work
 and preserve its task state and outstanding requests. Prepare a self-contained
 brief and a launcher command for a fresh session in the owning project, without
-`--handoff` or provider resume/continue flags. Include only relevant durable
+`--handoff` or provider resume/continue flags. If the requester asked for a
+specific CLI, the command includes `-x CLI --all-runtime CLI` before the brief,
+with the same value so every role runs on it (flags after the brief are passed
+to the provider CLI and ignored); otherwise include neither flag. Include only relevant durable
 project constraints and decisions; do not carry over the old conversation,
 specialist IDs, or unrelated pending work. Do not implement, delegate, or
 acknowledge incorporation of the new task under the old task/session identity.
