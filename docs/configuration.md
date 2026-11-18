@@ -213,6 +213,8 @@ agents. A role configured for the *other* CLI appears in the host as a thin
 delegates to it, the relay runs `syndicate team run-role <role>`, which executes the
 real role headlessly on its own CLI and hands the output back. Because the relay
 keeps the role's name, delegation and the review gate work identically.
+When that CLI reports an account usage limit, the runner can retry the role
+on another installed CLI using the [latest usage readings](handoff.md).
 
 Things to know:
 

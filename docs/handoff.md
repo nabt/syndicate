@@ -1,10 +1,10 @@
 # Usage-aware handoffs
 
-Syndicate monitors account usage by default and stops its managed team when an
-enforced provider's last recorded window reaches **10% remaining**. It saves a handoff and asks whether to
-leave agent work stopped or continue with the other CLI. Switching requires an
-explicit answer. Non-interactive runs stop with exit code 75 and never switch
-providers automatically.
+Syndicate monitors account usage by default and stops its managed team when
+the host's last recorded window reaches **10% remaining**. It saves a handoff
+and asks whether to leave agent work stopped or continue with the other CLI.
+Switching the host requires an explicit answer. A non-interactive host stops
+with exit code 75. Specialists can back off to another provider independently.
 
 This is account usage, not the conversation's context window or an exact token
 balance. Providers report percentages for usage windows. A context compaction
@@ -61,10 +61,9 @@ monitor; use `syndicate limits --stop` for that.
    The live worktree, including untracked files, remains in place. The snapshot
    is recovery context, not a complete project backup.
 3. It asks whether to stop or choose a CLI for continuation. You can also
-   choose the current host to move a depleted mixed-team specialist onto it.
-   When a delegated provider (not the host) hit the reserve, the prompt names
-   that provider and offers only the host for every role, never the exhausted
-   provider. Pressing Enter, EOF, or non-interactive
+   choose the current host after a legacy specialist lease causes a handoff.
+   The prompt then names the exhausted provider and offers the host for every
+   role. Pressing Enter, EOF, or non-interactive
    input leaves work stopped. A target whose last recorded reading is at or
    below the reserve is not launched, even if that reading is stale or its
    reset time has passed; the message names `syndicate limits --forget`.
@@ -113,8 +112,10 @@ Syndicate launches, and provider configuration directories are not modified.
 - **Which providers are enforced (project sessions):** the host (the
   orchestrator's CLI) for the whole run. A delegated provider (a specialist
   launched through `syndicate team run-role`, such as a Claude role under a
-  Codex host) is checked when the specialist launches and enforced only while
-  it runs. An idle assigned provider never stops the team.
+  Codex host) is checked at launch and while the specialist runs. If the
+  specialist reaches its reserve, its runner stops that attempt and checks
+  the other providers. The host's own reserve still triggers the project
+  handoff, which needs user confirmation to switch providers.
 - **Latest real reading:** enforcement uses each provider's most recently
   recorded percentages (the most constrained window), even when that reading
   is stale (older than 180 seconds) or its reset time has passed. A passed
@@ -134,18 +135,30 @@ Syndicate launches, and provider configuration directories are not modified.
   itself the source of Claude telemetry, so refusing would prevent the first
   reading. Malformed telemetry files (non-numeric, out-of-range, or
   non-finite values) are treated as no reading.
-- **Delegated launch gate:** before starting a specialist's CLI, `run-role`
-  refuses (non-zero exit, no CLI launched) when that provider's last reading is
-  at or below `handoff-reserve`, or when no reading has ever been recorded. The
-  error names the provider, remaining percentage, reserve, and observation time,
-  or explains how to obtain a reading: run an interactive Claude session through
-  Syndicate, check `syndicate limits` (Codex errors from the monitor are
-  included), or move the role to another runtime / use `--all-runtime`. A
-  refusal at the reserve also names `syndicate limits --forget`. A stale
-  reading above the reserve is accepted with a warning. The gate uses the
-  project configuration's `handoff-reserve`, not a one-run `--reserve`; the
-  running supervisor still applies `--reserve` to the active specialist.
-  `handoff = off` disables the gate.
+- **Specialist backoff:** `run-role` starts with the configured provider.
+  Upon a provider usage-limit failure or a refusal at the reserve, it reads
+  the global last-known usage of each supported CLI on `PATH` and retries on
+  the provider with the highest recorded usable percentage. Each provider
+  gets at most one attempt. A missing reading is unknown. If all installed
+  providers are known to have reached a limit or reserve, the task is marked
+  **On hold** and the command exits with status 75. The launcher passes a run
+  ID in `SYNDICATE_RUN_ID` so a specialist can update its owning task. Keep
+  this variable in the host CLI's shell environment policy. An unbound,
+  standalone `run-role` command can still retry. Read-only Codex roles require
+  their isolated workspace to run shell checks and cannot fall back to Claude.
+  The launch gate uses the stricter of the configured `handoff-reserve` and
+  the active run's reserve.
+  A stale reading above that gate is accepted with a warning. The command
+  continues using the active run's reserve while the specialist runs.
+  Claude roles in text mode use structured results internally and print the
+  result text. Explicit JSON and streaming JSON output pass through directly.
+  `handoff = off` disables reserve enforcement. An explicit provider quota
+  failure still triggers backoff using readings above zero.
+- **Native specialists:** if the host can still respond after a provider
+  usage-limit failure, the orchestrator invokes `team run-role ROLE
+  --backoff-from PROVIDER` with the role's original brief and any known
+  partial work. If the host itself exits or reaches its reserve first, the
+  project handoff path applies.
 - **Specialist leases:** the supervisor starts the CLI with
   `SYNDICATE_RUN_ID=<run id>` in its environment (Codex's default shell
   environment policy only drops names containing `KEY`, `SECRET` or `TOKEN`,
@@ -154,7 +167,9 @@ Syndicate launches, and provider configuration directories are not modified.
   `.syndicate/specialists/<32 hex>.json` (mode 0600, directory 0700), holding
   the run id, provider, and role, and holds an exclusive `flock` on it for the
   specialist's whole lifetime. On exit it unlinks the lease and releases the
-  lock. The supervisor counts a lease as active only while that lock is held
+  lock. The runner enforces its own quota so only that specialist stops when
+  its provider hits the reserve. The supervisor still enforces legacy leases.
+  It counts a lease as active only while that lock is held
   by someone else and only when the run id is its own; this works when the
   specialist runs in another PID namespace (for example, inside the Codex
   `workspace-write` sandbox). A lease nobody holds (a killed specialist) is
@@ -169,16 +184,16 @@ Syndicate launches, and provider configuration directories are not modified.
 - **Lease limitation (SIGKILL):** the lease lives exactly as long as the
   `run-role` process holding it. SIGTERM and SIGINT unwind it normally (the
   lease is removed, and a tmux-hosted specialist's session is stopped). If
-  that process is killed with SIGKILL while its child CLI keeps running
-  (including the outer launcher that waits for a tmux-hosted specialist),
-  the kernel releases the lock, the supervisor removes the lease, and that
-  specialist's provider is no longer enforced for the rest of its run.
+  that process is killed with SIGKILL while its child CLI keeps running,
+  the kernel releases the lock and the supervisor removes the lease. Usage
+  enforcement by that runner stops. On Linux, the runner samples descendant
+  processes during an attempt to stop tracked workers before retrying. A
+  descendant that detaches between samples can escape that cleanup.
 - **Lease location:** leases live in the `.syndicate/specialists/`
   directory of the project `run-role` resolves (the git top level when the
   project is a repository). In a project that is not a git repository,
   starting `run-role` from a subdirectory writes the lease where the
-  supervisor does not look; the launch gate still applies, but in-run
-  enforcement does not. Pass `--project` with the project root.
+  supervisor does not look. Pass `--project` with the project root.
 - **Lease write failure fails closed:** inside a supervised run, if
   `run-role` cannot record its lease (for example, a sandbox denies writing
   `.syndicate/specialists/`), it refuses to start the specialist: non-zero
@@ -199,15 +214,12 @@ Syndicate launches, and provider configuration directories are not modified.
   hard-linked, or unreadable), or when the lock is held but `run.json` does
   not name a valid run id. The lock is probed before and after reading
   `run.json`, so a run that ends in between is not credited with the lease.
-  Because the account is shared, a specialist started without a run id (for
-  example, from a Chief of Staff workspace) while the project's own team is
-  running is attributed to that team's run, whose supervisor may then stop
-  its team at the reserve; the notice says which run id was used.
+  A specialist started without a run id while the project's own team is
+  running is attributed to that run. The notice names the run id used.
 - **Outside a supervised run:** when `SYNDICATE_RUN_ID` is not usable and no
   supervised run is live (no `run.json`, or `session.lock` missing or free;
-  for example, `syndicate team run-role` started by hand), the launch gate
-  still applies, but no lease is written and a warning says in-run
-  enforcement is unavailable for that specialist.
+  for example, `syndicate team run-role` started by hand), the runner enforces
+  the configured reserve locally and does not write a lease.
 - **Recovering from an outdated low reading:** a Claude reading only refreshes
   while an interactive Claude session runs through Syndicate, so a stale
   reading at or below the reserve would otherwise block Claude host preflight,

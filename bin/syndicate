@@ -27,6 +27,7 @@ import stat
 import tomllib
 import uuid
 from contextlib import ExitStack, contextmanager
+from copy import copy
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,11 +47,11 @@ CLOSEOUT_SKILL = HOME_DIR / 'skills' / 'syndicate-closeout' / 'SKILL.md'
 INBOX_SKILL = HOME_DIR / 'skills' / 'syndicate-inbox' / 'SKILL.md'
 SCHEDULER_TOOLS = ['CronCreate', 'CronList', 'CronDelete']
 REGISTRY_PATH = Path.home() / ".syndicate" / "projects.json"
-CLIS = ("claude", "codex")
+CLIS = runtime.PROVIDERS
 LOCAL = ".syndicate"
 ROLE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 RELAY_SANDBOX = "workspace-write"
-STATUS_STATES = ("running", "waiting_on_user", "done", "ended")
+STATUS_STATES = ("running", "waiting_on_user", "on_hold", "done", "ended")
 MAX_STATUS_HISTORY = 200
 # Closed without completion: the owning session ended while the task still
 # claimed to be in progress. Distinct from done, which asserts completion.
@@ -94,6 +95,10 @@ CONFIG_TEMPLATE = """\
 
 
 class SyndicateError(Exception):
+    pass
+
+
+class SpecialistReserveReached(runtime.RoleUsageLimit, SyndicateError):
     pass
 
 
@@ -456,7 +461,7 @@ def relay_command(role: Role, project: Path) -> str:
 
 def relay_prompt(role: Role, project: Path) -> str:
     return f"""\
-You are a relay for the `{role.name}` role, which runs on the {role.cli} CLI in this project. You do not do the work yourself.
+You are a relay for the `{role.name}` role, which starts on the {role.cli} CLI in this project. You do not do the work yourself.
 
 1. Write a complete, self-contained brief for the role from the task you were given. The role cannot see this conversation, so include the goal, constraints, relevant file paths, and what to return.
 2. Run exactly this command with Bash, putting the brief in the heredoc:
@@ -465,7 +470,7 @@ You are a relay for the `{role.name}` role, which runs on the {role.cli} CLI in 
 <the brief>
 SYNDICATE_BRIEF
 
-3. If the sandbox denies scratch creation, the specialist lease write, or the child CLI's network connection, request normal approval to run this exact command outside the sandbox. Explain the denied operation; do not broaden the relay sandbox or change the command. If approval is unavailable, report the failure to the orchestrator so it can request approval.
+3. If the sandbox denies scratch creation, the specialist lease write, task hold ownership validation, or the child CLI's network connection, request normal approval to run this exact command outside the sandbox. Explain the denied operation; do not broaden the relay sandbox or change the command. If approval is unavailable, report the failure to the orchestrator so it can request approval.
 4. Reply with the command's output verbatim as your final answer, including the specialist completion ID on success. For failures, include the exit status and error. Do not retry a different way or do the work yourself.
 """
 
@@ -474,6 +479,19 @@ def orchestrator_body(team: Team) -> str:
     body = team.roles["orchestrator"].body + "\n\n" + split_frontmatter(PROJECT_SKILL.read_text())[1]
     if team.config["handoff"] == "on":
         body += "\n\n" + split_frontmatter(HANDOFF_SKILL.read_text())[1]
+    role_retry = shlex.join([sys.executable, str(SCRIPT), "team", "run-role"])
+    body += (
+        "\n\n## Specialist usage limits\n"
+        "Syndicate retries relayed specialists automatically on account usage-limit failures. "
+        "If the provider reports an account usage-limit failure for a native specialist, retry "
+        f"through `{role_retry} ROLE --project {shlex.quote(str(team.project))} "
+        "--backoff-from PROVIDER -` with the brief on stdin. Use the failed role's name and actual "
+        "provider. Ask for the usual approval if the shell sandbox denies the specialist command. "
+        "Include any known partial work so the next specialist can continue it. A role's ordinary "
+        "failure or discussion of usage limits is not a provider quota failure. When Syndicate "
+        "reports the task is on hold, its closeout is already committed. Preserve outstanding "
+        "work in the checkpoint before ending the session."
+    )
     body += "\n\n" + split_frontmatter(CLOSEOUT_SKILL.read_text())[1]
     return body + live_instructions(team.project)
 
@@ -1058,7 +1076,7 @@ def gather_statuses(sweep: bool = True) -> list[dict]:
                            key=lambda t: t.get("completed_at") or t.get("updated_at") or "", reverse=True)
         ended = sorted((t for t in tasks if t.get("state") == ENDED),
                        key=lambda t: t.get("ended_at") or t.get("updated_at") or "", reverse=True)
-        attention = {"waiting_on_user", "blocked", "failed", "unknown"}
+        attention = {"waiting_on_user", "on_hold", "blocked", "failed", "unknown"}
         unfinished.sort(key=lambda t: (0 if t.get("state") in attention else 1 if t.get("state") == "running" else 2))
         label = ("Needs attention" if any(t.get("state") in attention for t in unfinished) or any(t.get("needs_attention") for t in ended)
                  else "Working" if any(t.get("state") == "running" for t in unfinished)
@@ -1273,24 +1291,28 @@ def launch_tmux(argv, directory, name, headless=False):
         shell = (f'{command} >{shlex.quote(str(output))} 2>{shlex.quote(str(errors))}; '
                  f'result=$?; printf "%s" "$result" >{shlex.quote(str(code) + ".tmp")}; '
                  f'mv {shlex.quote(str(code) + ".tmp")} {shlex.quote(str(code))}')
-        result = subprocess.run([*base, '-P', '-F', '#{session_id}',
-                                 shlex.join(['/bin/sh', '-c', shell])], capture_output=True, text=True)
-        if result.returncode:
-            raise SyndicateError(result.stderr.strip())
-        target = result.stdout.strip() or target
-        previous_term = signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-        try:
-            while not code.exists():
-                time.sleep(0.1)
-                if subprocess.run(['tmux', 'has-session', '-t', target], capture_output=True).returncode and not code.exists():
-                    raise SyndicateError(f'tmux session {name} exited without a result')
-            sys.stdout.write(output.read_text())
-            sys.stderr.write(errors.read_text())
-            return int(code.read_text())
-        finally:
-            signal.signal(signal.SIGTERM, previous_term)
-            # This session was created by this invocation, never an existing team.
-            subprocess.run(['tmux', 'kill-session', '-t', target], capture_output=True)
+        with runtime.specialist_signals() as check_interrupt:
+            result = subprocess.run([*base, '-P', '-F', '#{session_id}',
+                                     shlex.join(['/bin/sh', '-c', shell])], capture_output=True, text=True,
+                                    start_new_session=True)
+            if result.returncode:
+                check_interrupt()
+                raise SyndicateError(result.stderr.strip())
+            target = result.stdout.strip() or target
+            try:
+                while not code.exists():
+                    check_interrupt()
+                    time.sleep(0.1)
+                    if subprocess.run(['tmux', 'has-session', '-t', target], capture_output=True).returncode and not code.exists():
+                        check_interrupt()
+                        raise SyndicateError(f'tmux session {name} exited without a result')
+                check_interrupt()
+                sys.stdout.write(output.read_text())
+                sys.stderr.write(errors.read_text())
+                return int(code.read_text())
+            finally:
+                # This session was created by this invocation, never an existing team.
+                subprocess.run(['tmux', 'kill-session', '-t', target], capture_output=True)
 
 
 def cmd_task(args):
@@ -2272,21 +2294,24 @@ def run_session(args: argparse.Namespace) -> int | None:
         if team.host == "claude" and args.print:
             # Headless Claude gives up on still-running subagents after 600s; a team run is longer.
             os.environ.setdefault("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "0")
-        if exec_cli:
-            os.chdir(project)
-            os.execvp(argv[0], argv)
-        runtime.start_monitor(SCRIPT)
-        # Only the host is enforced for the whole run. A delegated provider is
-        # enforced while one of its specialists runs (run-role gate and lease).
-        providers = {team.host}
         task = args.rest[0] if args.rest else "Interactive session; see checkpoint and session output for requests."
+        task_owner = (session["task_id"], session["id"]) if session else None
+        if exec_cli:
+            run_id = runtime.write_run_record(project, task, team.host, None, task_owner)
+            os.chdir(project)
+            os.execvpe(argv[0], argv, {**os.environ, runtime.RUN_ENV: run_id})
+        runtime.start_monitor(SCRIPT)
+        # The host is enforced for the whole run. Each specialist runner
+        # enforces its own usage reserve so it can retry without stopping the host.
+        providers = {team.host}
         print(f"syndicate: monitoring {team.host} account limits; handoff at {reserve:g}% remaining, "
-              "judged by the latest recorded reading. Stale or missing telemetry is reported, not enforced; "
-              "delegated specialists are checked at launch and while they run.", file=sys.stderr)
+              "judged by the latest recorded reading. Delegated specialists check usage at launch "
+              "and while they run.", file=sys.stderr)
         # The supervisor alone holds session.lock; the CLI child is recorded as an
         # additional owner so a supervisor crash is not mistaken for the end.
         result, handoff = runtime.supervise(argv, project, providers, reserve, task, team.host, headless=args.print,
                                            on_start=lambda pid: record_cli_owner(project, session, pid),
+                                           task_owner=task_owner,
                                            live=None if getattr(args, 'no_live', False) else dict(directory=REGISTRY_PATH.parent / 'portfolio', **inbox))
         if handoff is None:
             return result
@@ -2312,19 +2337,16 @@ def run_session(args: argparse.Namespace) -> int | None:
         return None  # cmd_run retains the project lock while starting the confirmed target
 
 
-def specialist_gate(team: Team, role: Role, warn: bool = True) -> None:
+def specialist_gate(role: Role, reserve: float | None) -> None:
     """Refuse to launch a specialist whose provider is at or below the reserve.
 
     Decides with the latest real reading (stale or awaiting-reset readings
-    count). No reading at all fails loudly: the supervisor could not enforce
+    count). No reading at all fails loudly: the runner could not enforce
     the reserve for this provider. No gate applies with handoff = off.
-    warn=False suppresses the stale-telemetry warning (refusals still apply),
-    for the inner tmux run whose launcher already printed it.
     """
-    if team.config["handoff"] == "off":
+    if reserve is None:
         return
     provider = role.cli
-    reserve = float(team.config["handoff-reserve"])
     observation = runtime.read_json(runtime.STATE / f"{provider}.json")
     remaining = runtime.latest_reading(observation)
     refused = f"refusing to launch the {role.name} specialist on {provider}; no {provider} CLI was launched. "
@@ -2342,14 +2364,53 @@ def specialist_gate(team: Team, role: Role, warn: bool = True) -> None:
                              f"{reserve:g}% reserve cannot be enforced. " + guidance)
     when = runtime.format_time(runtime.observed_time(observation), missing="at an unknown time")
     if remaining <= reserve:
-        raise SyndicateError(refused + f"The last {provider} reading (observed {when}) shows {remaining:g}% "
-                             f"account usage remaining, at or below the {reserve:g}% reserve. A passed reset "
-                             f"time does not count as restored capacity; check 'syndicate limits', or {move}. "
-                             f"Recovery: {runtime.forget_hint(provider)}.")
+        raise SpecialistReserveReached(refused + f"The last {provider} reading (observed {when}) shows {remaining:g}% "
+                                     f"account usage remaining, at or below the {reserve:g}% reserve. A passed reset "
+                                     f"time does not count as restored capacity; check 'syndicate limits', or {move}. "
+                                     f"Recovery: {runtime.forget_hint(provider)}.", 1)
     state, _ = runtime.availability(observation)
-    if warn and state != "current":
+    if state != "current":
         print(f"syndicate: WARNING: {provider} usage telemetry is {state}; launching {role.name} on the last "
               f"reading (observed {when}, {remaining:g}% remaining).", file=sys.stderr)
+
+
+def role_task_owner(project):
+    """Identify the current task/session before a specialist attempt starts."""
+    inherited_run = os.environ.get(runtime.RUN_ENV)
+    if not runtime.valid_run_id(inherited_run):
+        return None
+    status = runtime.read_json(status_path(project))
+    current = status.get("current")
+    if isinstance(current, dict):
+        task_id, session_id = current.get("task_id"), current.get("session_id")
+        if all(isinstance(value, str) and value for value in (task_id, session_id)):
+            state, record = read_run_record(project)
+            if state == "valid" and (record["id"], record.get("task_id"), record.get("session_id")) == (
+                    inherited_run, task_id, session_id):
+                return task_id, session_id
+    return None
+
+
+def hold_role_task(project, owner, role, providers):
+    """Park the owning task without rewriting the orchestrator's status file."""
+    if owner is None or portfolio.is_chief_record(portfolio_dir(), path=project):
+        return False
+    task_id, session_id = owner
+    store = coordination_store()
+    with store.edit(read_only=True) as data:
+        status = read_status(str(project)) or {}
+        current = status.get("current") or {}
+        if (current.get("task_id"), current.get("session_id")) != owner:
+            return False
+        if status.get("state") != "running":
+            return status.get("state") == "on_hold"
+        session = next((s for s in data["sessions"] if s["id"] == session_id
+                        and (s["source_path"], s["task_id"]) == (str(project), task_id)), None)
+        if not session or not store.session_live(session):
+            return False
+        progress = f"Task on hold. {role.name} could not run because the usage limit or reserve was reached on {', '.join(providers)}."
+        commit_closeout(project, task_id, session_id, "on_hold", progress, progress)
+    return True
 
 
 def cmd_run_role(args: argparse.Namespace) -> int:
@@ -2362,24 +2423,85 @@ def cmd_run_role(args: argparse.Namespace) -> int:
         raise SyndicateError(f"unknown role '{args.role}'")
     if getattr(args, "runtime", None):
         role.cli = args.runtime
-    require_clis({role.cli})
     brief = sys.stdin.read() if args.brief == "-" else args.brief
-    lease_held = getattr(args, "lease_held", False)
-    specialist_gate(team, role, warn=not lease_held)  # the tmux launcher already warned
-    with ExitStack() as stack:
-        if not lease_held:
-            enter_specialist_lease(stack, project, team, role)
-        result = launch_role(project, team, role, brief)
+    owner = role_task_owner(project)
+    failed_provider = getattr(args, "backoff_from", None)
+    if failed_provider and getattr(args, "runtime", None):
+        raise SyndicateError("--runtime and --backoff-from cannot be combined")
+    providers = {cli for cli in CLIS if shutil.which(cli)}
+    launch_reserve = float(team.config["handoff-reserve"]) if team.config["handoff"] == "on" else None
+    run_reserve = specialist_run_reserve(project, launch_reserve)
+    reserve = max(launch_reserve or 0, run_reserve or 0)
+    exhausted = set()
+    if failed_provider:
+        exhausted.add(failed_provider)
+        providers.add(failed_provider)
+        failure = runtime.RoleUsageLimit(f"{failed_provider} reported a usage limit for {role.name}")
+    else:
+        require_clis({role.cli})
+        providers.add(role.cli)
+        failure = None
+    provider = role.cli
+    while True:
+        if failure is not None:
+            readings = {cli: runtime.recorded_remaining(cli) for cli in sorted(providers)}
+            untried = {cli: remaining for cli, remaining in readings.items() if cli not in exhausted}
+            available = [cli for cli, remaining in untried.items() if remaining is not None and remaining > reserve]
+            # A Codex read-only role may run shell checks in its isolated
+            # scratch workspace. Claude tools alone cannot enforce that boundary.
+            if not role.can_write and "codex" in exhausted and "claude" in available:
+                available.remove("claude")
+                print(f"syndicate: cannot retry {role.name} on claude with the Codex read-only workspace restrictions.",
+                      file=sys.stderr)
+            if not available:
+                if all(remaining is not None and remaining <= reserve for remaining in untried.values()):
+                    try:
+                        held = hold_role_task(project, owner, role, sorted(providers))
+                    except OSError as error:
+                        raise SyndicateError(f"could not put the task on hold: {error}; "
+                                             "if sandboxed, retry this run-role command outside the sandbox with approval") from error
+                    if held:
+                        print(f"syndicate: task is on hold after hitting usage limits for {role.name}.", file=sys.stderr)
+                        return 75
+                    print(f"syndicate: usage limits exhausted for {role.name}; no active owning task was placed on hold.",
+                          file=sys.stderr)
+                elif any(remaining is None for remaining in untried.values()):
+                    missing = ", ".join(cli for cli, remaining in untried.items() if remaining is None)
+                    print(f"syndicate: no fallback with known usage available for {role.name}; "
+                          f"no usage reading for {missing}.", file=sys.stderr)
+                if isinstance(failure, SyndicateError):
+                    raise failure
+                print(f"syndicate: {failure}", file=sys.stderr)
+                return failure.exit_code
+            provider = max(available, key=readings.__getitem__)
+            print(f"syndicate: {failure}; retrying {role.name} on {provider} "
+                  f"({readings[provider]:g}% last recorded remaining).", file=sys.stderr)
+        attempt = copy(role)
+        attempt.cli = provider
+        try:
+            specialist_gate(attempt, reserve if launch_reserve is not None else None)
+            with ExitStack() as stack:
+                enter_specialist_lease(stack, project, team, attempt)
+                attempt_brief = brief
+                if exhausted:
+                    attempt_brief += ("\n\nAn earlier attempt hit a provider usage limit. Inspect the existing "
+                                      "state and continue any partial work. Verify whether earlier actions "
+                                      "completed before repeating them.")
+                result = launch_role(project, team, attempt, attempt_brief, reserve=run_reserve)
+        except runtime.RoleUsageLimit as error:
+            failure = error
+            exhausted.add(provider)
+            continue
         if result == 0:
-            print(f"Syndicate specialist completed: {role.name} {role.cli} {uuid.uuid4().hex}")
+            print(f"Syndicate specialist completed: {role.name} {provider} {uuid.uuid4().hex}")
         return result
 
 
 RUN_RECORD_MAX_BYTES = 1 << 20  # run.json holds the task text; anything larger is not a record we wrote
 
 
-def read_run_record(project: Path) -> tuple[str, str | None]:
-    """('missing' | 'invalid' | 'valid', run id) for .syndicate/run.json.
+def read_run_record(project: Path) -> tuple[str, dict | None]:
+    """('missing' | 'invalid' | 'valid', record) for .syndicate/run.json.
 
     Opened without following symbolic links (neither .syndicate nor run.json)
     and non-blocking; it must be a regular file owned by this user, at most
@@ -2417,7 +2539,7 @@ def read_run_record(project: Path) -> tuple[str, str | None]:
     except (ValueError, UnicodeDecodeError, RecursionError):
         return "invalid", None
     run_id = record.get("id") if isinstance(record, dict) else None
-    return ("valid", run_id) if len(raw) <= RUN_RECORD_MAX_BYTES and runtime.valid_run_id(run_id) else ("invalid", None)
+    return ("valid", record) if len(raw) <= RUN_RECORD_MAX_BYTES and runtime.valid_run_id(run_id) else ("invalid", None)
 
 
 def session_lock_state(project: Path) -> str:
@@ -2459,8 +2581,8 @@ def supervised_run_id(project: Path, role: Role, problem: str) -> str | None:
     # Probe, read, probe: a supervisor that exits and is replaced between the
     # read and a single probe would otherwise lend this lease a stale run id.
     lock = session_lock_state(project)
-    record, run_id = read_run_record(project)
-    if record == "missing":
+    state, record = read_run_record(project)
+    if state == "missing":
         return None
     if lock == "held":
         lock = session_lock_state(project)
@@ -2474,24 +2596,35 @@ def supervised_run_id(project: Path, role: Role, problem: str) -> str | None:
                              f"{role.cli} reserve. Check that file (it must be a regular file owned by you), "
                              f"or make sure {runtime.RUN_ENV} reaches run-role (for Codex, its "
                              "shell_environment_policy must keep it).")
-    if record != "valid":
+    if state != "valid":
         raise SyndicateError(refused + f"a supervised run holds {project_lock_path(project)} but "
                              f"{Path(project) / LOCAL / 'run.json'} does not name a valid run id, so the lease "
                              f"could not be attributed to it. Make sure {runtime.RUN_ENV} reaches run-role "
                              "(for Codex, its shell_environment_policy must keep it).")
-    return run_id
+    return record["id"]
+
+
+def specialist_run_reserve(project: Path, launch_reserve: float | None) -> float | None:
+    """Use the live supervisor's one-run reserve override when present."""
+    if launch_reserve is None:
+        return None
+    state, record = read_run_record(project)
+    if state == "valid":
+        reserve = record.get("reserve")
+        if type(reserve) in (int, float) and 0 < reserve < 100 and session_lock_state(project) == "held":
+            return float(reserve)
+    return launch_reserve
 
 
 def enter_specialist_lease(stack: ExitStack, project: Path, team: Team, role: Role) -> None:
-    """Hold this specialist's lease on stack so the supervisor enforces its provider.
+    """Record the locally enforced specialist against its supervising run.
 
     With handoff on, the lease names the supervised run: SYNDICATE_RUN_ID
     (set by the supervisor) or, if that is missing or malformed (for example,
     stripped by a Codex shell_environment_policy), the live run found through
     run.json and a held session.lock (supervised_run_id). With no supervised
-    run live, no lease is written and a warning says that only the launch
-    gate applied. Failure to write the lease refuses the launch (fail
-    closed): the specialist would run unenforced.
+    run live, no lease is written. A failure to record a supervised lease
+    refuses the launch rather than running an untracked specialist.
     """
     if team.config["handoff"] == "off":
         return
@@ -2502,29 +2635,37 @@ def enter_specialist_lease(stack: ExitStack, project: Path, team: Team, role: Ro
         found = supervised_run_id(project, role, detail)
         if found is None:
             print(f"syndicate: WARNING: {runtime.RUN_ENV} {detail} and no Syndicate-supervised run is live "
-                  f"for this project; the launch gate applied, but in-run enforcement of the {provider} "
-                  f"reserve is unavailable while {role.name} runs.", file=sys.stderr)
+                  f"for this project; {role.name} will enforce the {provider} reserve locally without a lease.",
+                  file=sys.stderr)
             return
         print(f"syndicate: {runtime.RUN_ENV} {detail}; using run id {found} from "
               f"{Path(project) / LOCAL / 'run.json'} (its supervisor holds the session lock) for the "
               f"{role.name} specialist lease.", file=sys.stderr)
         run_id = found
     try:
-        stack.enter_context(runtime.specialist_lease(project, provider, role.name, run_id))
+        stack.enter_context(runtime.specialist_lease(project, provider, role.name, run_id, local_quota=True))
     except (OSError, ValueError) as error:
         raise SyndicateError(
             f"cannot record the {role.name} specialist lease in {runtime.lease_directory(project)}: {error}; "
-            f"refusing to launch the specialist, so no {provider} CLI was launched. The supervisor needs the "
-            f"lease to enforce the {provider} reserve while it runs. If a sandbox denied the write, rerun this "
+            f"refusing to launch the specialist, so no {provider} CLI was launched. The supervisor uses the "
+            "lease to track its specialists. If a sandbox denied the write, rerun this "
             "exact run-role command outside the sandbox with approval.") from error
 
 
-def launch_role(project: Path, team: Team, role: Role, brief: str) -> int:
+def launch_role(project: Path, team: Team, role: Role, brief: str, *, reserve: float | None) -> int:
     if role.cli == "claude":
         argv = ["claude", "-p", "--agents", json.dumps({role.name: claude_agent(role)}), "--agent", role.name]
         if role.can_write:
             argv += ["--permission-mode", "acceptEdits"]
-        argv += cli_options('claude', team.config) + ['--', brief]
+        configured_format = cli_value(team.config.get("claude-output-format", "false"))
+        claude_text = configured_format is False or configured_format == "text"
+        config = team.config
+        if claude_text:
+            config = {**config, "claude-output-format": "json"}
+        argv += cli_options('claude', config) + ['--', brief]
+        return runtime.run_specialist_process(
+            argv, cwd=project, reserve=reserve, claude_text=claude_text,
+            structured_stdout=claude_text or configured_format in ("json", "stream-json"))
     else:
         # Keep reviewers' repository read-only while allowing test fixtures and
         # bytecode in a disposable workspace outside the repository. Native
@@ -2555,8 +2696,7 @@ def launch_role(project: Path, team: Team, role: Role, brief: str) -> int:
                 argv += ["--add-dir", str(REGISTRY_PATH.parent / "portfolio")]
             argv += cli_options('codex', team.config) + ['--', brief]
             env = dict(os.environ, TMPDIR=scratch, PYTHONDONTWRITEBYTECODE="1")
-            return subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL).returncode
-    return subprocess.run(argv, cwd=project, stdin=subprocess.DEVNULL).returncode
+            return runtime.run_specialist_process(argv, cwd=cwd, env=env, reserve=reserve)
 
 
 def forget_reading(provider: str) -> int:
@@ -2893,7 +3033,7 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     edit.add_argument("--source", help="source directory, required for ambiguous task IDs")
     edit.add_argument("--project", help="assign to repo name/path or generic")
     edit.add_argument("--summary")
-    edit.add_argument("--state", choices=("queued", "running", "waiting_on_user", "blocked", "failed", "done", ENDED),
+    edit.add_argument("--state", choices=("queued", "running", "waiting_on_user", "on_hold", "blocked", "failed", "done", ENDED),
                       help="ended: closed without completion (use done only for finished work)")
     edit.set_defaults(fn=cmd_tasks)
     p = team_actions.add_parser("init", help="create .syndicate/ in a project and exclude it from git")
@@ -2908,7 +3048,9 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p.set_defaults(fn=cmd_config)
     p = team_actions.add_parser("run-role", help="run one role headlessly on its configured CLI (used by relay agents)")
     p.add_argument("role")
-    p.add_argument("--runtime", choices=CLIS, help="use the runtime resolved by the parent session")
+    provider = p.add_mutually_exclusive_group()
+    provider.add_argument("--runtime", choices=CLIS, help="start with the runtime resolved by the parent session")
+    provider.add_argument("--backoff-from", choices=CLIS, help="retry after this provider reported an account usage limit")
     p.add_argument("brief", help="the task, or - to read it from stdin")
     p.add_argument("--project", dest="dir", default=".")
     p.set_defaults(fn=cmd_run_role)
@@ -2991,24 +3133,11 @@ def main(argv: list[str]) -> int:
                         original_argv = ['team', 'run-role', args.role, '--project', str(directory)]
                         if args.runtime:
                             original_argv += ['--runtime', args.runtime]
+                        if args.backoff_from:
+                            original_argv += ['--backoff-from', args.backoff_from]
                         original_argv += ['--', brief]
-            if args.fn == cmd_run_role:
-                # This launcher waits for the tmux-hosted specialist and runs in
-                # the supervised CLI's environment, so it gates and carries the
-                # lease; the inner run (_in-tmux) does not write another.
-                team = resolve_team(directory)
-                role = team.roles.get(args.role)
-                if role and args.role != 'orchestrator':
-                    if args.runtime:
-                        role.cli = args.runtime
-                    specialist_gate(team, role)
-                    with ExitStack() as stack:
-                        enter_specialist_lease(stack, directory, team, role)
-                        return launch_tmux(original_argv, directory, name, headless=True)
             return launch_tmux(original_argv, directory, name,
                                headless=getattr(args, 'print', False) or args.fn == cmd_run_role)
-        if inside_tmux and args.fn == cmd_run_role:
-            args.lease_held = True  # the launcher outside tmux holds it
         args.inside_tmux = inside_tmux
         return args.fn(args)
     except (SyndicateError, portfolio.PortfolioError) as e:

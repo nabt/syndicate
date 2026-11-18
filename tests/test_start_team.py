@@ -1,6 +1,8 @@
 import contextlib
 import io
+import os
 import shlex
+import signal
 import subprocess
 import shutil
 import unittest
@@ -135,6 +137,24 @@ class TeamTasks(ProjectCase):
             self.assertEqual(sy.launch_tmux(['-p', 'Task'], self.project, 'headless', headless=True), 7)
         self.assertEqual(out.getvalue(), 'result\n')
         self.assertEqual(err.getvalue(), 'diagnostic\n')
+
+    def test_headless_sighup_cleans_up_its_tmux_session(self):
+        def execute(argv, **kwargs):
+            if argv[1] == 'has-session':
+                return subprocess.CompletedProcess(argv, 1)
+            if argv[1] == 'new-session':
+                self.assertTrue(kwargs.get('start_new_session'))
+                os.kill(os.getpid(), signal.SIGHUP)
+                return subprocess.CompletedProcess(argv, 0, '$42\n', '')
+            return subprocess.CompletedProcess(argv, 0)
+
+        with patch.object(sy.shutil, 'which', return_value='/usr/bin/tmux'), \
+             patch.object(sy.subprocess, 'run', side_effect=execute) as run, \
+             self.assertRaises(SystemExit) as stopped:
+            sy.launch_tmux(['team', 'run-role', 'backend-engineer', 'Task'],
+                           self.project, 'headless-role', headless=True)
+        self.assertEqual(stopped.exception.code, 128 + signal.SIGHUP)
+        self.assertEqual(run.call_args.args[0], ['tmux', 'kill-session', '-t', '$42'])
 
 
 class TmuxConfig(ProjectCase):
