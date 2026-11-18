@@ -42,6 +42,14 @@ RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}-[0-9a-f]{8}")
 RUN_ENV = "SYNDICATE_RUN_ID"
 MAX_TIMESTAMP = 10**10  # epoch seconds (year 2286); larger values are treated as malformed
 PROVIDERS = ("claude", "codex")
+ROLE_QUOTA_MESSAGES = {
+    "claude": re.compile(r"^You['’]ve hit your (?:usage |session |weekly )?limit(?:$|[. ·])"),
+    "codex": re.compile(r"^You['’]ve hit your usage limit(?:$|\.)"),
+}
+CLAUDE_QUOTA_RESET = re.compile(
+    r"^You['’]ve hit your (?:usage |session |weekly )?limit · resets? \S"
+)
+ROLE_OUTPUT_TAIL = 32 * 1024
 clock = time.time  # supervisor loop clock; tests patch this module-local name
 _O = lambda name: getattr(os, name, 0)  # noqa: E731 - flags absent on some platforms
 
@@ -216,6 +224,183 @@ def latest_reading(observation):
     return min((w["remaining_percent"] for w in usage_windows(observation)), default=None)
 
 
+def recorded_remaining(provider):
+    return latest_reading(read_json(STATE / f"{provider}.json"))
+
+
+class RoleUsageLimit(Exception):
+    """A role could not continue on its current provider's account quota."""
+
+    def __init__(self, reason, exit_code=75):
+        super().__init__(reason)
+        self.exit_code = exit_code
+
+
+@contextmanager
+def specialist_signals():
+    """Stop the whole specialist group when its wrapper is interrupted."""
+    received = None
+
+    def interrupt(sig, _):
+        nonlocal received
+        if received is None:
+            received = sig
+
+    def check():
+        if received is not None:
+            raise SystemExit(128 + received)
+
+    handlers = {sig: signal.signal(sig, interrupt) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    try:
+        yield check
+    finally:
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+
+
+def reported_role_quota(provider, stdout, stderr):
+    """Match account-quota diagnostics in the provider's text and JSON output."""
+    pattern = ROLE_QUOTA_MESSAGES[provider]
+    if provider == "claude":
+        if any(CLAUDE_QUOTA_RESET.match(line) or (line.startswith("Error: ") and pattern.match(line[7:]))
+               for line in stderr.splitlines()):
+            return True
+    elif any(pattern.match(line.removeprefix("ERROR: "))
+             for line in stderr.splitlines() if line.startswith("ERROR: ")):
+        return True
+    for line in stdout.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        kind = event.get("type")
+        if provider == "claude":
+            if kind != "result" or event.get("is_error") is not True:
+                continue
+            messages = [event.get("result")]
+            errors = event.get("errors")
+            if isinstance(errors, list):
+                messages.extend(errors)
+        elif kind == "error":
+            messages = [event.get("message")]
+        else:
+            error = event.get("error")
+            messages = [error.get("message")] if kind == "turn.failed" and isinstance(error, dict) else []
+        if any(isinstance(message, str) and pattern.match(message) for message in messages):
+            return True
+    return False
+
+
+def render_claude_result(output):
+    """Render Claude's default JSON capture as the print CLI's text result."""
+    try:
+        event = json.loads(output)
+    except (ValueError, RecursionError):
+        return output
+    if isinstance(event, dict) and event.get("type") == "result":
+        result = event.get("result")
+        if isinstance(result, str):
+            return (result if result.endswith("\n") else result + "\n").encode(errors="replace")
+        errors = event.get("errors")
+        if isinstance(errors, list) and all(isinstance(error, str) for error in errors):
+            return ("\n".join(errors) + "\n").encode(errors="replace")
+    return output
+
+
+def run_specialist_process(argv, *, cwd, env=None, reserve=None, claude_text=False, structured_stdout=False):
+    """Forward CLI output, enforcing quota for just this specialist process."""
+    claude_output = bytearray()
+    pending_record = bytearray()
+    stderr_tail = b""
+    structured_quota = False
+    with specialist_signals() as check_interrupt, selectors.DefaultSelector() as selector, subprocess.Popen(
+            argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, start_new_session=True) as proc:
+        for name in ("stdout", "stderr"):
+            pipe = getattr(proc, name)
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, name)
+
+        def forward(name, chunk):
+            stream = getattr(sys, name)
+            if hasattr(stream, "buffer"):
+                stream.buffer.write(chunk)
+            else:
+                stream.write(chunk.decode(errors="replace"))
+            stream.flush()
+
+        def inspect_structured_stdout(chunk):
+            nonlocal pending_record, structured_quota
+            first, *records = chunk.split(b"\n")
+            pending_record.extend(first)
+            if records:
+                remainder = records.pop()
+                structured_quota = any(
+                    reported_role_quota(argv[0], record.decode(errors="replace"), "")
+                    for record in (pending_record, *records)
+                )
+                pending_record = bytearray() if structured_quota else bytearray(remainder)
+
+        def drain(timeout):
+            nonlocal stderr_tail
+            for key, _ in selector.select(timeout):
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                name = key.data
+                if claude_text and name == "stdout":
+                    claude_output.extend(chunk)
+                else:
+                    forward(name, chunk)
+                    if name == "stderr":
+                        stderr_tail = (stderr_tail + chunk)[-ROLE_OUTPUT_TAIL:]
+                    elif structured_stdout and not structured_quota:
+                        inspect_structured_stdout(chunk)
+
+        try:
+            next_check = 0
+            next_worker_check = 0
+            workers = {}
+            while proc.poll() is None:
+                check_interrupt()
+                now = time.monotonic()
+                if now >= next_worker_check:
+                    workers.update(descendants(proc.pid))
+                    next_worker_check = now + 0.25
+                if selector.get_map():
+                    drain(0.25)
+                else:
+                    try:
+                        proc.wait(timeout=0.25)
+                    except subprocess.TimeoutExpired:
+                        pass
+                check_interrupt()
+                now = time.monotonic()
+                if reserve is not None and now >= next_check and proc.poll() is None:
+                    next_check = now + 1
+                    remaining = recorded_remaining(argv[0])
+                    if remaining is not None and remaining <= reserve:
+                        raise RoleUsageLimit(f"{argv[0]} reached the role usage reserve "
+                                             f"({remaining:g}% remaining, {reserve:g}% reserve)")
+            # Drain both pipes without waiting on descendants holding them open.
+            for _ in range(4):
+                drain(0)
+            check_interrupt()
+            if claude_text:
+                forward("stdout", render_claude_result(claude_output))
+            stdout = claude_output if claude_text else pending_record
+            if proc.returncode and (structured_quota or reported_role_quota(
+                    argv[0], stdout.decode(errors="replace"), stderr_tail.decode(errors="replace"))):
+                raise RoleUsageLimit(f"{argv[0]} reported a usage limit", proc.returncode)
+        except BaseException:
+            stop_group(proc, workers)
+            raise
+    return proc.returncode
+
+
 def supervision_usage(observation, chief=False, now=None):
     """(state, remaining) for enforcing the reserve with the latest real reading.
 
@@ -305,7 +490,7 @@ def valid_run_id(value):
 
 
 @contextmanager
-def specialist_lease(project, provider, role, run_id):
+def specialist_lease(project, provider, role, run_id, *, local_quota=False):
     """Hold a lease for a running delegated specialist of supervised run run_id.
 
     Raises OSError (or ValueError for invalid fields) if the lease cannot be
@@ -316,8 +501,11 @@ def specialist_lease(project, provider, role, run_id):
         raise ValueError("invalid lease provider or run id")
     if not isinstance(role, str) or not ROLE.fullmatch(role):
         role = "unnamed-role"  # still enforced; the label is only descriptive
-    payload = json.dumps({"version": 2, "run_id": run_id, "provider": provider, "role": role,
-                          "created_at": time.time()}).encode()
+    record = {"version": 2, "run_id": run_id, "provider": provider, "role": role,
+              "created_at": time.time()}
+    if local_quota:
+        record["local_quota"] = True
+    payload = json.dumps(record).encode()
     directory = _open_lease_directory(project, create=True)
     fd = None
     name = None
@@ -432,7 +620,10 @@ def read_leases(project, run_id=None, on_cap=None):
                 continue
             if run_id is not None and owner != run_id:
                 continue
-            leases.append({"provider": provider, "role": role, "run_id": owner})
+            lease = {"provider": provider, "role": role, "run_id": owner}
+            if data.get("local_quota") is True:
+                lease["local_quota"] = True
+            leases.append(lease)
     finally:
         os.close(directory)
     return leases
@@ -656,22 +847,30 @@ def stop_group(proc, known=None):
     proc.wait()
 
 
+def write_run_record(project, task, host, threshold, task_owner):
+    run_id = time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    record = {"id": run_id, "task": task, "provider": host,
+              "reserve": threshold, "started_at": time.time()}
+    if task_owner:
+        record["task_id"], record["session_id"] = task_owner
+    atomic_json(project / ".syndicate" / "run.json", record)
+    return run_id
+
+
 def supervise(argv, project, providers, threshold, task, host, headless=False, live=None, pass_fds=(),
-              on_start=None, chief=False):
+              on_start=None, chief=False, task_owner=None):
     """Proxy a CLI terminal while keeping monitoring outside the model loop.
 
-    providers are enforced for the whole run (the host). In project sessions,
-    the CLI runs with SYNDICATE_RUN_ID set to this run's id, and the provider of
-    each held specialist lease of this run (see specialist_lease) is also
-    enforced while that specialist runs. Enforcement uses the latest real
-    reading; stale or unknown telemetry only produces a warning.
+    providers are enforced for the whole run (the host). In project sessions
+    the CLI receives SYNDICATE_RUN_ID. Specialists of this run enforce their
+    own quota and backoff. Legacy leases still use supervisor enforcement.
+    Enforcement uses the latest real reading.
 
     on_start(pid), if given, is called once the CLI child has been started,
     so the caller can record it as an owner of the session."""
-    run_id = time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     local = project / ".syndicate"
     (local / "runs").mkdir(parents=True, exist_ok=True, mode=0o700)
-    atomic_json(local / "run.json", {"id": run_id, "task": task, "provider": host, "started_at": time.time()})
+    run_id = write_run_record(project, task, host, threshold, task_owner)
     warned = {}  # provider -> telemetry state last warned about (one warning per transition)
     for provider in sorted(providers):
         observation = read_json(STATE / f"{provider}.json")
@@ -802,7 +1001,8 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
                     # failure, treat this tick as having no leases.
                     try:
                         for lease in read_leases(project, run_id, on_cap=lease_cap):
-                            enforced.setdefault(lease["provider"], lease["role"])
+                            if not lease.get("local_quota"):
+                                enforced.setdefault(lease["provider"], lease["role"])
                     except Exception as error:
                         if not lease_failed:
                             lease_failed = True

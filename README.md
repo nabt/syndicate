@@ -138,22 +138,21 @@ syndicate team task --reserve 20 --project ~/code/some-project "your task"
 syndicate limits --watch
 ```
 
-The host CLI is enforced for the whole run with its latest recorded reading;
-stale or missing telemetry produces a warning, not a stop. A specialist on the
-other CLI is checked at launch (no reading, or one at the reserve, refuses it)
-and enforced while it runs. Claude telemetry depends on an interactive status
-line; headless Claude cannot supply it on its own. If a recorded reading is
-known to be outdated, `syndicate limits --forget claude` (or `codex`) discards
-it; Syndicate never does this on its own.
+Syndicate checks the host's latest recorded reading throughout the run.
+A specialist that hits a usage limit can retry on the installed provider with
+the highest recorded usable quota. When every installed provider is exhausted
+or at its reserve, Syndicate puts the task **On hold**. Claude telemetry comes
+from an interactive status line. To discard a reading you know is outdated,
+use `syndicate limits --forget claude` or `syndicate limits --forget codex`.
 Read [Usage-aware handoffs](docs/handoff.md) for setup, recovery commands,
 provider limitations, and reset notifications.
 
 ## Monitoring
 
-Every run registers its project in `~/.syndicate/projects.json` and keeps
-`.syndicate/status.json` updated: current state (`running`,
-`waiting_on_user`, or `done`), which role is active and what it's doing, and
-a running history of past rounds. Two ways to watch it, across every
+Every team run registers its project in `~/.syndicate/projects.json`.
+The dashboard combines the current status, role, and history from
+`.syndicate/status.json` with durable task closeouts such as `on_hold`.
+Two ways to watch it, across every
 registered project at once:
 
 ```sh

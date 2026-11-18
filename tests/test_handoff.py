@@ -597,6 +597,34 @@ class ProjectUsagePolicy(ProjectCase):
         self.assertIn("claude: 10% account usage remaining (reserve 10%) while the backend-engineer "
                       "specialist was running", (handoff / "handoff.md").read_text())
 
+    def test_locally_enforced_specialist_reserve_does_not_stop_host(self):
+        self.reading("codex", 50, observed_at=None)
+        self.reading("claude", 50, observed_at=None)
+        specialist = self.project / "claude"
+        specialist.write_text(
+            f"#!{sys.executable}\n"
+            f"import sys,time; sys.path.insert(0, {BIN!r}); import syndicate_runtime as rt\n"
+            f"rt.STATE = rt.Path({str(self.state)!r})\n"
+            "rt.save_observation('claude', {'rate_limits': {'five_hour': {'used_percentage': 95}}})\n"
+            "time.sleep(30)\n"
+        )
+        specialist.chmod(0o700)
+        code = (
+            f"import os,sys,time; sys.path.insert(0, {BIN!r}); import syndicate_runtime as rt\n"
+            f"project = rt.Path({str(self.project)!r}); rt.STATE = rt.Path({str(self.state)!r})\n"
+            "os.environ['PATH'] = str(project) + ':' + os.environ['PATH']\n"
+            f"with rt.specialist_lease(project, 'claude', 'qa', os.environ[{rt.RUN_ENV!r}], local_quota=True):\n"
+            "    try: rt.run_specialist_process(['claude'], cwd=project, reserve=10)\n"
+            "    except rt.RoleUsageLimit as error: print(error, flush=True); time.sleep(1.2)\n"
+            "print('host kept running', flush=True)\n"
+        )
+        result, handoff = self.supervise(code, {"codex"}, "codex", clock=False)
+        self.assertEqual((result, handoff), (0, None))
+        self.out.flush()
+        output = self.out.buffer.getvalue().decode()
+        self.assertIn("claude reached the role usage reserve (5% remaining, 10% reserve)", output)
+        self.assertIn("host kept running", output)
+
     def test_lease_from_another_pid_namespace_is_enforced(self):
         # Regression: a Codex host runs run-role inside its sandbox, which has
         # its own PID namespace (getpid() is 2 there). PID-based leases never
@@ -910,6 +938,75 @@ class ProjectUsagePolicy(ProjectCase):
         self.assertIn("syndicate limits --forget codex", self.errors())
 
 
+class SpecialistProcess(ProjectCase):
+    def test_reports_structured_quota_only_on_provider_error_events(self):
+        codex = '{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit."}}'
+        claude = '{"type":"result","is_error":true,"result":"You\'ve hit your session limit · resets at 3:51pm"}'
+        self.assertTrue(rt.reported_role_quota("codex", codex, ""))
+        self.assertTrue(rt.reported_role_quota("claude", claude, ""))
+        self.assertTrue(rt.reported_role_quota("claude", '{"type":"result","is_error":true,'
+                                               '"errors":["You\'ve hit your usage limit."]}', ""))
+        self.assertFalse(rt.reported_role_quota("codex", codex.replace("turn.failed", "item.completed"), ""))
+        self.assertFalse(rt.reported_role_quota("claude", claude.replace("true", "false"), ""))
+        self.assertFalse(rt.reported_role_quota("claude", "You've hit your limit.", ""))
+        self.assertFalse(rt.reported_role_quota("claude", "You've hit your weekly limit · resets 3:51pm", ""))
+        self.assertTrue(rt.reported_role_quota("claude", "", "You've hit your weekly limit · resets 3:51pm"))
+
+    def test_terminating_role_wrapper_stops_child_session(self):
+        marker = self.project / "child.pid"
+        specialist = self.project / "claude"
+        specialist.write_text(
+            f"#!{sys.executable}\nimport os,time,pathlib\n"
+            f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\n"
+            "time.sleep(30)\n"
+        )
+        specialist.chmod(0o700)
+        child_env = dict(os.environ, PATH=f"{self.project}:{os.environ.get('PATH', '')}", PYTHONPATH=BIN)
+        code = "import syndicate_runtime as rt; rt.run_specialist_process(['claude'], cwd='.')"
+        with subprocess.Popen([sys.executable, "-c", code], cwd=self.project, env=child_env,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as wrapper:
+            try:
+                deadline = time.monotonic() + 5
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(marker.exists(), "stand-in specialist did not start")
+                pid = int(marker.read_text())
+                wrapper.terminate()
+                self.assertEqual(wrapper.wait(timeout=6), 128 + signal.SIGTERM)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+            finally:
+                if wrapper.poll() is None:
+                    wrapper.kill()
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires process identity tracking")
+    def test_quota_failure_stops_detached_worker_before_retry(self):
+        ready = self.project / "worker-ready"
+        stopped = self.project / "worker-stopped"
+        worker = (
+            "import pathlib, signal, time\n"
+            f"def stop(*_): pathlib.Path({str(stopped)!r}).touch(); raise SystemExit(0)\n"
+            "signal.signal(signal.SIGINT, stop)\n"
+            f"pathlib.Path({str(ready)!r}).touch()\n"
+            "time.sleep(5)\n"
+        )
+        specialist = self.project / "codex"
+        specialist.write_text(
+            f"#!{sys.executable}\nimport pathlib, subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, '-c', {worker!r}], start_new_session=True, "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            f"ready = pathlib.Path({str(ready)!r}); deadline = time.monotonic() + 2\n"
+            "while not ready.exists() and time.monotonic() < deadline: time.sleep(.01)\n"
+            "time.sleep(.6)\n"
+            'print("ERROR: You\'ve hit your usage limit.", file=sys.stderr); sys.exit(1)\n'
+        )
+        specialist.chmod(0o700)
+        env = dict(os.environ, PATH=f"{self.project}:{os.environ.get('PATH', '')}")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(rt.RoleUsageLimit):
+            rt.run_specialist_process(["codex"], cwd=self.project, env=env)
+        self.assertTrue(stopped.exists(), "detached specialist worker survived the failed attempt")
+
+
 class SpecialistGate(ProjectCase):
     RUN = "20260101T000000-0123abcd"
 
@@ -920,15 +1017,12 @@ class SpecialistGate(ProjectCase):
             seen.append(rt.read_leases(self.project, run_id))
             if launch_error:
                 raise launch_error
-            return subprocess.CompletedProcess(argv, 0)
-        real_run = subprocess.run
-        def dispatch(argv, **kwargs):  # execution_project invokes git
-            return launched(argv, **kwargs) if argv[0] in ("claude", "codex") else real_run(argv, **kwargs)
+            return 0
         err = io.StringIO()
         environment = {key: value for key, value in os.environ.items() if key != rt.RUN_ENV}
         if env_run_id is not None or run_id:
             environment[rt.RUN_ENV] = env_run_id if env_run_id is not None else run_id
-        with patch.object(sy, "require_clis"), patch.object(sy.subprocess, "run", side_effect=dispatch), \
+        with patch.object(sy, "require_clis"), patch.object(rt, "run_specialist_process", side_effect=launched), \
              patch.dict(os.environ, environment, clear=True), contextlib.redirect_stderr(err):
             try:
                 result = sy.cmd_run_role(args)
@@ -988,7 +1082,8 @@ class SpecialistGate(ProjectCase):
         self.usage("claude", 40, observed_at=100)
         result, seen, err = self.run_role("claude")
         self.assertEqual(result, 0)
-        self.assertEqual(seen, [[{"provider": "claude", "role": "backend-engineer", "run_id": self.RUN}]])
+        self.assertEqual(seen, [[{"provider": "claude", "role": "backend-engineer", "run_id": self.RUN,
+                                  "local_quota": True}]])
         self.assertEqual(os.listdir(rt.lease_directory(self.project)), [])  # released after exit
         self.assertIn("claude usage telemetry is stale", err)
         self.assertNotIn("in-run enforcement", err)
@@ -1008,7 +1103,7 @@ class SpecialistGate(ProjectCase):
         self.assertEqual((result, seen), (0, [[]]))
         self.assertFalse(rt.lease_directory(self.project).exists())
         self.assertIn("SYNDICATE_RUN_ID is not set", err)
-        self.assertIn("in-run enforcement of the claude reserve is unavailable", err)
+        self.assertIn("enforce the claude reserve locally without a lease", err)
 
     def test_lease_write_failure_in_supervised_run_refuses_launch(self):
         self.usage("claude", 40, observed_at=None)
@@ -1035,42 +1130,43 @@ class SpecialistGate(ProjectCase):
         self.assertIn("30% reserve", result)
         self.assertEqual(seen, [])
 
-    def test_tmux_launcher_gates_and_holds_lease_for_detached_specialist(self):
+    def test_active_run_reserve_applies_to_attempt_and_fallback(self):
+        self.run_record(reserve=30)
+        self.hold_session_lock()
+        self.usage("claude", 75)
+        self.usage("codex", 72)
+        result, seen, _ = self.run_role("claude")
+        self.assertIn("30% reserve", result)
+        self.assertEqual(seen, [])  # Both providers started below the active run reserve.
+
+    def test_tmux_hosted_role_manages_backoff_and_attempt_leases(self):
         self.usage("codex", 20, observed_at=None)
+        self.usage("claude", 40, observed_at=None)
         leases, commands = [], []
+
         def tmux(argv, directory, name, headless=False):
-            leases.extend(rt.read_leases(directory, self.RUN))
             commands.append(argv)
+            self.assertEqual(rt.read_leases(directory, self.RUN), [])
+            return sy.main(["_in-tmux", *argv])
+
+        def launched(argv, **kwargs):
+            leases.extend(rt.read_leases(self.project, self.RUN))
+            if argv[0] == "codex":
+                raise rt.RoleUsageLimit("codex reported a usage limit", 17)
             return 0
+
         with patch.object(sy, "tmux_enabled", return_value=True), \
              patch.dict(os.environ, {"TMUX": "", rt.RUN_ENV: self.RUN}), \
+             patch.object(rt, "run_specialist_process", side_effect=launched), \
              patch.object(sy, "launch_tmux", side_effect=tmux):
-            self.assertEqual(sy.main(["team", "run-role", "code-reviewer", "--project", str(self.project),
-                                      "--runtime", "codex", "review"]), 0)
-            self.usage("codex", 95, observed_at=None)
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                self.assertEqual(sy.main(["team", "run-role", "code-reviewer", "--project", str(self.project),
-                                          "--runtime", "codex", "review"]), 1)
-        self.assertEqual(leases, [{"provider": "codex", "role": "code-reviewer", "run_id": self.RUN}])
-        self.assertEqual(len(commands), 1)  # the refused launch never reached tmux
-        self.assertIn("no codex CLI was launched", err.getvalue())
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(sy.main(["team", "run-role", "backend-engineer", "--project", str(self.project),
+                                          "--runtime", "codex", "work"]), 0)
+        self.assertEqual(leases, [{"provider": provider, "role": "backend-engineer", "run_id": self.RUN,
+                                   "local_quota": True} for provider in ("codex", "claude")])
+        self.assertEqual(len(commands), 1)
+        self.assertIn("Syndicate specialist completed: backend-engineer claude ", out.getvalue())
         self.assertEqual(os.listdir(rt.lease_directory(self.project)), [])
-
-    def test_inner_tmux_run_does_not_write_a_second_lease(self):
-        self.usage("claude", 40, observed_at=None)
-        seen = []
-        def launched(argv, **kwargs):
-            seen.append(rt.read_leases(self.project, self.RUN))
-            return subprocess.CompletedProcess(argv, 0)
-        real_run = subprocess.run
-        with patch.object(sy, "require_clis"), \
-             patch.object(sy.subprocess, "run", side_effect=lambda argv, **kw: launched(argv, **kw)
-                          if argv[0] == "claude" else real_run(argv, **kw)), \
-             patch.dict(os.environ, {rt.RUN_ENV: self.RUN}):
-            self.assertEqual(sy.main(["_in-tmux", "team", "run-role", "backend-engineer", "--project",
-                                      str(self.project), "--runtime", "claude", "work"]), 0)
-        self.assertEqual(seen, [[]])
 
 
     # SYNDICATE_RUN_ID stripped (security LOW-2) ---------------------------
@@ -1096,7 +1192,8 @@ class SpecialistGate(ProjectCase):
             with self.subTest(label):
                 result, seen, err = self.run_role("claude", run_id=None, env_run_id=env)
                 self.assertEqual(result, 0)
-                self.assertEqual(seen, [[{"provider": "claude", "role": "backend-engineer", "run_id": self.LIVE}]])
+                self.assertEqual(seen, [[{"provider": "claude", "role": "backend-engineer", "run_id": self.LIVE,
+                                          "local_quota": True}]])
                 self.assertIn(f"using run id {self.LIVE} from", err)
                 self.assertIn("run.json", err)
                 self.assertNotIn("in-run enforcement", err)
@@ -1158,7 +1255,7 @@ class SpecialistGate(ProjectCase):
                 result, seen, err = self.run_role("claude", run_id=None)
                 self.assertEqual((result, seen), (0, [[]]))
                 self.assertIn("no Syndicate-supervised run is live", err)
-                self.assertIn("in-run enforcement of the claude reserve is unavailable", err)
+                self.assertIn("enforce the claude reserve locally without a lease", err)
         # An unusable run.json with a free lock is not a live run either.
         (self.project / ".syndicate" / "run.json").write_text("{broken")
         result, seen, err = self.run_role("claude", run_id=None)
@@ -1208,22 +1305,18 @@ class SpecialistGate(ProjectCase):
                 self.assertIn("no claude CLI was launched", result)
         self.assertFalse(rt.lease_directory(self.project).exists())
 
-    def test_inner_tmux_run_does_not_repeat_the_stale_warning(self):
+    def test_inner_tmux_run_checks_usage(self):
         self.usage("claude", 40, observed_at=100)  # stale but above the reserve
-        real_run = subprocess.run
         def main(*argv):
             err = io.StringIO()
             with patch.object(sy, "require_clis"), contextlib.redirect_stderr(err), \
-                 patch.object(sy.subprocess, "run", side_effect=lambda a, **kw: subprocess.CompletedProcess(a, 0)
-                              if a[0] == "claude" else real_run(a, **kw)), \
+                 patch.object(rt, "run_specialist_process", return_value=0), \
                  patch.dict(os.environ, {rt.RUN_ENV: self.RUN}):
                 return sy.main([*argv, "team", "run-role", "backend-engineer", "--project", str(self.project),
                                 "--runtime", "claude", "work"]), err.getvalue()
         code, err = main("_in-tmux")
         self.assertEqual(code, 0)
-        self.assertNotIn("telemetry is stale", err)
-        code, err = main()  # a direct run still warns
-        self.assertEqual(code, 0)
+        self.assertEqual(err.count("telemetry is stale"), 1)
         self.assertIn("claude usage telemetry is stale", err)
         self.usage("claude", 95, observed_at=100)  # the inner refusal still applies
         code, err = main("_in-tmux")

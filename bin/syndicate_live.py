@@ -70,7 +70,7 @@ def valid_closeout(record):
     if (not isinstance(patch, dict) or set(patch) - CLOSEOUT_KEYS
             or not {'state', 'progress', 'updated_at', 'completed_at',
                     'closeout_session', 'needs_attention'} <= set(patch)
-            or patch['state'] not in ('done', 'ended', 'waiting_on_user', 'blocked')
+            or patch['state'] not in ('done', 'ended', 'waiting_on_user', 'on_hold', 'blocked')
             or patch['closeout_session'] != record.get('session_id')
             or not isinstance(patch['needs_attention'], bool)
             or not all(isinstance(patch.get(k), str) and patch[k].strip()

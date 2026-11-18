@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import sys
 from itertools import product
 from unittest.mock import patch
 
@@ -21,6 +22,10 @@ class Closeout(ProjectCase):
         status['tasks'].append(dict(id='unrelated', state='queued', progress='Keep this'))
         sy.runtime.atomic_json(sy.status_path(self.project), status)
         self.original = status
+        run_id = sy.runtime.write_run_record(self.project, 'Closeout test', 'codex', 10, (self.task_id, self.session_id))
+        environment = patch.dict(os.environ, {sy.runtime.RUN_ENV: run_id})
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def close(self, state='done', **overrides):
         participants = (['--implementation', 'backend-engineer', 'codex', 'implementer-42',
@@ -118,6 +123,161 @@ class Closeout(ProjectCase):
         self.assertEqual(launch.call_args.args[2].cli, 'codex')
         self.assertRegex(completed.getvalue(), r'^Syndicate specialist completed: code-reviewer codex [a-f0-9]{32}\n$')
         self.assertEqual(failed.getvalue(), '')
+
+    def fake_cli(self, name, code):
+        path = self.project / name
+        path.write_text(f'#!{sys.executable}\n{code}\n')
+        path.chmod(0o700)
+
+    def invoke_role(self, *runtime_args, role='backend-engineer'):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, PATH=f'{self.project}:{os.environ.get("PATH", "")}'), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            result = sy.main(['team', 'run-role', role, '--project', str(self.project),
+                              *runtime_args, 'work'])
+        return result, out.getvalue(), err.getvalue()
+
+    def test_role_backoff_uses_last_known_usage_and_actual_provider(self):
+        self.config('codex-model_verbosity = low\nclaude-model = sonnet\n')
+        self.usage('codex', 5)
+        self.usage('claude', 40, observed_at=100)
+        self.fake_cli('codex', 'import sys; assert \'model_verbosity="low"\' in sys.argv; '
+                              'print("ERROR: You\'ve hit your usage limit.", file=sys.stderr); sys.exit(1)')
+        self.fake_cli('claude', 'import json, sys; assert "partial work" in sys.argv[-1]; '
+                               'assert sys.argv[sys.argv.index("--model") + 1] == "sonnet"; '
+                               'assert sys.argv[sys.argv.index("--output-format") + 1] == "json"; '
+                               'print(json.dumps(dict(type="result", is_error=False, result="continued")))')
+        result, out, err = self.invoke_role('--runtime', 'codex')
+        self.assertEqual(result, 0)
+        self.assertIn('retrying backend-engineer on claude (60% last recorded remaining)', err)
+        self.assertIn("ERROR: You've hit your usage limit.", err)
+        self.assertRegex(out, r'continued\nSyndicate specialist completed: backend-engineer claude [a-f0-9]{32}')
+        self.assertEqual(self.messages(), [])
+
+    def test_last_known_reserves_can_hold_before_any_cli_launches(self):
+        self.usage('codex', 90, observed_at=100)
+        self.usage('claude', 99, observed_at=100)
+        self.fake_cli('codex', 'raise AssertionError("no quota left")')
+        self.fake_cli('claude', 'raise AssertionError("no quota left")')
+        result, out, err = self.invoke_role('--runtime', 'codex')
+        self.assertEqual((result, out), (75, ''))
+        self.assertIn('task is on hold', err)
+        self.assertEqual(sy.read_status(str(self.project))['state'], 'on_hold')
+
+    def test_role_from_previous_run_cannot_hold_new_owning_task(self):
+        self.usage('codex', 95)
+        self.usage('claude', 95)
+        self.fake_cli('codex', 'raise AssertionError("no quota left")')
+        self.fake_cli('claude', 'raise AssertionError("no quota left")')
+        old_run_id = sy.runtime.write_run_record(self.project, 'Prior task', 'codex', 10, ('old-task', 'old-session'))
+        for inherited_run_id in ('', '20260101T000000-0123abcd', old_run_id):
+            with self.subTest(inherited_run_id=inherited_run_id), \
+                 patch.dict(os.environ, {sy.runtime.RUN_ENV: inherited_run_id}):
+                result, out, err = self.invoke_role('--runtime', 'codex')
+                self.assertEqual((result, out), (1, ''))
+                self.assertIn('no active owning task was placed on hold', err)
+                self.assertEqual(sy.read_status(str(self.project))['state'], 'running')
+                self.assertEqual(self.messages(), [])
+
+    def test_codex_read_only_role_retains_its_permissions(self):
+        self.usage('codex', 95)
+        self.usage('claude', 20)
+        self.fake_cli('codex', 'raise AssertionError("no quota left")')
+        self.fake_cli('claude', 'raise AssertionError("read-only restrictions must be preserved")')
+        result, out, err = self.invoke_role('--runtime', 'codex', role='code-reviewer')
+        self.assertEqual((result, out), (1, ''))
+        self.assertIn('cannot retry code-reviewer on claude with the Codex read-only workspace restrictions', err)
+        self.assertEqual(sy.read_status(str(self.project))['state'], 'running')
+
+    def test_native_backoff_skips_failed_provider_and_unknown_stays_distinct(self):
+        self.usage('codex', 3)
+        self.fake_cli('codex', 'raise AssertionError("failed provider must be skipped")')
+        self.fake_cli('claude', 'print("continued")')
+        result, out, err = self.invoke_role('--backoff-from', 'codex')
+        self.assertEqual((result, out), (75, ''))
+        self.assertIn('no usage reading for claude', err)
+        self.assertEqual(self.messages(), [])
+
+        self.usage('claude', 20)
+        result, out, _ = self.invoke_role('--backoff-from', 'codex')
+        self.assertEqual(result, 0)
+        self.assertIn('Syndicate specialist completed: backend-engineer claude ', out)
+
+    def test_all_cli_limits_put_only_owning_task_on_hold(self):
+        self.usage('claude', 40)
+        self.usage('codex', 5)
+        self.fake_cli('codex', 'import sys; print("ERROR: You\'ve hit your usage limit.", file=sys.stderr); sys.exit(1)')
+        self.fake_cli('claude', 'import json, sys; print(json.dumps(dict(type="result", is_error=True, '
+                               'result="You\'ve hit your session limit · resets at 3:50pm"))); sys.exit(1)')
+        self.fake_cli('unsupported', 'raise AssertionError("unregistered CLI must not run")')
+        self.usage('unsupported', 0)
+        before = sy.status_path(self.project).read_bytes()
+        result, out, err = self.invoke_role('--runtime', 'codex')
+        self.assertEqual(result, 75)
+        self.assertIn('task is on hold', err)
+        self.assertIn("You've hit your session limit", out)
+        self.assertNotIn('Syndicate specialist completed', out)
+        self.assertEqual(sy.status_path(self.project).read_bytes(), before)
+        self.assertEqual(len(self.messages()), 1)
+        self.assertTrue(sy.read_status(str(self.project))['tasks'][0]['progress'].startswith('Task on hold.'))
+        self.assertFalse(sy.close_owned_task(self.project, self.task_id, session_id=self.session_id))
+        sy.register_workspace(self.project)
+        row, = sy.gather_statuses(sweep=False)
+        self.assertEqual(row['project_status'], 'Needs attention')
+        self.assertEqual(row['tasks'][0]['state'], 'on_hold')
+        self.assertIsNone(row['tasks'][0]['completed_at'])
+        self.assertEqual(row['tasks'][1]['state'], 'queued')
+
+    def test_ordinary_role_failure_preserves_exit_and_does_not_retry(self):
+        self.usage('codex', 15)
+        self.usage('claude', 25)
+        self.fake_cli('claude', 'raise AssertionError("ordinary error must not retry")')
+        self.fake_cli('codex', "import sys; print(\"Quoted: ERROR: You've hit your usage limit.\"); "
+                              "print('ERROR: transient HTTP 429', file=sys.stderr); sys.exit(17)")
+        result, out, err = self.invoke_role('--runtime', 'codex')
+        self.assertEqual(result, 17)
+        self.assertIn('Quoted:', out)
+        self.assertIn('transient HTTP 429', err)
+        self.assertNotIn('retrying', err)
+        self.assertEqual(self.messages(), [])
+
+    def test_explicit_claude_text_output_preserves_ordinary_quota_prose(self):
+        self.config('claude-output-format = text\n')
+        self.usage('claude', 15)
+        self.usage('codex', 25)
+        self.fake_cli('codex', 'raise AssertionError("ordinary error must not retry")')
+        prose = "You've hit your weekly limit · resets 3:50pm"
+        imitation = json.dumps(dict(type="result", is_error=True, result=prose))
+        response = json.dumps(dict(type="result", is_error=False, result=f"{prose}\n{imitation}"))
+        self.fake_cli('claude', 'import sys; assert sys.argv[sys.argv.index("--output-format") + 1] == "json"; '
+                               f'print({response!r}); sys.exit(17)')
+        result, out, err = self.invoke_role('--runtime', 'claude')
+        self.assertEqual((result, out), (17, f"{prose}\n{imitation}\n"))
+        self.assertNotIn('retrying', err)
+
+    def test_explicit_claude_json_output_is_forwarded_verbatim(self):
+        self.config('claude-output-format = json\n')
+        self.usage('claude', 15)
+        response = json.dumps(dict(type="result", is_error=False, result="continued"))
+        self.fake_cli('claude', 'import sys; assert sys.argv[sys.argv.index("--output-format") + 1] == "json"; '
+                               f'print({response!r})')
+        result, out, _ = self.invoke_role('--runtime', 'claude')
+        self.assertEqual(result, 0)
+        self.assertTrue(out.startswith(response + "\n"))
+
+    def test_large_explicit_claude_json_quota_result_still_triggers_fallback(self):
+        self.config('claude-output-format = json\n')
+        self.usage('claude', 15)
+        self.usage('codex', 25)
+        response = json.dumps(dict(type="result", is_error=True, result="You've hit your usage limit.",
+                                   metadata="x" * 40_000))
+        self.fake_cli('claude', 'import sys; assert sys.argv[sys.argv.index("--output-format") + 1] == "json"; '
+                               f'print({response!r}, end=""); sys.exit(1)')
+        self.fake_cli('codex', 'print("continued")')
+        result, out, err = self.invoke_role('--runtime', 'claude')
+        self.assertEqual(result, 0)
+        self.assertTrue(out.startswith(response))
+        self.assertIn('retrying backend-engineer on codex', err)
 
     def test_foreign_and_hidden_owners_cannot_close(self):
         before = sy.status_path(self.project).read_bytes()

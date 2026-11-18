@@ -22,7 +22,7 @@ let rows=[],list=false,lastData='',portfolioData=null;
 function age(value){if(!value)return '—';const time=Date.parse(value);if(!Number.isFinite(time))return '—';const m=Math.max(0,Math.floor((Date.now()-time)/60000));return m<1?'Just now':m<60?`${m} min ago`:m<1440?`${Math.floor(m/60)} hr ago`:new Date(time).toLocaleDateString();}
 function badge(s){return `<span class="badge ${s==='Needs attention'?'attention':s==='Working'?'working':''}">${esc(s)}</span>`;}
 function link(r){return `<a href="#${encodeURIComponent(r.path)}">${esc(r.name)}</a><div class="path">${esc(r.path)}</div>`;}
-function stateText(t){return (t.state||'unknown')+(t.liveness==='unknown'?' (unverified)':'');}
+function stateText(t){return (t.state==='on_hold'?'On hold':t.state||'unknown')+(t.liveness==='unknown'?' (unverified)':'');}
 function task(t){return `<div class="task"><strong>${esc(t.summary||'Untitled task')}</strong> <span class="badge">${esc(stateText(t))}</span>${t.progress&&t.progress!==t.summary?`<p>${esc(t.progress)}</p>`:''}${t.state==='ended'?`<p class="muted">Ended without completion: ${esc(t.end_reason||'session ended')}${t.last_state?` · was ${esc(t.last_state)}`:''}</p>`:''}<p class="muted">Updated ${esc(age(t.completed_at||t.ended_at||t.updated_at))}</p></div>`;}
 function renderBriefing(selected){
  const data=portfolioData;

@@ -172,7 +172,7 @@ class ConfigParsing(ProjectCase):
             with unittest.mock.patch.object(sy, 'require_clis'), \
                  unittest.mock.patch.object(sy, 'execution_project', return_value=self.project), \
                  unittest.mock.patch.object(sy, 'register_workspace', side_effect=lambda p: p), \
-                 unittest.mock.patch.object(sy.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+                 unittest.mock.patch.object(sy.runtime, 'run_specialist_process', return_value=0) as run:
                 self.assertEqual(sy.main(['team', 'run-role', 'code-reviewer', '--project',
                                          str(self.project), '--runtime', provider, 'Review']), 0)
             argv = run.call_args.args[0]
@@ -577,12 +577,9 @@ class LaunchCommands(ProjectCase):
             for rule in ("AGENTS.md", "AGENTS.override.md", "ancestors and root", "nested instruction files"):
                 self.assertIn(rule, instructions)
             (cwd / "fixture").write_text("test")
-            return subprocess.CompletedProcess(argv, 0)
-        # execution_project invokes git; only mock the specialist subprocess.
-        real_run = subprocess.run
-        def dispatch(argv, **kwargs):
-            return run(argv, **kwargs) if argv[0] == "codex" else real_run(argv, **kwargs)
-        with unittest.mock.patch.object(sy, "require_clis"), unittest.mock.patch.object(sy.subprocess, "run", side_effect=dispatch):
+            return 0
+        with unittest.mock.patch.object(sy, "require_clis"), \
+             unittest.mock.patch.object(sy.runtime, "run_specialist_process", side_effect=run):
             self.assertEqual(sy.cmd_run_role(args), 0)
         self.assertEqual(list((sy.REGISTRY_PATH.parent / "portfolio/scratch").iterdir()), [])
 
@@ -910,13 +907,17 @@ class StatusAndRegistry(ProjectCase):
              unittest.mock.patch.object(sy.shutil, "which", return_value="/bin/true"):
             mock_os.environ = {}
             mock_os.getpid.return_value = 4242
-            mock_os.execvp.side_effect = SystemExit  # never actually exec
+            mock_os.execvpe.side_effect = SystemExit  # never actually exec
             args = argparse.Namespace(dir=str(self.project), runtime=None, print=True, rest=["do the thing please"])
             with self.assertRaises(SystemExit):
                 sy.cmd_run(args)
         data = json.loads(sy.status_path(self.project).read_text())
         self.assertEqual(data["pid"], 4242)
         self.assertIn("do the thing please", data["current"]["summary"])
+        record = sy.runtime.read_json(sy.status_path(self.project).with_name('run.json'))
+        self.assertEqual(mock_os.execvpe.call_args.args[2][sy.runtime.RUN_ENV], record['id'])
+        self.assertEqual(record['task_id'], data['current']['task_id'])
+        self.assertEqual(record['session_id'], data['current']['session_id'])
         self.assertEqual([p["path"] for p in sy.load_registry()], [str(self.project)])
 
 
@@ -1041,7 +1042,7 @@ class StaleSessions(ProjectCase):
         lock_path = self.project / ".syndicate" / "session.lock"
         seen = {}
 
-        def execvp(*_):
+        def execvpe(*_):
             fd = args.session_lock_fd
             status = json.loads(sy.status_path(self.project).read_text())
             seen.update(inheritable=os.get_inheritable(fd), inode=os.fstat(fd).st_ino,
@@ -1050,7 +1051,7 @@ class StaleSessions(ProjectCase):
                         pid=status["pid"])
             raise SystemExit(0)
         args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "-p", "exec task"])
-        with unittest.mock.patch.object(sy.os, "execvp", side_effect=execvp), \
+        with unittest.mock.patch.object(sy.os, "execvpe", side_effect=execvpe), \
              contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 sy.cmd_run(args)
