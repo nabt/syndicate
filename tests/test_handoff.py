@@ -1324,6 +1324,41 @@ class SpecialistGate(ProjectCase):
         self.assertIn("no claude CLI was launched", err)
 
 
+class LimitsOutput(ProjectCase):
+    def test_one_shot_prints_only_the_report(self):
+        self.usage("claude", 95)
+        notices = rt.STATE / "notifications.log"
+        notices.write_text("historical reset notice\n")
+        report = rt.describe_limits()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+             patch.object(rt, "start_monitor") as monitor:
+            self.assertEqual(sy.main(["limits"]), 0)
+        monitor.assert_called_once_with(sy.SCRIPT)
+        self.assertEqual(out.getvalue(), report + "\n")
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(notices.read_text(), "historical reset notice\n")
+
+    def test_watch_prints_only_new_reset_notices_to_stderr(self):
+        self.usage("claude", 95)
+        notices = rt.STATE / "notifications.log"
+        notices.write_text("historical reset notice\n")
+        report = rt.describe_limits()
+        out, err = io.StringIO(), io.StringIO()
+
+        def add_notice(_script):
+            with notices.open("a") as log:
+                log.write("new reset notice\n")
+
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+             patch.object(rt, "start_monitor", side_effect=add_notice), \
+             patch.object(sy.time, "sleep", side_effect=[None, KeyboardInterrupt]):
+            self.assertEqual(sy.main(["limits", "--watch"]), 0)
+        self.assertEqual(out.getvalue(), (report + "\n") * 2)
+        self.assertEqual(err.getvalue(), "new reset notice\n")
+        self.assertEqual(notices.read_text(), "historical reset notice\nnew reset notice\n")
+
+
 class ForgetReading(ProjectCase):
     def forget(self, provider):
         out, err = io.StringIO(), io.StringIO()
