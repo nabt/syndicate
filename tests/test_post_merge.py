@@ -72,7 +72,7 @@ class PostMergeCleanupTests(unittest.TestCase):
                 self.assertEqual(command[:6], ("gh", "pr", "view", "123", "--repo",
                                                "github.com/example/project"))
                 return subprocess.CompletedProcess(command, 0, json.dumps(self.pr), "")
-            if command[0] == "git" and command[2] == "push" and move_remote:
+            if command[0] == "git" and "push" in command and move_remote:
                 # The branch changed after ls-remote. A leased deletion must fail.
                 self.git(self.task, "commit", "--allow-empty", "-m", "new remote work")
                 self.git(self.task, "push", "origin", self.branch)
@@ -134,6 +134,53 @@ class PostMergeCleanupTests(unittest.TestCase):
         self.cleanup()
         self.assertEqual(self.git(self.repo, "rev-parse", unrelated), self.start)
         self.assertEqual(self.git(self.repo, "rev-parse", "refs/tags/local-only"), self.start)
+
+    def test_remote_branch_deletion_does_not_follow_symbolic_tracking_ref(self):
+        self.merge()
+        unrelated = "refs/heads/unrelated"
+        tracking = f"refs/remotes/origin/{self.branch}"
+        self.git(self.repo, "branch", "unrelated", self.start)
+        self.git(self.repo, "symbolic-ref", tracking, unrelated)
+        self.cleanup()
+        self.assertEqual(self.git(self.repo, "rev-parse", unrelated), self.start)
+        self.assertEqual(self.git(self.repo, "symbolic-ref", tracking), unrelated)
+        self.assertEqual(self.git(self.remote, "branch", "--list", self.branch), "")
+
+    def test_remote_branch_deletion_ignores_origin_local_fetch_mapping(self):
+        self.merge()
+        unrelated = "refs/heads/unrelated"
+        self.git(self.repo, "branch", "unrelated", self.start)
+        self.git(self.repo, "config", "--replace-all", "remote.origin.fetch",
+                 f"+{self.task_ref}:{unrelated}")
+        self.cleanup()
+        self.assertEqual(self.git(self.repo, "rev-parse", unrelated), self.start)
+        self.assertEqual(self.git(self.remote, "branch", "--list", self.branch), "")
+
+    def test_remote_branch_deletion_keeps_verified_push_url_despite_push_instead_of(self):
+        self.merge()
+        alternate = self.task.parent / "alternate.git"
+        self.git(self.repo, "init", "--bare", str(alternate))
+        self.git(self.task, "push", str(alternate), self.task_ref)
+        self.git(self.repo, "config", "remote.origin.pushurl", str(self.remote))
+        self.git(self.repo, "config", f"url.{alternate}.pushInsteadOf", str(self.remote))
+        self.cleanup()
+        self.assertEqual(self.git(self.remote, "branch", "--list", self.branch), "")
+        self.assertEqual(self.git(alternate, "rev-parse", self.task_ref), self.head)
+
+    def test_remote_branch_deletion_refuses_chained_instead_of_rewrite(self):
+        self.merge()
+        alternate = self.task.parent / "alternate.git"
+        self.git(self.repo, "init", "--bare", str(alternate))
+        self.git(self.task, "push", str(alternate), self.task_ref)
+        alias = "https://example.test/project"
+        self.git(self.repo, "config", "remote.origin.url", alias)
+        self.git(self.repo, "config", "remote.origin.pushurl", alias)
+        self.git(self.repo, "config", f"url.{self.remote}.insteadOf", alias)
+        self.git(self.repo, "config", f"url.{alternate}.insteadOf", str(self.remote))
+        with self.assertRaisesRegex(syndicate_git.CleanupError, "Cleanup push URL changed"):
+            self.cleanup()
+        self.assert_artifacts()
+        self.assertEqual(self.git(alternate, "rev-parse", self.task_ref), self.head)
 
     def test_repository_overrides_stop_before_git_or_gh_commands(self):
         for name in ("GIT_DIR", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_SSH_COMMAND"):
@@ -248,3 +295,11 @@ class GitHubEndpointTests(unittest.TestCase):
             with self.subTest(url=url):
                 with self.assertRaisesRegex(syndicate_git.CleanupError, "standard GitHub endpoint"):
                     syndicate_git._github_repository(url)
+
+    def test_embedded_credentials_are_rejected_without_echoing_the_url(self):
+        for url in ("https://private-token@github.com/example/project.git",
+                    "https://user:private-token@github.com/example/project.git",
+                    "ssh://git:private-token@github.com/example/project.git"):
+            with self.assertRaisesRegex(syndicate_git.CleanupError, "embedded credentials") as error:
+                syndicate_git._github_repository(url)
+            self.assertNotIn("private-token", str(error.exception))

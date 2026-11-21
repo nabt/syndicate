@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
@@ -63,6 +64,8 @@ def _github_repository(url: str) -> str:
         host, path = parsed.hostname, parsed.path
         if parsed.scheme not in ("https", "ssh"):
             raise CleanupError("Origin must use a GitHub HTTPS or SSH URL")
+        if parsed.password is not None or (parsed.scheme == "https" and parsed.username is not None):
+            raise CleanupError("Origin URL contains embedded credentials")
         if port is not None or parsed.query or parsed.fragment:
             raise CleanupError("Origin URL must use a standard GitHub endpoint without a port, query or fragment")
     else:
@@ -117,6 +120,23 @@ def _clean(path: Path, label: str, *, ignored: bool = False) -> None:
 def _check_tip(repo: Path, tip: str | None, pr_head: str, main_tip: str, label: str) -> None:
     if tip and (not _ancestor(repo, tip, main_tip) or not _ancestor(repo, tip, pr_head)):
         raise CleanupError(f"{label} tip {tip} cannot be proven part of the merged PR history")
+
+
+def _delete_remote_branch(repo: Path, push_url: str, task_ref: str, remote_tip: str) -> None:
+    # Use a temporary remote name without fetch mappings. A named origin push
+    # can automatically delete a mapped local ref when deleting a remote ref.
+    # An explicit pushurl also avoids applying pushInsteadOf to a bare URL.
+    target = f"syndicate-cleanup-{uuid.uuid4().hex}"
+    options = ("-c", f"remote.{target}.url={push_url}",
+               "-c", f"remote.{target}.pushurl={push_url}")
+    # The equal url and explicit pushurl undergo the same insteadOf rewrite.
+    # ls-remote recognizes a command-scoped remote and resolves it without I/O.
+    effective_url = _git(repo, *options, "ls-remote", "--get-url", target).stdout.rstrip("\n")
+    if effective_url != push_url:
+        raise CleanupError("Cleanup push URL changed after applying Git URL rewrites")
+    # The lease guards a deletion-only refspec against concurrent branch updates.
+    _git(repo, *options, "push", "--no-follow-tags", "--recurse-submodules=no",
+         f"--force-with-lease={task_ref}:{remote_tip}", target, f":{task_ref}")
 
 
 def _check_main(path: Path, target: str) -> str:
@@ -186,7 +206,7 @@ def cleanup_pr(repo: Path, number: int, branch: str, path: Path,
         raise CleanupError("Merged PR is missing a valid merge commit or head commit")
 
     _ref_oid(repo, ORIGIN_MAIN)  # Reject symbolic tracking refs before fetching into them.
-    _git(repo, "fetch", "--no-tags", "--no-prune", "--no-prune-tags",
+    _git(repo, "fetch", "--no-tags", "--no-prune", "--no-prune-tags", "--no-auto-maintenance",
          "--no-recurse-submodules", "--no-write-fetch-head",
          "--refmap=", "origin", f"{MAIN}:{ORIGIN_MAIN}")
     main_tip = _ref_oid(repo, ORIGIN_MAIN)
@@ -218,9 +238,7 @@ def cleanup_pr(repo: Path, number: int, branch: str, path: Path,
     _check_tip(repo, remote_tip, pr_head, main_tip, "Remote task branch")
 
     if remote_tip:
-        # The lease guards a deletion-only refspec against concurrent branch updates.
-        _git(repo, "push", "--no-follow-tags", "--recurse-submodules=no",
-             f"--force-with-lease={task_ref}:{remote_tip}", "origin", f":{task_ref}")
+        _delete_remote_branch(repo, push_urls[0], task_ref, remote_tip)
         report(f"Deleted remote task branch {branch}.")
     else:
         report(f"Remote task branch {branch} was already absent.")
