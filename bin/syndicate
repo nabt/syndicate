@@ -36,6 +36,7 @@ sys.path.insert(0, str(SCRIPT.parent))
 import syndicate_runtime as runtime
 import syndicate_portfolio as portfolio
 import syndicate_live as live
+import syndicate_git
 HOME_DIR = SCRIPT.parent.parent
 GLOBAL_ROLES = HOME_DIR / "roles"
 GATE_SCRIPT = HOME_DIR / "hooks" / "require-review.sh"
@@ -1536,6 +1537,17 @@ def cmd_tasks_close(args):
     return 0
 
 
+def cmd_tasks_cleanup_pr(args):
+    repo = Path(args.dir).expanduser().resolve()
+    worktree = Path(args.worktree).expanduser().resolve()
+    try:
+        syndicate_git.cleanup_pr(repo, args.number, args.branch, worktree,
+                                 lambda message: print(message, flush=True))
+    except syndicate_git.CleanupError as error:
+        raise SyndicateError(f"Post-merge cleanup stopped: {error}") from error
+    return 0
+
+
 @contextmanager
 def project_session(project, provider, outcome=None):
     """Own the current task's coordination session for one supervised run.
@@ -3015,7 +3027,7 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
             command.add_argument("--answer-revision", type=int, required=True,
                                  help="answer_revision incorporated by the owning team")
         command.set_defaults(fn=cmd_decisions)
-    p = cmds.add_parser("tasks", help="list, edit and close project tasks")
+    p = cmds.add_parser("tasks", help="list, edit, clean up merged PRs and close project tasks")
     actions = p.add_subparsers(dest="action", required=True)
     listing = actions.add_parser("list")
     listing.add_argument("--project", help="repo name/path or generic")
@@ -3035,6 +3047,12 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     close.add_argument('--role-blocker', nargs=2, metavar=('ROLE', 'REASON'),
                        help='required specialist that could not start; use with --state blocked')
     close.set_defaults(fn=cmd_tasks_close)
+    cleanup = actions.add_parser("cleanup-pr", help="verify the task PR merge and clean its Git artifacts")
+    cleanup.add_argument("number", type=int, help="task PR number on origin")
+    cleanup.add_argument("-C", "--dir", default=".", help="repository checkout outside the task worktree")
+    cleanup.add_argument("--branch", required=True, help="recorded task branch")
+    cleanup.add_argument("--worktree", required=True, help="absolute path to the recorded linked worktree")
+    cleanup.set_defaults(fn=cmd_tasks_cleanup_pr)
     edit = actions.add_parser("edit")
     edit.add_argument("task_id")
     edit.add_argument("--source", help="source directory, required for ambiguous task IDs")

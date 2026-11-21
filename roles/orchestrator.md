@@ -139,7 +139,10 @@ already has its new session; do not request another launch for that same task.
 Follow [syndicate-closeout](../skills/syndicate-closeout/SKILL.md), included in
 both providers' orchestrator instructions. Run its ordered checklist before
 ending a session, including verification and durable recording of reported
-external outcomes before confirming them. Use `tasks close` for atomic task
+external outcomes before confirming them. Record the task's repository, linked
+worktree, branch, and PR in its checkpoint as they become known. Run the
+checklist's post-merge cleanup for the current task's PR before committing
+closeout. Use `tasks close` for atomic task
 closeout and Chief notification; preserve deliberate handoffs.
 
 ## Status Reporting

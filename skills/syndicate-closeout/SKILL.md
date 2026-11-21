@@ -40,9 +40,44 @@ owning task's `delegated_closeout_required` flag when present.
    --task TASK_ID --json` and `decisions list --json`. Match source/task/session,
    incorporate authorized input, and acknowledge the exact decision revision
    or request using the owning session. Record unresolved questions explicitly.
-2. Verify external outcomes before confirming them. For a reported PR merge,
-   use `gh pr view NUMBER --json state,mergedAt,mergeCommit,url` in the correct
-   repository. Record URL, state, time/commit, tests actually run, review results
+2. Verify external outcomes before confirming them. If the current task has a
+   PR, run the post-merge check before committing closeout:
+
+   ```sh
+   syndicate tasks cleanup-pr NUMBER -C REPO --branch TASK_BRANCH --worktree TASK_WORKTREE
+   ```
+
+   Take the PR, branch and absolute linked worktree path from the current
+   task's checkpoint. Use a repository checkout outside the task worktree and
+   make sure the launch source and active workers are outside it too. Keep
+   both checkouts idle during cleanup. Stop editors, builds, other writers,
+   and concurrent Git operations in either checkout before running it.
+   If provenance is missing or ambiguous, stop cleanup and report the blocker.
+   Use the helper only for the current task, including when the requester
+   reports its merge. It checks GitHub PR state and checks that the merge
+   commit is on fetched `origin/main` before removing any task artifacts.
+   Open and closed-unmerged PRs leave Git artifacts alone. For other tasks'
+   reported merges, use `gh pr view NUMBER --json state,mergedAt,mergeCommit,url`
+   in the correct repository and verify the commit on fetched `origin/main`.
+
+   A merged PR must match the recorded same-repository task branch and target
+   `main`. The helper requires the task branch tips to be reachable from
+   both fetched `origin/main` and the PR head reported by GitHub. Squash or
+   rebase merges can lack that ancestry and then require preserving the branch
+   and reporting why cleanup stopped. A dirty task worktree, including its
+   ignored files, stops cleanup. A remote branch that is already absent is
+   safe to skip. Remote deletion is conditional on the inspected tip still
+   being current. The helper uses a deletion-only refspec with an explicit
+   lease and never force-updates a branch. The existing local main checkout
+   must be clean and able to fast-forward. The helper never switches a checkout
+   to main, resets main, or overwrites local files.
+
+   Record each outcome and any partial cleanup or blocker in the task progress
+   and checkpoint. Preserve blocked artifacts and report the reason without
+   forcing removal or synchronization. If cleanup is blocked after a verified
+   merge, report the merge and the cleanup blocker separately.
+
+   Record URL, state, time/commit, tests actually run, review results
    and remaining work in task progress and checkpoint before confirming. Reconcile
    affected older records without changing ownership or unrelated pending work.
    A merge proves neither deployment nor full completion. If verification fails,
