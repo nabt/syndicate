@@ -1427,6 +1427,7 @@ def launch_tmux(argv, directory, name, headless=False, socket=None):
         print(f'Launch requested in tmux session {TMUX_SESSION}, window {name}. Show it with: '
               f'{shlex.join(["syndicate", "show", name])}')
         if sys.stdin.isatty() and sys.stdout.isatty() and not os.environ.get('TMUX'):
+            _arm_detach_binding(socket)
             return subprocess.run(attach).returncode
         return 0
     with tempfile.TemporaryDirectory(prefix='syndicate-tmux-') as tmp:
@@ -1601,8 +1602,39 @@ def _missing_worker(name, socket=None):
     raise SyndicateError(f'no worker {name!r} in {TMUX_SESSION}; running: {running}')
 
 
+def _arm_detach_binding(socket=None):
+    """Let F12 leave a syndicate view without sending a key to the worker.
+
+    Ctrl-b often never reaches tmux: Cursor and VS Code use it to toggle the
+    sidebar, and a worker prompt would consume it if it did. F12 is bound in
+    tmux's root table, so the worker process is not involved. Other tmux
+    sessions still receive F12.
+    """
+    listed = _tmux(['list-keys', '-T', 'root', 'F12'], socket=socket)
+    current = listed.stdout or ''
+    foreign = listed.returncode == 0 and current.strip() and TMUX_SESSION not in current
+    if not foreign:
+        bound = _tmux(['bind-key', '-T', 'root', '-n', 'F12',
+                       'if-shell', '-F', '#{==:#{session_name},' + TMUX_SESSION + '}',
+                       'detach-client', 'send-keys F12'], socket=socket)
+        if bound.returncode:
+            raise SyndicateError(bound.stderr.strip() or 'could not bind the view detach key')
+    hint = (' F12 detaches · worker keeps running ' if not foreign
+            else ' syndicate detach · from another terminal ')
+    for option, value in (('extended-keys', 'on'), ('status', 'on'), ('status-right', hint)):
+        set_option = _tmux(['set-option', '-t', TMUX_SESSION, option, value], socket=socket)
+        if set_option.returncode:
+            raise SyndicateError(set_option.stderr.strip() or 'could not prepare the syndicate view')
+    noted = _tmux(['set-hook', '-t', TMUX_SESSION, 'client-attached',
+                   'display-message -d 8000 "F12 leaves this view; the worker keeps running"'],
+                  socket=socket)
+    if noted.returncode:
+        raise SyndicateError(noted.stderr.strip() or 'could not prepare the syndicate view')
+
+
 def focus_target(target, socket=None):
     """Attach to a syndicate target, or switch the current tmux client onto it."""
+    _arm_detach_binding(socket)
     if os.environ.get('TMUX') and not socket:
         switched = _tmux(['switch-client', '-t', target], socket=socket)
         if switched.returncode:

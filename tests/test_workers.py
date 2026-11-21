@@ -178,6 +178,8 @@ class Workers(ProjectCase):
             'list-windows': subprocess.CompletedProcess([], 0, '@1\tapi\t0\t0\tcodex\t/src/api\n', ''),
             'set-hook': subprocess.CompletedProcess([], 0, '', ''),
             'set-option': subprocess.CompletedProcess([], 0, '', ''),
+            'list-keys': subprocess.CompletedProcess([], 1, '', ''),
+            'bind-key': subprocess.CompletedProcess([], 0, '', ''),
             'switch-client': subprocess.CompletedProcess([], 0, '', ''),
         }
         with patch.object(sy.shutil, 'which', return_value='/usr/bin/tmux'), \
@@ -186,6 +188,9 @@ class Workers(ProjectCase):
             self.assertEqual(sy.show_workers(['api']), 0)
         switched = next(call.args[0] for call in run.call_args_list if call.args[0][1] == 'switch-client')
         self.assertEqual(switched, ['tmux', 'switch-client', '-t', 'the-syndicate:api'])
+        bound = next(call.args[0] for call in run.call_args_list if call.args[0][1] == 'bind-key')
+        self.assertEqual(bound[-2:], ['detach-client', 'send-keys F12'])
+        self.assertIn('#{session_name},the-syndicate', bound[8])
 
 
 class WorkerIntegration(ProjectCase):
@@ -223,6 +228,15 @@ class WorkerIntegration(ProjectCase):
         self.assertEqual(sy.capture_worker('example', 5, socket=socket).strip(), '')
         sy.close_worker('example', socket=socket)
         self.assertEqual([row['name'] for row in sy.worker_records(socket)], ['chief-of-staff'])
+        sy._arm_detach_binding(socket)
+        keys = subprocess.run(['tmux', '-L', socket, 'list-keys', '-T', 'root', 'F12'],
+                              capture_output=True, text=True, check=True)
+        self.assertIn('detach-client', keys.stdout)
+        self.assertIn('the-syndicate', keys.stdout)
+        alive = subprocess.run(
+            ['tmux', '-L', socket, 'list-panes', '-t', f'{sy.TMUX_SESSION}:chief-of-staff', '-F', '#{pane_dead}'],
+            capture_output=True, text=True, check=True)
+        self.assertEqual(alive.stdout.strip(), '0')
         sy._start_tmux_window(self.project, 'inbox', 'cat', socket=socket)
         sy.message_worker('inbox', 'hello workers', socket=socket)
         time.sleep(0.2)
