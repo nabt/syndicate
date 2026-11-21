@@ -20,8 +20,9 @@ syndicate team task --project ~/code/project "implement the feature"
 # Override for one run
 syndicate team task --reserve 20 --project ~/code/project "implement the feature"
 
-# Inspect both providers and reset notices
+# Report limits for both providers
 syndicate limits
+# Keep reporting limits and show new reset notices on stderr
 syndicate limits --watch
 
 # Discard a recorded reading you know is outdated (see "Recovering from an

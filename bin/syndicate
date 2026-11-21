@@ -2739,19 +2739,26 @@ def cmd_limits(args: argparse.Namespace) -> int:
         (runtime.STATE / "stop").touch()
         print("Limit monitor stop requested; agent sessions are unaffected.")
         return 0
-    runtime.start_monitor(SCRIPT)
-    offset = 0
+    notices = runtime.STATE / "notifications.log"
     try:
+        offset = 0
+        if args.watch:
+            try:
+                offset = notices.stat().st_size
+            except FileNotFoundError:
+                pass
+        runtime.start_monitor(SCRIPT)
         while True:
             print(runtime.describe_limits())
-            notices = runtime.STATE / "notifications.log"
-            if notices.exists():
-                with notices.open() as f:
-                    f.seek(offset)
-                    print(f.read(), end="")
-                    offset = f.tell()
             if not args.watch:
                 return 0
+            try:
+                with notices.open() as f:
+                    f.seek(offset)
+                    sys.stderr.write(f.read())
+                    offset = f.tell()
+            except FileNotFoundError:
+                pass
             time.sleep(5)
     except KeyboardInterrupt:
         return 0
