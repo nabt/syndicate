@@ -94,8 +94,8 @@ creates it only when it is absent. Chief of Staff is the window `chief-of-staff`
 (exactly one window, with no `-work` suffix). Each project team is its own
 window, named after the project. Each window keeps the single pane that runs
 its CLI. List and show those windows with `syndicate list workers`,
-`syndicate show`, `syndicate capture`, `syndicate attach`, `syndicate detach`,
-and `syndicate close` instead of driving tmux yourself. `syndicate show` of one worker attaches to
+`syndicate show`, `syndicate capture`, `syndicate message`, `syndicate attach`,
+`syndicate detach`, and `syndicate close` instead of driving tmux yourself. `syndicate show` of one worker attaches to
 that window. `syndicate show` of two workers places their panes side by side
 for that view, and three or more are tiled. Detaching, switching away, or
 `syndicate detach` puts each worker back in its own window. Interactive launches

@@ -1691,6 +1691,39 @@ def show_workers(names, socket=None):
         restore_worker_view(socket, force=True)
 
 
+def message_worker(name, text, socket=None, submit=True):
+    """Type text into a running worker. Enter is sent unless submit is false.
+
+    The text is literal, so words such as Enter are not interpreted as keys.
+    """
+    _require_session(socket)
+    if name == VIEW_WINDOW:
+        raise SyndicateError('that is the side-by-side view, not a worker')
+    if not text or not text.strip():
+        raise SyndicateError('message text is required')
+    held = _workers_in_view(socket)
+    if name in held:
+        pane = held[name]
+        if pane['dead']:
+            raise SyndicateError(f'worker {name} is not running')
+        target = pane['pane']
+    else:
+        rows = [row for row in _window_listing(socket) if row['name'] == name]
+        if len(rows) != 1:
+            _missing_worker(name, socket)
+        if rows[0]['dead']:
+            raise SyndicateError(f'worker {name} is not running')
+        target = f'{TMUX_SESSION}:{name}'
+    literal = _tmux(['send-keys', '-t', target, '-l', '--', text], socket=socket)
+    if literal.returncode:
+        raise SyndicateError(literal.stderr.strip() or f'could not message {name}')
+    if not submit:
+        return
+    entered = _tmux(['send-keys', '-t', target, 'Enter'], socket=socket)
+    if entered.returncode:
+        raise SyndicateError(entered.stderr.strip() or f'could not message {name}')
+
+
 def capture_worker(name, lines, socket=None):
     _require_session(socket)
     held = _workers_in_view(socket)
@@ -1768,6 +1801,12 @@ def cmd_show_workers(args):
 def cmd_attach_workers(args):
     _require_session()
     return focus_target(TMUX_SESSION)
+
+
+def cmd_message_worker(args):
+    message_worker(args.worker, ' '.join(args.text), submit=not args.no_submit)
+    print(f'Sent to {args.worker}.')
+    return 0
 
 
 def cmd_capture_worker(args):
@@ -3585,6 +3624,11 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p.set_defaults(fn=cmd_show_workers)
     p = cmds.add_parser('attach', help='attach to the syndicate session')
     p.set_defaults(fn=cmd_attach_workers)
+    p = cmds.add_parser('message', help='type a message into a running worker')
+    p.add_argument('worker')
+    p.add_argument('text', nargs='+', help='words to type; Enter is pressed unless --no-submit is set')
+    p.add_argument('--no-submit', action='store_true', help='type the text without pressing Enter')
+    p.set_defaults(fn=cmd_message_worker)
     p = cmds.add_parser('capture', help='print recent output from a worker without attaching')
     p.add_argument('worker')
     p.add_argument('--lines', type=int, default=100, help='lines of pane history to print (default: 100)')
@@ -3631,7 +3675,7 @@ def main(argv: list[str]) -> int:
         return runtime.monitor_forever()
     run, sub = build_parsers()
     try:
-        if argv[0] in ("team", "config", "setup-codex-gate", "dashboard", "web", "limits", "tasks", "decisions", "briefing", "briefs", "sessions", "requests", "chief-of-staff", "live", "messages", "list", "show", "attach", "capture", "close", "detach"):
+        if argv[0] in ("team", "config", "setup-codex-gate", "dashboard", "web", "limits", "tasks", "decisions", "briefing", "briefs", "sessions", "requests", "chief-of-staff", "live", "messages", "list", "show", "attach", "capture", "close", "detach", "message"):
             args = sub.parse_args(argv)
         elif argv[0] in ('-h', '--help'):
             sub.parse_args(argv)
