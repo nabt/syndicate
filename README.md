@@ -82,10 +82,29 @@ Run from inside a project, `--project` can be omitted. The orchestrator decides 
 roles the task needs and delegates to them. Extra arguments after the task are
 passed to the underlying CLI.
 
-All CLI execution uses tmux by default. Chief of Staff uses `chief-of-staff-work`;
-project tasks use `<project_name>-work`. To disable tmux globally, add
-`tmux = off` to `~/.config/syndicate/syndicate.conf` (or the corresponding
-`$XDG_CONFIG_HOME` path). Headless runs still return their output and exit code.
+All CLI execution uses tmux by default, in one session named `the-syndicate`.
+That session is created on first use and reused after that. Chief of Staff is
+the `chief-of-staff` window; each project team gets its own window, named after
+the project. To disable tmux globally, add `tmux = off` to
+`~/.config/syndicate/syndicate.conf` (or the corresponding `$XDG_CONFIG_HOME`
+path). Headless runs still return their output and exit code.
+
+Workers in that session are managed with syndicate, not tmux:
+
+```sh
+syndicate list workers                         # every open window
+syndicate show chief-of-staff                  # attach to one worker
+syndicate show chief-of-staff some-project     # two side by side; three or more tile
+syndicate capture some-project                 # recent output, without attaching
+syndicate attach                               # rejoin the session where you left it
+syndicate detach                               # leave, and put a side-by-side view back into windows
+syndicate close some-project                   # close a finished worker
+syndicate close chief-of-staff --force         # the Chief is refused without --force
+```
+
+`syndicate show` of several workers is a view, not a new place they live. Detach
+or switch away and each worker is a window again. `syndicate detach` does that
+from another terminal.
 
 ## Customizing a project
 

@@ -48,6 +48,13 @@ CLOSEOUT_SKILL = HOME_DIR / 'skills' / 'syndicate-closeout' / 'SKILL.md'
 INBOX_SKILL = HOME_DIR / 'skills' / 'syndicate-inbox' / 'SKILL.md'
 SCHEDULER_TOOLS = ['CronCreate', 'CronList', 'CronDelete']
 REGISTRY_PATH = Path.home() / ".syndicate" / "projects.json"
+# One shared session. Chief of Staff and each team are windows in it, not sessions of their own.
+TMUX_SESSION = 'the-syndicate'
+CHIEF_TMUX_WINDOW = 'chief-of-staff'
+# Temporary window that shows several workers at once. It is not itself a worker.
+VIEW_WINDOW = 'syndicate-view'
+# Ignore a just-opened view long enough for the client to land on it.
+VIEW_HOLD_SECONDS = 3
 CLIS = runtime.PROVIDERS
 LOCAL = ".syndicate"
 ROLE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -1252,40 +1259,175 @@ def report_usage_reserve(args, project, handoff, reason=None):
             print(f"Syndicate could not retain the tmux pane: {detail}", file=sys.stderr, flush=True)
 
 
-def launch_tmux(argv, directory, name, headless=False):
-    """Run the launcher inside tmux; synchronous runs retain output and exit code."""
-    if not shutil.which('tmux'):
-        raise SyndicateError('tmux is required; install it or set tmux = off in the global config')
-    target = '=' + name
-    if subprocess.run(['tmux', 'has-session', '-t', target], capture_output=True).returncode == 0:
-        panes = subprocess.run(['tmux', 'list-panes', '-s', '-t', target, '-F',
-                                '#{session_id}:#{pane_dead}:#{@syndicate-usage-reserve}'],
-                               capture_output=True, text=True)
-        rows = [line.split(':', 2) for line in (panes.stdout or '').splitlines()]
-        if panes.returncode == 0 and rows and all(
-                len(row) == 3 and row[1] == '1' and (name == 'chief-of-staff-work' or row[2] == '1')
-                for row in rows):
-            # Retained reserve messages must not prevent the next launch.
-            removed = subprocess.run(['tmux', 'kill-session', '-t', rows[0][0]], capture_output=True, text=True)
-            if removed.returncode:
-                raise SyndicateError(removed.stderr.strip())
-        else:
-            raise SyndicateError(f'tmux session {name} already exists; inspect or attach to it before launching again')
-    command = shlex.join([sys.executable, str(SCRIPT), '_in-tmux', *argv])
-    base = ['tmux', 'new-session', '-d', '-s', name, '-c', str(directory)]
+def _tmux(args, socket=None, **kwargs):
+    command = ['tmux']
+    if socket:
+        command += ['-L', socket]
+    return subprocess.run([*command, *args], capture_output=True, text=True, **kwargs)
+
+
+def _tmux_session_exists(socket=None):
+    return _tmux(['has-session', '-t', TMUX_SESSION], socket=socket).returncode == 0
+
+
+def _window_listing(socket=None):
+    """Windows in the syndicate session, oldest index first."""
+    listed = _tmux(['list-windows', '-t', TMUX_SESSION, '-F',
+                    '#{window_id}\t#{window_name}\t#{window_active}\t#{pane_dead}\t'
+                    '#{pane_current_command}\t#{pane_current_path}'], socket=socket)
+    if listed.returncode:
+        raise SyndicateError(listed.stderr.strip() or f'tmux session {TMUX_SESSION} could not be inspected')
+    rows = []
+    for line in listed.stdout.splitlines():
+        parts = line.split('\t')
+        if len(parts) < 2 or not parts[0]:
+            continue
+        rows.append({
+            'id': parts[0],
+            'name': parts[1],
+            'active': len(parts) > 2 and parts[2] == '1',
+            'dead': len(parts) > 3 and parts[3] == '1',
+            'command': parts[4] if len(parts) > 4 else '',
+            'path': parts[5] if len(parts) > 5 else '',
+        })
+    return rows
+
+
+def _tmux_windows(name, socket=None):
+    """Ids of windows in the syndicate session whose name is exactly `name`."""
+    return [row['id'] for row in _window_listing(socket) if row['name'] == name]
+
+
+def _workers_in_view(socket=None, listing=None):
+    """Worker name to pane id for panes parked in the side-by-side view."""
+    if listing is None:
+        listing = _window_listing(socket)
+    held = {}
+    for row in listing:
+        if row['name'] != VIEW_WINDOW:
+            continue
+        panes = _tmux(['list-panes', '-t', row['id'], '-F',
+                       '#{pane_id}\t#{@syndicate-worker}\t#{pane_dead}\t'
+                       '#{pane_current_command}\t#{pane_current_path}'], socket=socket)
+        if panes.returncode:
+            continue
+        for line in panes.stdout.splitlines():
+            parts = line.split('\t')
+            if len(parts) < 2 or not parts[0].startswith('%') or not parts[1]:
+                continue
+            held[parts[1]] = {
+                'pane': parts[0],
+                'dead': len(parts) > 2 and parts[2] == '1',
+                'command': parts[3] if len(parts) > 3 else '',
+                'path': parts[4] if len(parts) > 4 else '',
+            }
+    return held
+
+
+def _window_replaceable(name, window_id, socket=None):
+    """A dead chief window, or a dead usage-reserve window, may be replaced.
+
+    Anything still running stays. Replacement closes that window only.
+    """
+    panes = _tmux(['list-panes', '-t', window_id, '-F', '#{pane_dead}:#{@syndicate-usage-reserve}'], socket=socket)
+    if panes.returncode:
+        return False
+    rows = [line.split(':', 1) for line in panes.stdout.splitlines()]
+    if not rows or any(len(row) != 2 or row[0] != '1' for row in rows):
+        return False
+    return name == CHIEF_TMUX_WINDOW or all(row[1] == '1' for row in rows)
+
+
+def _window_busy(name, in_view=False):
+    message = (f'tmux window {name} already exists in session {TMUX_SESSION}; '
+               'inspect or attach to it before launching again')
+    if in_view:
+        message += '. It is open in a side-by-side view; run syndicate detach to restore its window'
+    raise SyndicateError(message)
+
+
+def _tmux_env_flags():
     # A tmux server may predate the user's current configuration environment.
     # SYNDICATE_RUN_ID is reset too, so a server started inside an earlier run
-    # cannot leak a stale run id into this session.
+    # cannot leak a stale run id into this window.
+    flags = []
     for key in ('XDG_CONFIG_HOME', 'SYNDICATE_RUNTIME', 'PATH', runtime.RUN_ENV):
-        base += ['-e', f'{key}={os.environ.get(key, "")}']
+        flags += ['-e', f'{key}={os.environ.get(key, "")}']
+    return flags
+
+
+def _start_tmux_window(directory, name, command, socket=None, **run_kwargs):
+    """Open `name` in the syndicate session, creating the session only if it is absent."""
+    env = _tmux_env_flags()
+    common = ['-n', name, '-c', str(directory), *env, '-P', '-F', '#{window_id}', command]
+
+    def create(kind):
+        if kind == 'new-session':
+            argv = ['new-session', '-d', '-s', TMUX_SESSION, *common]
+        else:
+            argv = ['new-window', '-d', '-t', TMUX_SESSION, *common]
+        return _tmux(argv, socket=socket, **run_kwargs)
+
+    kind = 'new-window' if _tmux_session_exists(socket) else 'new-session'
+    result = create(kind)
+    if result.returncode and kind == 'new-session' and _tmux_session_exists(socket):
+        # Another launch created the session between the check and new-session.
+        result = create('new-window')
+    if result.returncode:
+        raise SyndicateError(result.stderr.strip() or f'could not open tmux window {name}')
+    window_id = result.stdout.strip()
+    if not window_id.startswith('@'):
+        raise SyndicateError(result.stderr.strip() or f'tmux did not report a window id for {name}')
+    # Window names are not unique in tmux. Drop the window we just opened when
+    # another one with this name is already there, so chief-of-staff stays singular.
+    others = [wid for wid in _tmux_windows(name, socket) if wid != window_id]
+    if others:
+        _tmux(['kill-window', '-t', window_id], socket=socket)
+        _window_busy(name)
+    return window_id
+
+
+def _release_replaced_windows(name, socket=None):
+    """Close dead windows of this name so the next launch can open exactly one."""
+    if not _tmux_session_exists(socket):
+        return
+    if name in _workers_in_view(socket):
+        _window_busy(name, in_view=True)
+    windows = _tmux_windows(name, socket)
+    if not windows:
+        return
+    if not all(_window_replaceable(name, window_id, socket) for window_id in windows):
+        _window_busy(name)
+    for window_id in windows:
+        removed = _tmux(['kill-window', '-t', window_id], socket=socket)
+        if removed.returncode:
+            raise SyndicateError(removed.stderr.strip() or f'could not replace tmux window {name}')
+
+
+def launch_tmux(argv, directory, name, headless=False, socket=None):
+    """Run the launcher in one window of the shared `the-syndicate` session.
+
+    Windows are the orchestration unit: Chief of Staff and each team are
+    independent CLIs, so each launch is its own window. The session is created
+    on first use and reused after that. A window keeps the single pane tmux
+    opens for its command. That pane is marked when a usage reserve stops the
+    CLI; panes are not used to split chief of staff from teams.
+    """
+    if not shutil.which('tmux'):
+        raise SyndicateError('tmux is required; install it or set tmux = off in the global config')
+    _release_replaced_windows(name, socket)
+    command = shlex.join([sys.executable, str(SCRIPT), '_in-tmux', *argv])
+    target = f'{TMUX_SESSION}:{name}'
     if not headless:
-        result = subprocess.run([*base, command], capture_output=True, text=True)
-        if result.returncode:
-            raise SyndicateError(result.stderr.strip())
-        print(f'Launch requested in tmux session {name}. Attach with: '
-              f'{shlex.join(["tmux", "attach-session", "-t", target])}')
+        _start_tmux_window(directory, name, command, socket=socket)
+        attach = ['tmux']
+        if socket:
+            attach += ['-L', socket]
+        attach += ['attach-session', '-t', target]
+        print(f'Launch requested in tmux session {TMUX_SESSION}, window {name}. Show it with: '
+              f'{shlex.join(["syndicate", "show", name])}')
         if sys.stdin.isatty() and sys.stdout.isatty() and not os.environ.get('TMUX'):
-            return subprocess.run(['tmux', 'attach-session', '-t', target]).returncode
+            return subprocess.run(attach).returncode
         return 0
     with tempfile.TemporaryDirectory(prefix='syndicate-tmux-') as tmp:
         output, errors, code = (Path(tmp) / part for part in ('stdout', 'stderr', 'exit'))
@@ -1293,27 +1435,358 @@ def launch_tmux(argv, directory, name, headless=False):
                  f'result=$?; printf "%s" "$result" >{shlex.quote(str(code) + ".tmp")}; '
                  f'mv {shlex.quote(str(code) + ".tmp")} {shlex.quote(str(code))}')
         with runtime.specialist_signals() as check_interrupt:
-            result = subprocess.run([*base, '-P', '-F', '#{session_id}',
-                                     shlex.join(['/bin/sh', '-c', shell])], capture_output=True, text=True,
-                                    start_new_session=True)
-            if result.returncode:
-                check_interrupt()
-                raise SyndicateError(result.stderr.strip())
-            target = result.stdout.strip() or target
+            window_id = None
             try:
+                try:
+                    window_id = _start_tmux_window(
+                        directory, name, shlex.join(['/bin/sh', '-c', shell]),
+                        socket=socket, start_new_session=True)
+                except SyndicateError:
+                    check_interrupt()
+                    raise
                 while not code.exists():
                     check_interrupt()
                     time.sleep(0.1)
-                    if subprocess.run(['tmux', 'has-session', '-t', target], capture_output=True).returncode and not code.exists():
+                    if _tmux(['list-panes', '-t', window_id], socket=socket).returncode and not code.exists():
                         check_interrupt()
-                        raise SyndicateError(f'tmux session {name} exited without a result')
+                        raise SyndicateError(f'tmux window {name} exited without a result')
                 check_interrupt()
                 sys.stdout.write(output.read_text())
                 sys.stderr.write(errors.read_text())
                 return int(code.read_text())
             finally:
-                # This session was created by this invocation, never an existing team.
-                subprocess.run(['tmux', 'kill-session', '-t', target], capture_output=True)
+                # Close only this run's window. The shared session and any other
+                # team or chief window stay up. The last window takes the session with it.
+                if window_id:
+                    _tmux(['kill-window', '-t', window_id], socket=socket)
+
+
+def _require_tmux():
+    if not shutil.which('tmux'):
+        raise SyndicateError('tmux is required; install it or set tmux = off in the global config')
+
+
+def _require_session(socket=None):
+    _require_tmux()
+    if not _tmux_session_exists(socket):
+        raise SyndicateError(f'no {TMUX_SESSION} session is running')
+
+
+@contextmanager
+def _view_lock(socket=None):
+    locked = _tmux(['wait-for', '-L', 'syndicate-view'], socket=socket)
+    if locked.returncode:
+        raise SyndicateError(locked.stderr.strip() or 'could not lock the syndicate view')
+    try:
+        yield
+    finally:
+        _tmux(['wait-for', '-U', 'syndicate-view'], socket=socket)
+
+
+def _view_hook(socket=None):
+    command = [sys.executable, str(SCRIPT), '_restore-view']
+    if socket:
+        command += ['--socket', socket]
+    return 'run-shell ' + shlex.quote(shlex.join(command))
+
+
+def _arm_view_hooks(socket=None):
+    hook = _view_hook(socket)
+    held = _tmux(['set-option', '-t', TMUX_SESSION, '@syndicate-view-hold',
+                  str(int(time.time()) + VIEW_HOLD_SECONDS)], socket=socket)
+    if held.returncode:
+        raise SyndicateError(held.stderr.strip() or 'could not arm the side-by-side view')
+    for name in ('client-detached', 'session-window-changed'):
+        armed = _tmux(['set-hook', '-t', TMUX_SESSION, name, hook], socket=socket)
+        if armed.returncode:
+            raise SyndicateError(armed.stderr.strip() or 'could not arm the side-by-side view')
+
+
+def _clear_view_hooks(socket=None):
+    for name in ('client-detached', 'session-window-changed'):
+        _tmux(['set-hook', '-u', '-t', TMUX_SESSION, name], socket=socket)
+    _tmux(['set-option', '-u', '-t', TMUX_SESSION, '@syndicate-view-hold'], socket=socket)
+
+
+def _view_hold(socket=None):
+    shown = _tmux(['show-options', '-t', TMUX_SESSION, '-v', '@syndicate-view-hold'], socket=socket)
+    value = shown.stdout.strip() if shown.returncode == 0 else ''
+    return int(value) if value.isdigit() else 0
+
+
+def _view_clients(socket=None, listing=None):
+    if listing is None:
+        listing = _window_listing(socket)
+    views = [row['id'] for row in listing if row['name'] == VIEW_WINDOW]
+    if not views:
+        return 0
+    shown = _tmux(['display-message', '-t', views[0], '-p', '#{window_active_clients}'], socket=socket)
+    value = shown.stdout.strip() if shown.returncode == 0 else ''
+    return int(value) if value.isdigit() else 0
+
+
+def _restore_view_unlocked(socket=None, force=False):
+    """Put side-by-side workers back in their own windows. The view is not a worker."""
+    if not _tmux_session_exists(socket):
+        return
+    if not force and (time.time() < _view_hold(socket) or _view_clients(socket) > 0):
+        return
+    for name, pane in _workers_in_view(socket).items():
+        restored = _tmux(['break-pane', '-d', '-n', name, '-s', pane['pane'], '-t', TMUX_SESSION + ':'],
+                         socket=socket)
+        if restored.returncode:
+            raise SyndicateError(restored.stderr.strip() or f'could not restore worker {name}')
+        _tmux(['set-option', '-p', '-u', '-t', pane['pane'], '@syndicate-worker'], socket=socket)
+    for row in _window_listing(socket):
+        if row['name'] == VIEW_WINDOW:
+            _tmux(['kill-window', '-t', row['id']], socket=socket)
+    _clear_view_hooks(socket)
+
+
+def restore_worker_view(socket=None, force=False):
+    with _view_lock(socket):
+        _restore_view_unlocked(socket, force=force)
+
+
+def worker_records(socket=None):
+    """Workers in the syndicate session, or None when that session does not exist."""
+    _require_tmux()
+    if not _tmux_session_exists(socket):
+        return None
+    listing = _window_listing(socket)
+    held = _workers_in_view(socket, listing)
+    records = []
+    for row in listing:
+        if row['name'] == VIEW_WINDOW:
+            continue
+        records.append({
+            'name': row['name'],
+            'state': 'exited' if row['dead'] else 'live',
+            'command': row['command'],
+            'path': row['path'],
+            'active': row['active'],
+        })
+    for name, pane in held.items():
+        if any(record['name'] == name for record in records):
+            continue
+        records.append({
+            'name': name,
+            'state': 'exited' if pane['dead'] else 'side-by-side',
+            'command': pane['command'],
+            'path': pane['path'],
+            'active': False,
+        })
+    return records
+
+
+def format_worker_table(records):
+    if not records:
+        return f'No workers in {TMUX_SESSION}.'
+    width = max(len(record['name']) for record in records)
+    lines = []
+    for record in records:
+        marker = '*' if record['active'] else ' '
+        command = record['command'] or '-'
+        path = record['path'] or '-'
+        lines.append(f"{marker} {record['name']:<{width}}  {record['state']:<12}  {command}  {path}")
+    return '\n'.join(lines)
+
+
+def _known_worker_names(socket=None):
+    return [record['name'] for record in (worker_records(socket) or [])]
+
+
+def _missing_worker(name, socket=None):
+    running = ', '.join(_known_worker_names(socket)) or 'none'
+    raise SyndicateError(f'no worker {name!r} in {TMUX_SESSION}; running: {running}')
+
+
+def focus_target(target, socket=None):
+    """Attach to a syndicate target, or switch the current tmux client onto it."""
+    if os.environ.get('TMUX') and not socket:
+        switched = _tmux(['switch-client', '-t', target], socket=socket)
+        if switched.returncode:
+            raise SyndicateError(switched.stderr.strip() or f'could not show {target}')
+        return 0
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        if target == TMUX_SESSION:
+            hint = 'syndicate attach'
+        else:
+            hint = 'syndicate show ' + target.split(':', 1)[-1]
+        raise SyndicateError(f'a terminal is required to show workers; from a terminal run: {hint}')
+    attach = ['tmux']
+    if socket:
+        attach += ['-L', socket]
+    attach += ['attach-session', '-t', target]
+    return subprocess.run(attach).returncode
+
+
+def open_worker_view(names, socket=None):
+    """Move each named worker into one window, side by side for two and tiled beyond that."""
+    with _view_lock(socket):
+        try:
+            _restore_view_unlocked(socket, force=True)
+            listing = _window_listing(socket)
+            panes = []
+            for name in names:
+                ids = [row['id'] for row in listing if row['name'] == name]
+                if len(ids) != 1:
+                    _missing_worker(name, socket)
+                listed = _tmux(['list-panes', '-t', ids[0], '-F', '#{pane_id}'], socket=socket)
+                found = [line for line in (listed.stdout or '').splitlines() if line]
+                if listed.returncode or len(found) != 1:
+                    raise SyndicateError(f'worker {name} has {len(found)} panes; syndicate expects one pane per worker')
+                marked = _tmux(['set-option', '-p', '-t', found[0], '@syndicate-worker', name], socket=socket)
+                if marked.returncode:
+                    raise SyndicateError(marked.stderr.strip() or f'could not mark worker {name}')
+                panes.append(found[0])
+            created = _tmux(['new-window', '-d', '-t', TMUX_SESSION, '-n', VIEW_WINDOW, '-P', '-F',
+                             '#{window_id}\t#{pane_id}', '/bin/sleep 86400'], socket=socket)
+            if created.returncode:
+                raise SyndicateError(created.stderr.strip() or 'could not open the side-by-side view')
+            window_id, separator, sleep_pane = created.stdout.strip().partition('\t')
+            if not separator or not window_id.startswith('@') or not sleep_pane.startswith('%'):
+                raise SyndicateError('tmux did not report the side-by-side view')
+            for pane in panes:
+                joined = _tmux(['join-pane', '-d', '-h', '-s', pane, '-t', window_id], socket=socket)
+                if joined.returncode:
+                    raise SyndicateError(joined.stderr.strip() or 'could not arrange the side-by-side view')
+            removed = _tmux(['kill-pane', '-t', sleep_pane], socket=socket)
+            if removed.returncode:
+                raise SyndicateError(removed.stderr.strip() or 'could not open the side-by-side view')
+            layout = 'even-horizontal' if len(names) == 2 else 'tiled'
+            laid = _tmux(['select-layout', '-t', window_id, layout], socket=socket)
+            if laid.returncode:
+                raise SyndicateError(laid.stderr.strip() or 'could not arrange the side-by-side view')
+            _arm_view_hooks(socket)
+        except SyndicateError:
+            try:
+                _restore_view_unlocked(socket, force=True)
+            except SyndicateError:
+                raise
+            raise
+
+
+def show_workers(names, socket=None):
+    if len(names) != len(set(names)):
+        raise SyndicateError('name each worker once')
+    if VIEW_WINDOW in names:
+        raise SyndicateError(f'{VIEW_WINDOW} is the side-by-side view, not a worker')
+    _require_session(socket)
+    restore_worker_view(socket, force=True)
+    missing = [name for name in names if name not in set(_known_worker_names(socket))]
+    if missing:
+        _missing_worker(missing[0], socket)
+    if len(names) == 1:
+        return focus_target(f'{TMUX_SESSION}:{names[0]}', socket=socket)
+    open_worker_view(names, socket=socket)
+    target = f'{TMUX_SESSION}:{VIEW_WINDOW}'
+    # Inside tmux, switch the current client and let the view hooks restore workers
+    # when that client leaves. Outside, attach and restore when the client detaches.
+    if os.environ.get('TMUX') and not socket:
+        return focus_target(target, socket=socket)
+    try:
+        return focus_target(target, socket=socket)
+    finally:
+        restore_worker_view(socket, force=True)
+
+
+def capture_worker(name, lines, socket=None):
+    _require_session(socket)
+    held = _workers_in_view(socket)
+    if name in held:
+        target = held[name]['pane']
+    elif _tmux_windows(name, socket):
+        target = f'{TMUX_SESSION}:{name}'
+    else:
+        _missing_worker(name, socket)
+        return ''
+    captured = _tmux(['capture-pane', '-p', '-J', '-t', target, '-S', f'-{lines}'], socket=socket)
+    if captured.returncode:
+        raise SyndicateError(captured.stderr.strip() or f'could not capture {name}')
+    return captured.stdout
+
+
+def close_worker(name, force=False, socket=None):
+    _require_session(socket)
+    if name == VIEW_WINDOW:
+        raise SyndicateError('that is the side-by-side view; run syndicate detach to restore its workers')
+    if name == CHIEF_TMUX_WINDOW and not force:
+        raise SyndicateError('closing chief-of-staff stops the Chief; pass --force to close it')
+    with _view_lock(socket):
+        held = _workers_in_view(socket)
+        if name in held:
+            killed = _tmux(['kill-pane', '-t', held[name]['pane']], socket=socket)
+            if killed.returncode:
+                raise SyndicateError(killed.stderr.strip() or f'could not close {name}')
+            remaining = _workers_in_view(socket)
+            if len(remaining) <= 1:
+                _restore_view_unlocked(socket, force=True)
+            else:
+                layout = 'even-horizontal' if len(remaining) == 2 else 'tiled'
+                views = [row['id'] for row in _window_listing(socket) if row['name'] == VIEW_WINDOW]
+                if views:
+                    laid = _tmux(['select-layout', '-t', views[0], layout], socket=socket)
+                    if laid.returncode:
+                        raise SyndicateError(laid.stderr.strip() or 'could not rearrange the side-by-side view')
+            return
+        ids = _tmux_windows(name, socket)
+        if len(ids) != 1:
+            _missing_worker(name, socket)
+        killed = _tmux(['kill-window', '-t', ids[0]], socket=socket)
+        if killed.returncode:
+            raise SyndicateError(killed.stderr.strip() or f'could not close {name}')
+
+
+def detach_workers(socket=None):
+    _require_session(socket)
+    _tmux(['detach-client', '-s', TMUX_SESSION], socket=socket)
+    restore_worker_view(socket, force=True)
+
+
+def cmd_list_workers(args):
+    records = worker_records()
+    if records is None:
+        message = f'No workers. Session {TMUX_SESSION} is not running.'
+        if args.json:
+            print(message, file=sys.stderr)
+            print('[]')
+        else:
+            print(message)
+        return 0
+    if args.json:
+        print(json.dumps(records, indent=2))
+        return 0
+    print(format_worker_table(records))
+    return 0
+
+
+def cmd_show_workers(args):
+    return show_workers(args.workers)
+
+
+def cmd_attach_workers(args):
+    _require_session()
+    return focus_target(TMUX_SESSION)
+
+
+def cmd_capture_worker(args):
+    if args.lines < 1 or args.lines > 5000:
+        raise SyndicateError('--lines must be between 1 and 5000')
+    sys.stdout.write(capture_worker(args.worker, args.lines))
+    return 0
+
+
+def cmd_close_worker(args):
+    close_worker(args.worker, force=args.force)
+    print(f'Closed {args.worker}.')
+    return 0
+
+
+def cmd_detach_workers(args):
+    detach_workers()
+    print(f'Detached from {TMUX_SESSION}.')
+    return 0
 
 
 def cmd_task(args):
@@ -2904,7 +3377,8 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
         prog="syndicate",
         description="Open Chief of Staff for a greeting, portfolio briefing, and conversational next steps. "
                     "Use -x codex or -x claude to choose its CLI. Project work lives under syndicate team.",
-        epilog="Examples: syndicate | syndicate -x codex | syndicate team task --project /repo 'task' | syndicate team init",
+        epilog="Examples: syndicate | syndicate -x codex | syndicate team task --project /repo 'task' | "
+               "syndicate list workers | syndicate show chief-of-staff | syndicate team init",
     )
     sub.add_argument('-x', '--runtime', choices=CLIS, help='Chief of Staff CLI')
     cmds = sub.add_subparsers(dest="cmd", required=True)
@@ -3101,6 +3575,26 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
                    help="remove the recorded usage reading of PROVIDER (claude or codex) when you know it is "
                         "outdated; the reserve cannot be enforced for it until a new reading is recorded")
     p.set_defaults(fn=cmd_limits)
+    p = cmds.add_parser('list', help='list windows in the syndicate tmux session')
+    list_actions = p.add_subparsers(dest='action', required=True)
+    workers = list_actions.add_parser('workers', help='list open workers')
+    workers.add_argument('--json', action='store_true')
+    workers.set_defaults(fn=cmd_list_workers)
+    p = cmds.add_parser('show', help='show one worker, or several side by side')
+    p.add_argument('workers', nargs='+', help='worker window names; two are side by side, three or more are tiled')
+    p.set_defaults(fn=cmd_show_workers)
+    p = cmds.add_parser('attach', help='attach to the syndicate session')
+    p.set_defaults(fn=cmd_attach_workers)
+    p = cmds.add_parser('capture', help='print recent output from a worker without attaching')
+    p.add_argument('worker')
+    p.add_argument('--lines', type=int, default=100, help='lines of pane history to print (default: 100)')
+    p.set_defaults(fn=cmd_capture_worker)
+    p = cmds.add_parser('close', help='close a worker window')
+    p.add_argument('worker')
+    p.add_argument('--force', action='store_true', help='close chief-of-staff; without this, the Chief is refused')
+    p.set_defaults(fn=cmd_close_worker)
+    p = cmds.add_parser('detach', help='detach from the syndicate session and restore side-by-side workers')
+    p.set_defaults(fn=cmd_detach_workers)
     return run, sub
 
 
@@ -3108,6 +3602,19 @@ def main(argv: list[str]) -> int:
     inside_tmux = bool(argv and argv[0] == '_in-tmux')
     if inside_tmux:
         argv = argv[1:]
+    if argv and argv[0] == '_restore-view':
+        socket = None
+        if len(argv) == 3 and argv[1] == '--socket':
+            socket = argv[2]
+        elif len(argv) != 1:
+            print('syndicate: usage: _restore-view [--socket NAME]', file=sys.stderr)
+            return 2
+        try:
+            restore_worker_view(socket=socket)
+        except (SyndicateError, portfolio.PortfolioError) as e:
+            print(f'syndicate: {e}', file=sys.stderr)
+            return 1
+        return 0
     original_argv = list(argv)
     if not argv:
         argv = ['chief-of-staff']
@@ -3124,7 +3631,7 @@ def main(argv: list[str]) -> int:
         return runtime.monitor_forever()
     run, sub = build_parsers()
     try:
-        if argv[0] in ("team", "config", "setup-codex-gate", "dashboard", "web", "limits", "tasks", "decisions", "briefing", "briefs", "sessions", "requests", "chief-of-staff", "live", "messages"):
+        if argv[0] in ("team", "config", "setup-codex-gate", "dashboard", "web", "limits", "tasks", "decisions", "briefing", "briefs", "sessions", "requests", "chief-of-staff", "live", "messages", "list", "show", "attach", "capture", "close", "detach"):
             args = sub.parse_args(argv)
         elif argv[0] in ('-h', '--help'):
             sub.parse_args(argv)
@@ -3138,11 +3645,11 @@ def main(argv: list[str]) -> int:
                     pass
                 directory = REGISTRY_PATH.parent / 'portfolio' / 'workspace'
                 directory.mkdir(parents=True, exist_ok=True)
-                name = 'chief-of-staff-work'
+                name = CHIEF_TMUX_WINDOW
             else:
                 project = getattr(args, 'project', None)
                 directory = execution_project(project or getattr(args, 'dir', '.'))
-                name = re.sub(r'[^\w-]', '-', directory.name) + '-work'
+                name = re.sub(r'[^\w-]', '-', directory.name)
                 if args.fn == cmd_task:
                     rows = assignment_rows()  # one sweep, reused for every live session
                     for session in coordination_store().snapshot()['sessions']:
