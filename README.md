@@ -107,6 +107,12 @@ syndicate close chief-of-staff --force         # the Chief is refused without --
 or switch away and each worker is a window again. `syndicate detach` does that
 from another terminal.
 
+Leave a view with **F12**. That detaches you and leaves the worker running; it
+does not type into the worker or close its prompt. Ctrl-b is the tmux prefix,
+but Cursor and VS Code use Ctrl-b for the sidebar, so it often never arrives.
+The session status line repeats the hint. From a second terminal,
+`syndicate detach` leaves the same way.
+
 ## Customizing a project
 
 Everything lives in `<project>/.syndicate/`, created by `syndicate team init` and

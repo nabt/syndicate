@@ -98,7 +98,9 @@ its CLI. List and show those windows with `syndicate list workers`,
 `syndicate detach`, and `syndicate close` instead of driving tmux yourself. `syndicate show` of one worker attaches to
 that window. `syndicate show` of two workers places their panes side by side
 for that view, and three or more are tiled. Detaching, switching away, or
-`syndicate detach` puts each worker back in its own window. Interactive launches
+`syndicate detach` puts each worker back in its own window. Press F12 to leave a
+view without stopping the worker; Ctrl-b often does not reach tmux from Cursor
+or VS Code. Interactive launches
 attach that window automatically from a terminal outside tmux; launches from
 inside tmux remain detached and print a `syndicate show` command. Headless runs wait and return the CLI's
 stdout, stderr, and exit code, then close only their window. Specialists already
