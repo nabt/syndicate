@@ -89,13 +89,22 @@ the user file.
 
 Set `tmux = off` in `~/.config/syndicate/syndicate.conf` (or
 `$XDG_CONFIG_HOME/syndicate/syndicate.conf`) to disable tmux for every execution
-task. With tmux enabled, Chief of Staff uses `chief-of-staff-work` and project
-tasks use `<project_name>-work`. Interactive launches attach automatically from
-a terminal outside tmux; launches from inside tmux remain detached and print an
-attach command. Headless runs wait and return the CLI's stdout, stderr, and exit
-code. Specialists already inside a team tmux session run there; standalone
-specialist runs use a temporary named session. Missing tmux produces an error
-with instructions to install it or disable the setting. Dry runs start nothing.
+task. With tmux enabled, every launch uses one session, `the-syndicate`, and
+creates it only when it is absent. Chief of Staff is the window `chief-of-staff`
+(exactly one window, with no `-work` suffix). Each project team is its own
+window, named after the project. Each window keeps the single pane that runs
+its CLI. List and show those windows with `syndicate list workers`,
+`syndicate show`, `syndicate capture`, `syndicate attach`, `syndicate detach`,
+and `syndicate close` instead of driving tmux yourself. `syndicate show` of one worker attaches to
+that window. `syndicate show` of two workers places their panes side by side
+for that view, and three or more are tiled. Detaching, switching away, or
+`syndicate detach` puts each worker back in its own window. Interactive launches
+attach that window automatically from a terminal outside tmux; launches from
+inside tmux remain detached and print a `syndicate show` command. Headless runs wait and return the CLI's
+stdout, stderr, and exit code, then close only their window. Specialists already
+inside a syndicate window run there; standalone specialist runs use a temporary
+window in `the-syndicate`. Missing tmux produces an error with instructions to
+install it or disable the setting. Dry runs start nothing.
 
 Interactive Codex launches suppress the default welcome-screen onboarding tips
 with the built-in `codex-tui.show_tooltips = false` setting, for both project

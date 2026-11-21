@@ -669,7 +669,7 @@ class ChiefExclusion(ProjectCase):
                 # Sweeps and session views must never probe Chief ownership.
                 self.assertFalse(any(path == self.lock or self.workspace in path.parents for path in probed))
                 self.assertEqual(sy.main(['briefing', '--json']), 0)
-        self.assertFalse(any(arg == 'tmux' or 'chief-of-staff-work' in str(arg) for argv in commands for arg in argv))
+        self.assertFalse(any(arg == 'tmux' or 'the-syndicate' in str(arg) for argv in commands for arg in argv))
         self.assertIn(self.project / '.syndicate' / 'session.lock', probed)
         # Briefing deliberately reads the Chief lock through the safe opener.
         self.assertIn(self.lock, probed)

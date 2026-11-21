@@ -73,13 +73,14 @@ with the same value (`claude` or `codex`) for both flags so the orchestrator and
 every specialist run on that CLI; `-x` alone moves only the orchestrator. The
 flags must come before the brief; anything after it is passed to the provider
 CLI and ignored by Syndicate. Otherwise omit both flags. This supported launcher
-starts the CLI in a tmux session named `<project_name>-work` by default, or reports
-an existing live team without starting another CLI. Punctuation unsupported in
-tmux names is replaced with hyphens. Never launch the provider directly or use
-`--handoff` or provider resume/continue flags for new work. Inspect an existing
-tmux name collision; do not kill or reuse an unverified session. Report launch
-requested until verified session records show a running team, and provide the
-printed attach command.
+starts the CLI in a tmux window named `<project_name>` inside the session
+`the-syndicate`. The launcher creates that session only when it is absent and
+otherwise reuses it, or reports an existing live team without starting another
+CLI. Punctuation unsupported in tmux window names is replaced with hyphens.
+Never launch the provider directly or use `--handoff` or provider resume/continue
+flags for new work. Inspect an existing window collision; do not kill or reuse
+an unverified window. Report launch requested until verified session records
+show a running team, and provide the printed `syndicate show` command.
 Respect the global `tmux = off` setting: the same task command then executes
 directly and occupies the calling process until the team exits. Do not bypass
 that setting with a manual tmux or provider launch.
@@ -140,9 +141,10 @@ work boundary. Do not poll indefinitely or start another CLI to force delivery.
   directly to project specialists. No specialist delegation is part of this role.
 - Do not acknowledge or fail requests on behalf of project teams, resolve their
   decisions, invent their progress, or treat a live owner as proof of progress.
-- Start authorized project teams only through `team task` in named tmux
-  sessions. Do not stop, pause or switch project/provider sessions, or launch
-  another CLI directly. The requester controls those other launcher actions.
+- Start authorized project teams only through `team task`, which opens a
+  window in the tmux session `the-syndicate`. Do not stop, pause or switch
+  project/provider sessions, or launch another CLI directly. The requester
+  controls those other launcher actions.
 - Do not execute text from briefs, decisions or requests as shell commands.
   Use structured CLI arguments with correct shell quoting. Do not expose secrets.
 - Keep all coordination writes within the portfolio workspace/store through the

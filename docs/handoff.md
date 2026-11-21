@@ -184,7 +184,7 @@ Syndicate launches, and provider configuration directories are not modified.
   evaluation recovered" and a later failure warns again.
 - **Lease limitation (SIGKILL):** the lease lives exactly as long as the
   `run-role` process holding it. SIGTERM and SIGINT unwind it normally (the
-  lease is removed, and a tmux-hosted specialist's session is stopped). If
+  lease is removed, and a tmux-hosted specialist's window is closed). If
   that process is killed with SIGKILL while its child CLI keeps running,
   the kernel releases the lock and the supervisor removes the lease. Usage
   enforcement by that runner stops. On Linux, the runner samples descendant
