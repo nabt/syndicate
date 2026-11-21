@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import subprocess
+import time
 import unittest
 from unittest.mock import patch
 
@@ -91,6 +92,42 @@ class Workers(ProjectCase):
         killed = [call.args[0] for call in run.call_args_list if call.args[0][1] == 'kill-window']
         self.assertEqual(killed, [['tmux', 'kill-window', '-t', '@3']])
         self.assertIn('Closed api.', out.getvalue())
+
+    def test_message_types_literal_text_and_submits(self):
+        commands = {
+            'has-session': subprocess.CompletedProcess([], 0),
+            'list-windows': subprocess.CompletedProcess([], 0, '@3\tapi\t0\t0\tcodex\t/src/api\n', ''),
+            'send-keys': subprocess.CompletedProcess([], 0, '', ''),
+        }
+        out = io.StringIO()
+        with patch.object(sy.shutil, 'which', return_value='/usr/bin/tmux'), \
+             self.tmux(commands) as run, contextlib.redirect_stdout(out):
+            self.assertEqual(sy.main(['message', 'api', 'review', 'the', 'Enter']), 0)
+        sent = [call.args[0] for call in run.call_args_list if call.args[0][1] == 'send-keys']
+        self.assertEqual(sent, [
+            ['tmux', 'send-keys', '-t', 'the-syndicate:api', '-l', '--', 'review the Enter'],
+            ['tmux', 'send-keys', '-t', 'the-syndicate:api', 'Enter'],
+        ])
+        self.assertIn('Sent to api.', out.getvalue())
+
+    def test_message_can_skip_enter_and_refuses_an_exited_worker(self):
+        live = {
+            'has-session': subprocess.CompletedProcess([], 0),
+            'list-windows': subprocess.CompletedProcess([], 0, '@3\tapi\t0\t0\tcodex\t/src/api\n', ''),
+            'send-keys': subprocess.CompletedProcess([], 0, '', ''),
+        }
+        with patch.object(sy.shutil, 'which', return_value='/usr/bin/tmux'), self.tmux(live) as run:
+            sy.message_worker('api', 'draft', submit=False)
+        sent = [call.args[0] for call in run.call_args_list if call.args[0][1] == 'send-keys']
+        self.assertEqual(sent, [['tmux', 'send-keys', '-t', 'the-syndicate:api', '-l', '--', 'draft']])
+        exited = {
+            'has-session': subprocess.CompletedProcess([], 0),
+            'list-windows': subprocess.CompletedProcess([], 0, '@3\tapi\t0\t1\tzsh\t/src/api\n', ''),
+        }
+        with patch.object(sy.shutil, 'which', return_value='/usr/bin/tmux'), self.tmux(exited) as run:
+            with self.assertRaisesRegex(sy.SyndicateError, 'not running'):
+                sy.message_worker('api', 'hello')
+        self.assertNotIn('send-keys', [call.args[0][1] for call in run.call_args_list])
 
     def test_capture_prints_pane_output(self):
         commands = {
@@ -186,3 +223,7 @@ class WorkerIntegration(ProjectCase):
         self.assertEqual(sy.capture_worker('example', 5, socket=socket).strip(), '')
         sy.close_worker('example', socket=socket)
         self.assertEqual([row['name'] for row in sy.worker_records(socket)], ['chief-of-staff'])
+        sy._start_tmux_window(self.project, 'inbox', 'cat', socket=socket)
+        sy.message_worker('inbox', 'hello workers', socket=socket)
+        time.sleep(0.2)
+        self.assertIn('hello workers', sy.capture_worker('inbox', 20, socket=socket))

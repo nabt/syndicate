@@ -96,6 +96,7 @@ syndicate list workers                         # every open window
 syndicate show chief-of-staff                  # attach to one worker
 syndicate show chief-of-staff some-project     # two side by side; three or more tile
 syndicate capture some-project                 # recent output, without attaching
+syndicate message some-project "ship it"       # type into a running worker and press Enter
 syndicate attach                               # rejoin the session where you left it
 syndicate detach                               # leave, and put a side-by-side view back into windows
 syndicate close some-project                   # close a finished worker
