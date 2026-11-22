@@ -1,0 +1,257 @@
+# Recommended Codex command approvals.
+# Copy this file to ~/.codex/rules/ so a new thread auto-allows these prefixes.
+# Add a local host_executable() entry when a tool is invoked by an absolute path
+# other than /usr/bin/git or /bin/git.
+
+host_executable(
+    name = "git",
+    paths = ["/usr/bin/git", "/bin/git"],
+)
+
+# --- git: inspection and the local workflow ---
+
+prefix_rule(
+    pattern = [
+        "git",
+        [
+            "status",
+            "diff",
+            "log",
+            "show",
+            "fetch",
+            "branch",
+            "rev-parse",
+            "grep",
+            "ls-files",
+            "ls-tree",
+            "ls-remote",
+            "remote",
+            "worktree",
+            "switch",
+            "merge-base",
+            "rev-list",
+            "check-ignore",
+            "cat-file",
+            "for-each-ref",
+            "blame",
+            "apply",
+            "patch-id",
+            "archive",
+            "stash",
+            "merge",
+            "add",
+        ],
+    ],
+    decision = "allow",
+    justification = "Routine git inspection and local workflow commands.",
+    match = [
+        "git status --short",
+        "git diff --stat",
+        "git log -1 --oneline",
+        "git fetch origin",
+        "git add -- bin/syndicate",
+        "git ls-remote --heads origin",
+        "git worktree list",
+    ],
+    not_match = [
+        "git reset --hard",
+        "git clean -fd",
+        "git config user.name",
+        "git push origin main",
+        "git commit -m hello",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "commit"],
+    decision = "allow",
+    justification = "Local commits are part of the normal edit loop.",
+    match = ["git commit -m hello", "git commit -- bin/syndicate"],
+    not_match = ["git status", "git push origin main"],
+)
+
+prefix_rule(
+    pattern = ["git", "commit", "--amend"],
+    decision = "prompt",
+    justification = "Amending a commit rewrites history and stays a manual approval.",
+    match = ["git commit --amend"],
+)
+
+# A prompt rule only wins when the force flag is the next token
+# (`git push --force`). `git push origin --force` still matches the allow prefix.
+prefix_rule(
+    pattern = ["git", "push"],
+    decision = "allow",
+    justification = "Publishing the current branch is a repeated step.",
+    match = ["git push -u origin HEAD", "git push origin main"],
+    not_match = ["git fetch origin", "git commit -m hello"],
+)
+
+prefix_rule(
+    pattern = ["git", "push", "--force"],
+    decision = "prompt",
+    justification = "Force-push stays a manual approval.",
+    match = ["git push --force"],
+)
+
+prefix_rule(
+    pattern = ["git", "push", "--force-with-lease"],
+    decision = "prompt",
+    justification = "Force-with-lease still rewrites the remote ref.",
+    match = ["git push --force-with-lease"],
+)
+
+prefix_rule(
+    pattern = ["git", "push", "-f"],
+    decision = "prompt",
+    justification = "Force-push stays a manual approval.",
+    match = ["git push -f origin"],
+)
+
+# --- gh ---
+
+prefix_rule(
+    pattern = [
+        "gh",
+        "pr",
+        ["view", "list", "diff", "checks", "status", "create", "edit", "review"],
+    ],
+    decision = "allow",
+    justification = "PR inspection and opening or updating a pull request.",
+    match = [
+        "gh pr view 27 --json title,url",
+        "gh pr list",
+        "gh pr checks 27",
+        "gh pr create --base main --head work/example --title Example",
+    ],
+    not_match = ["gh pr merge 27", "gh api repos/example/project"],
+)
+
+prefix_rule(
+    pattern = ["gh", "run", ["view", "list", "watch"]],
+    decision = "allow",
+    justification = "Reading GitHub Actions runs does not mutate the repo.",
+    match = ["gh run view 1", "gh run list", "gh run watch"],
+    not_match = ["gh run cancel 1", "gh run rerun 1"],
+)
+
+prefix_rule(
+    pattern = ["gh", "repo", "view"],
+    decision = "allow",
+    justification = "Repository metadata reads are safe.",
+    match = ["gh repo view example/project --json nameWithOwner"],
+    not_match = ["gh repo create example/project"],
+)
+
+prefix_rule(
+    pattern = ["gh", "auth", "status"],
+    decision = "allow",
+    justification = "Checking gh auth does not change credentials.",
+    match = ["gh auth status"],
+    not_match = ["gh auth login"],
+)
+
+# --- search ---
+
+prefix_rule(
+    pattern = ["rg"],
+    decision = "allow",
+    justification = "ripgrep searches the workspace.",
+    match = ["rg --files", "rg -n approval bin"],
+    not_match = ["grep -n approval bin"],
+)
+
+prefix_rule(
+    pattern = ["rg", "--pre"],
+    decision = "prompt",
+    justification = "rg --pre executes another program.",
+    match = ["rg --pre cmd pattern"],
+)
+
+# --- unit tests and the compilers/checks that sit next to them ---
+
+prefix_rule(
+    pattern = [
+        ["python3", "python", "python3.14"],
+        "-m",
+        ["unittest", "pytest"],
+    ],
+    decision = "allow",
+    justification = "Python unit tests and pytest.",
+    match = [
+        "python3 -m unittest discover -s tests",
+        "python -m pytest -q",
+        "python3.14 -m unittest discover -s tests",
+    ],
+    not_match = [
+        "python3 -c print(1)",
+        "python3 -B -m unittest discover -s tests",
+        "python3 -m pip install pytest",
+    ],
+)
+
+prefix_rule(
+    pattern = [
+        ["python3", "python", "python3.14"],
+        "-B",
+        "-m",
+        ["unittest", "pytest"],
+    ],
+    decision = "allow",
+    justification = "The same test runners with -B, which occupies the token before -m.",
+    match = [
+        "python3 -B -m unittest discover -s tests",
+        "python3 -B -m pytest -q",
+    ],
+    not_match = ["python3 -B -c print(1)", "python3 -m unittest discover -s tests"],
+)
+
+prefix_rule(
+    pattern = ["cargo", ["test", "check", "fmt", "clippy", "build"]],
+    decision = "allow",
+    justification = "Rust test and check commands.",
+    match = ["cargo test", "cargo fmt --check", "cargo clippy --all-targets --offline"],
+    not_match = ["cargo install ripgrep", "cargo clean"],
+)
+
+# --- read-only container inspection ---
+
+prefix_rule(
+    pattern = ["docker", ["ps", "images", "version", "info"]],
+    decision = "allow",
+    justification = "Read-only docker queries.",
+    match = ["docker ps", "docker images", "docker version"],
+    not_match = ["docker run --rm alpine", "docker exec -it abc sh", "docker build ."],
+)
+
+prefix_rule(
+    pattern = ["docker", "image", "ls"],
+    decision = "allow",
+    justification = "Listing local images is read-only.",
+    match = ["docker image ls"],
+    not_match = ["docker image rm postgres"],
+)
+
+prefix_rule(
+    pattern = ["nerdctl", ["ps", "images", "version", "info", "inspect", "logs"]],
+    decision = "allow",
+    justification = "Read-only nerdctl queries.",
+    match = ["nerdctl ps", "nerdctl images", "nerdctl version"],
+    not_match = ["nerdctl run alpine", "nerdctl exec abc sh", "nerdctl build ."],
+)
+
+prefix_rule(
+    pattern = ["nerdctl", "image", "ls"],
+    decision = "allow",
+    justification = "Listing nerdctl images is read-only.",
+    match = ["nerdctl image ls"],
+    not_match = ["nerdctl image rm postgres"],
+)
+
+prefix_rule(
+    pattern = ["nerdctl", ["namespace", "network", "volume"], "ls"],
+    decision = "allow",
+    justification = "Listing nerdctl namespaces, networks, and volumes is read-only.",
+    match = ["nerdctl namespace ls", "nerdctl network ls", "nerdctl volume ls"],
+    not_match = ["nerdctl network rm dev", "nerdctl volume rm pg"],
+)
