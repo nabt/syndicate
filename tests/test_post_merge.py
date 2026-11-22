@@ -449,6 +449,71 @@ class PostMergeCleanupTests(unittest.TestCase):
         self.assertEqual(self.git(fresh, "for-each-ref", "--format=%(refname)"), refs_before)
         self.assertTrue(any("Verified squash/rebase merge" in message for message in self.messages))
 
+    def test_squash_merge_error_escapes_untrusted_path_names(self):
+        name = "evil\n\x1b[32mVerified.txt"
+        self.task_commit(name, "task\n", "add hostile path name")
+        self.squash(edit=lambda path: (path / name).write_text("altered\n"))
+        with self.assertRaises(syndicate_git.CleanupError) as raised:
+            self.cleanup()
+        message = str(raised.exception)
+        self.assertNotIn("\n", message)
+        self.assertNotIn("\x1b", message)
+        self.assertIn(repr(name), message)
+        self.assert_artifacts()
+
+    def shallow_clone(self, depth):
+        clone = self.task.parent / "shallow"
+        self.git(self.task.parent, "clone", "-q", f"--depth={depth}", "--single-branch", "--branch", "main",
+                 f"file://{self.remote}", str(clone))
+        self.assertEqual(self.git(clone, "rev-parse", "--is-shallow-repository"), "true")
+        return clone
+
+    def test_squash_merge_in_shallow_clone_preserves(self):
+        self.squash()
+        clone = self.shallow_clone(1)
+        with self.assertRaisesRegex(syndicate_git.CleanupError, "shallow clone.*preserved.*--unshallow"):
+            self.cleanup(repo=clone, worktree=self.task.parent / "absent task")
+        self.assertEqual(self.git(self.remote, "rev-parse", self.task_ref), self.head)
+        self.assertEqual(self.git(self.repo, "rev-parse", self.task_ref), self.head)
+
+    def test_squash_merge_with_grafts_preserves(self):
+        self.squash()
+        grafts = Path(self.git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        (grafts / "info").mkdir(exist_ok=True)
+        (grafts / "info" / "grafts").write_text("")
+        with self.assertRaisesRegex(syndicate_git.CleanupError, "grafts.*preserved"):
+            self.cleanup()
+        self.assert_artifacts()
+
+    def test_merge_commit_in_shallow_clone_cleans_up(self):
+        # Ancestry needs no content proof; a shallow history can only hide ancestry, never invent it.
+        target = self.merge()
+        clone = self.shallow_clone(2)
+        self.cleanup(repo=clone, worktree=self.task.parent / "absent task")
+        self.assertEqual(self.git(self.remote, "branch", "--list", self.branch), "")
+        self.assertEqual(self.git(clone, "rev-parse", "HEAD"), target)
+
+    def test_oid_of_other_hash_format_is_rejected_before_deletion(self):
+        self.merge()
+        self.pr["headRefOid"] = "a" * 64
+        with self.assertRaisesRegex(syndicate_git.CleanupError, "missing a valid merge commit or head commit"):
+            self.cleanup()
+        self.assert_artifacts()
+
+    def test_unknown_object_format_is_rejected(self):
+        self.merge()
+        run = syndicate_git._git
+
+        def fake_format(path, *args, expected=(0,)):
+            if args == ("rev-parse", "--show-object-format"):
+                return subprocess.CompletedProcess(args, 0, "sha3\n", "")
+            return run(path, *args, expected=expected)
+
+        with patch.object(syndicate_git, "_git", side_effect=fake_format), \
+                self.assertRaisesRegex(syndicate_git.CleanupError, "Unsupported Git object format 'sha3'"):
+            self.cleanup()
+        self.assert_artifacts()
+
     def test_squash_merge_honors_syndicate_lock_and_series_guard(self):
         self.git(self.repo, "worktree", "lock", "--reason", "syndicate: task-123", str(self.task))
         target = self.squash()
@@ -485,6 +550,30 @@ class PostMergeCleanupTests(unittest.TestCase):
         self.assertTrue(self.task.is_dir())
         self.assertEqual(self.git(self.repo, "rev-parse", self.task_ref), local_tip)
         self.assertEqual(self.git(self.remote, "rev-parse", self.task_ref), self.head)
+        self.assertEqual(self.git(self.repo, "rev-parse", "HEAD"), self.start)
+
+    def test_merge_commit_with_local_tip_behind_pr_head_cleans_up(self):
+        first = self.head
+        self.task_commit("second.txt", "second\n", "second task change")
+        self.git(self.integrator, "fetch", "origin")
+        target = self.merge()
+        self.git(self.task, "reset", "-q", "--hard", first)
+        self.cleanup()
+        self.assert_cleaned(target)
+        self.assertFalse(any("squash/rebase" in message for message in self.messages))
+
+    def test_merge_commit_with_remote_pushed_after_merge_preserves(self):
+        self.merge()
+        self.git(self.task, "commit", "--allow-empty", "-m", "pushed after merge")
+        moved = self.git(self.task, "rev-parse", "HEAD")
+        self.git(self.task, "push", "origin", self.branch)
+        self.git(self.task, "reset", "-q", "--hard", self.head)
+        with self.assertRaisesRegex(syndicate_git.CleanupError,
+                                    f"Remote task branch tip {moved} cannot be proven.*preserved"):
+            self.cleanup()
+        self.assertTrue(self.task.is_dir())
+        self.assertEqual(self.git(self.repo, "rev-parse", self.task_ref), self.head)
+        self.assertEqual(self.git(self.remote, "rev-parse", self.task_ref), moved)
         self.assertEqual(self.git(self.repo, "rev-parse", "HEAD"), self.start)
 
     def test_remote_branch_that_changes_during_cleanup_survives(self):
