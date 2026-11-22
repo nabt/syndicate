@@ -5,22 +5,25 @@ a prefix rule in `~/.codex/rules/` already allows that command. Codex reads
 every `*.rules` file in that directory when a thread starts. An already-open
 session keeps the rules it loaded at start.
 
-On this machine the recommended set is installed at
-`~/.codex/rules/common.rules`, next to the older syndicate-specific files
-below. Check a command against the installed files with:
+The recommended set is [`resources/codex/rules/common.rules`](../resources/codex/rules/common.rules).
+Copy it into `~/.codex/rules/` and start a new thread. Check a command against
+that file with:
 
 ```sh
 codex execpolicy check --pretty \
-  --rules ~/.codex/rules/common.rules \
-  --rules ~/.codex/rules/custom_exec.rules \
-  --rules ~/.codex/rules/default.rules \
-  --rules ~/.codex/rules/git.rules \
+  --rules resources/codex/rules/common.rules \
   -- git status --short
 ```
 
 `decision` is `allow` when a rule covers the command. An empty `matchedRules`
 list means Codex will still ask. A matching `prompt` rule wins over a shorter
 `allow` rule.
+
+When a tool is invoked by an absolute path, add a local `host_executable()`
+entry for that path. The recommended file already lists `/usr/bin/git` and
+`/bin/git`. A rule whose first token is `python3` matches `python3 -m unittest`
+and does not match `/usr/local/bin/python3 -m unittest` until that path is
+listed.
 
 ## Rule shape
 
@@ -39,15 +42,9 @@ prefix_rule(
 )
 ```
 
-`decision` is `allow`, `prompt`, or `forbidden`. `host_executable` lets an
-absolute path such as `/usr/bin/git` match a rule whose first token is `git`,
-and only for the paths listed there. Point those paths at the local binaries
-(`command -v git`, and the same for `gh` and `cargo`).
+`decision` is `allow`, `prompt`, or `forbidden`.
 
 ## Recommended allows
-
-These are the prefixes in `common.rules`. They came from the commands Codex
-sessions on this machine actually run.
 
 | Tool | Allowed prefix |
 |---|---|
@@ -59,15 +56,14 @@ sessions on this machine actually run.
 | gh | `repo view` |
 | gh | `auth status` |
 | rg | any `rg` search |
-| python | `python`, `python3`, or `python3.14` (including `/usr/bin/python3`, `/bin/python3`, and the Linuxbrew 3.14 paths), then `-m unittest` or `-m pytest` |
+| python | `python`, `python3`, or `python3.14`, then `-m unittest` or `-m pytest` |
 | python | the same interpreters, then `-B -m unittest` or `-B -m pytest` |
 | cargo | `test`, `check`, `fmt`, `clippy`, `build` |
 | docker | `ps`, `images`, `version`, `info`, and `image ls` |
 | nerdctl | `ps`, `images`, `version`, `info`, `inspect`, `logs`, `image ls`, and `namespace`/`network`/`volume` `ls` |
 
-`python3 -B -m unittest` is the form these sessions use most often. A rule for
-`python3 -m unittest` does not cover the `-B` form, because `-B` occupies the
-next token.
+`python3 -B -m unittest` needs its own rule. `-B` occupies the token before
+`-m`, so a rule for `python3 -m unittest` leaves the `-B` form unmatched.
 
 ## Commands that still ask
 
@@ -85,25 +81,10 @@ next token.
 
 Prefix rules cannot see a flag that comes later. `git push origin --force` and
 `git commit -m hello --amend` match the plain `push` and `commit` allows.
-Those two shapes did not appear in the session logs. Heredoc commands also
-stay on a prompt; a saved prefix is the wrong tool for them.
+Heredoc commands also stay on a prompt; a saved prefix is the wrong tool for
+them.
 
 Read-only inspection inside the workspace (`sed -n`, `head`, `tail`, `ls`,
-`cat`) already runs under the `on-request` sandbox, so `common.rules` leaves
-those commands unmatched.
-
-## Syndicate rules already installed
-
-`~/.codex/rules/custom_exec.rules` allows `syndicate` and
-`python3.14 …/bin/syndicate` for `requests`, `team`, `briefs`, `sessions`,
-`live`, `messages`, `briefing`, `decisions`, `tasks`, `config`, `dashboard`,
-`web`, and `limits`. It also allows `gh pr review`.
-
-`~/.codex/rules/default.rules` allows `gh pr view`, `git fetch`,
-`python3 -m unittest`, one `syndicate sessions --json` invocation, and one
-specific `git worktree add`.
-
-`~/.codex/rules/git.rules` allows `gh run view`.
-
-`common.rules` repeats a few of those prefixes so the recommended set stands
-on its own. Repeating an allow is harmless.
+`cat`) already runs under the `on-request` sandbox, so
+[`common.rules`](../resources/codex/rules/common.rules) leaves those commands
+unmatched.
