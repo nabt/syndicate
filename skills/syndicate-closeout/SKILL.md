@@ -77,7 +77,10 @@ owning task's `delegated_closeout_required` flag when present.
    must equal the PR head exactly, and every path the PR changed (including
    deletions, renames, mode and submodule changes) must be identical in the
    merge commit. Otherwise it preserves the branches and worktree; report why
-   cleanup stopped. A dirty task worktree, including its
+   cleanup stopped. The squash/rebase proof also refuses shallow clones and
+   repositories with `info/grafts`; recover with `git fetch --unshallow origin`
+   or by removing the grafts file (or converting it with
+   `git replace --convert-graft-file`), then rerun. A dirty task worktree, including its
    ignored files, stops cleanup. The helper accepts the worktree's Syndicate
    lock, unlocks it only immediately before removal, and stops on any other
    lock. While another task registered to the same series (in any of its

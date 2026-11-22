@@ -41,20 +41,26 @@ class CleanupError(Exception):
     """An operation was unsafe or could not be verified."""
 
 
-def _run(path: Path, command: tuple[str, ...], expected=(0,)) -> subprocess.CompletedProcess:
+def _run(path: Path, command: tuple[str, ...], expected=(0,), label: str | None = None) -> subprocess.CompletedProcess:
+    label = label or f"{command[0]} {command[1]}"
     try:
         result = subprocess.run(command, cwd=path, text=True, errors="surrogateescape", stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise CleanupError(f"Could not run {command[0]} {command[1]}: {exc}") from exc
+        raise CleanupError(f"Could not run {label}: {exc}") from exc
     if result.returncode not in expected:
         detail = result.stderr.strip() or result.stdout.strip()
-        raise CleanupError(f"{command[0]} {command[1]} failed: {detail or result.returncode}")
+        raise CleanupError(f"{label} failed: {detail or result.returncode}")
     return result
 
 
 def _git(path: Path, *args: str, expected=(0,)) -> subprocess.CompletedProcess:
-    return _run(path, ("git", "--no-replace-objects", *args), expected)
+    # Name the subcommand in errors, skipping leading options and -c/-C values.
+    index = 0
+    while index < len(args) and args[index].startswith("-"):
+        index += 2 if args[index] in ("-c", "-C") else 1
+    subcommand = args[index] if index < len(args) else "command"
+    return _run(path, ("git", "--no-replace-objects", *args), expected, f"git {subcommand}")
 
 
 def _github_repository(url: str) -> str:
@@ -148,10 +154,13 @@ def _has_commit(repo: Path, oid: str) -> bool:
 
 
 def _merged_by_ancestry(repo: Path, tips: list[tuple[str, str]], pr_head: str, main_tip: str) -> bool:
-    """True when every existing task tip is in both origin/main and the PR head history."""
-    return _has_commit(repo, pr_head) and all(
+    """True when every existing task tip is in both origin/main and the PR head history.
+
+    Vacuously true without tips: no task branch remains to delete or prove."""
+    # With no tips (both branches already gone) nothing is deleted, so accept vacuously.
+    return not tips or (_has_commit(repo, pr_head) and all(
         _has_commit(repo, tip) and _ancestor(repo, tip, main_tip) and _ancestor(repo, tip, pr_head)
-        for _, tip in tips)
+        for _, tip in tips))
 
 
 def _tree_entries(repo: Path, commit: str) -> dict[str, tuple[str, str]]:

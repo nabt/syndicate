@@ -104,7 +104,7 @@ class PostMergeCleanupTests(unittest.TestCase):
                 series_guard=None):
         run = syndicate_git._run
 
-        def run_with_mock_pr(path, command, expected=(0,)):
+        def run_with_mock_pr(path, command, expected=(0,), label=None):
             if command[0] == "gh":
                 self.assertEqual(command[:6], ("gh", "pr", "view", "123", "--repo",
                                                "github.com/example/project"))
@@ -115,7 +115,7 @@ class PostMergeCleanupTests(unittest.TestCase):
                 self.git(self.task, "push", "origin", self.branch)
             if command[0] == "sh" and switch_main:
                 self.git(self.repo, "switch", "-c", "different-task")
-            return run(path, command, expected)
+            return run(path, command, expected, label)
 
         with patch.object(syndicate_git, "_run", side_effect=run_with_mock_pr), patch.object(
             syndicate_git, "_github_repository", return_value="github.com/example/project"
@@ -492,6 +492,35 @@ class PostMergeCleanupTests(unittest.TestCase):
         self.cleanup(repo=clone, worktree=self.task.parent / "absent task")
         self.assertEqual(self.git(self.remote, "branch", "--list", self.branch), "")
         self.assertEqual(self.git(clone, "rev-parse", "HEAD"), target)
+
+    def remove_task_branches(self):
+        """The remote auto-deleted the task branch; cleanup then runs where none was ever checked out."""
+        self.git(self.remote, "update-ref", "-d", self.task_ref)
+
+    def test_squash_merge_without_task_branches_in_fresh_clone_cleans_up(self):
+        # No tip is left to prove or delete, so no fetch of the deleted remote branch is attempted.
+        target = self.squash()
+        self.remove_task_branches()
+        fresh = self.task.parent / "fresh"
+        self.git(self.task.parent, "clone", "-q", f"file://{self.remote}", str(fresh))
+        self.cleanup(repo=fresh, worktree=self.task.parent / "absent task")
+        self.assertEqual(self.git(fresh, "rev-parse", "HEAD"), target)
+        self.assertIn(f"Remote task branch {self.branch} was already absent.", self.messages)
+        self.assertFalse(any("Verified squash/rebase merge" in message for message in self.messages))
+
+    def test_merge_commit_without_task_branches_in_depth_one_clone_cleans_up(self):
+        target = self.merge()
+        self.remove_task_branches()
+        clone = self.shallow_clone(1)
+        self.cleanup(repo=clone, worktree=self.task.parent / "absent task")
+        self.assertEqual(self.git(clone, "rev-parse", "HEAD"), target)
+        self.assertIn(f"Remote task branch {self.branch} was already absent.", self.messages)
+
+    def test_git_errors_name_the_subcommand(self):
+        with self.assertRaisesRegex(syndicate_git.CleanupError, r"^git check-ref-format failed: "):
+            syndicate_git._git(self.repo, "check-ref-format", "refs/heads/a..b")
+        with self.assertRaisesRegex(syndicate_git.CleanupError, r"^git rev-parse failed: "):
+            syndicate_git._git(self.repo, "-c", "core.quotePath=false", "rev-parse", "--verify", "missing")
 
     def test_oid_of_other_hash_format_is_rejected_before_deletion(self):
         self.merge()

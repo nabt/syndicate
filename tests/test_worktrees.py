@@ -535,12 +535,12 @@ class LockedCleanup(WorktreeCase):
         """Run cleanup-pr; git commands starting with an entry of fail exit 1."""
         run = syndicate_git._run
 
-        def fake(path, command, expected=(0,)):
+        def fake(path, command, expected=(0,), label=None):
             if command[0] == "gh":
                 return subprocess.CompletedProcess(command, 0, json.dumps(self.pr), "")
             if any(command[2:2 + len(prefix)] == prefix for prefix in fail):
                 raise syndicate_git.CleanupError(f"git {command[2]} failed: simulated")
-            return run(path, command, expected)
+            return run(path, command, expected, label)
 
         argv = ["tasks", "cleanup-pr", "7", "-C", str(self.repo), "--branch", self.branch,
                 "--worktree", str(self.path)] + (["--task", task] if task else [])
