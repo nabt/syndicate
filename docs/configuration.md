@@ -25,8 +25,10 @@ registered projects, `task-edits.json` stores task-management overrides, and
 `portfolio/` holds decisions, project briefs, ownership, team requests, and the
 isolated Chief of Staff workspace. `worktrees/` holds locked task worktrees and
 their `registry.json`; set `$SYNDICATE_WORKTREE_ROOT` to an absolute, durable
-directory to place worktrees elsewhere (temporary filesystems are refused). See
-[Task worktrees](handoff.md#task-worktrees). See the [Chief of Staff guide](chief-of-staff.md)
+directory to place worktrees elsewhere (temporary filesystems are refused; the
+registry stays in `~/.syndicate/worktrees/`). An invalid `registry.json` is
+never overwritten; worktree commands stop until it is repaired or moved aside.
+See [Task worktrees](handoff.md#task-worktrees). See the [Chief of Staff guide](chief-of-staff.md)
 for its separate launch path; project role/runtime settings do not configure it.
 
 Run `syndicate team init` inside a project to create `syndicate.conf` and `roles/` and the

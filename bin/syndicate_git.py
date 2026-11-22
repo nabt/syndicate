@@ -5,9 +5,11 @@ import json
 import os
 import re
 import subprocess
+import shlex
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Callable
+from typing import Callable, ContextManager
 from urllib.parse import urlsplit
 
 MAIN = "refs/heads/main"
@@ -171,15 +173,41 @@ def _check_task_worktree(repo: Path, path: Path, task_ref: str,
     return task_record is not None
 
 
+def _remove_task_worktree(repo: Path, path: Path) -> None:
+    record = next((wt for wt in _worktrees(repo) if Path(wt["worktree"]).resolve() == path), None)
+    if record is None:
+        raise CleanupError(f"Task worktree {path} is no longer registered; removal skipped")
+    if "locked" not in record:
+        _git(repo, "worktree", "remove", "--", str(path))
+        return
+    # Unlock only immediately before removal; restore the lock if removal fails.
+    reason = record["locked"]
+    _git(repo, "worktree", "unlock", "--", str(path))
+    try:
+        _git(repo, "worktree", "remove", "--", str(path))
+    except CleanupError as error:
+        relock = ("git", "-C", str(repo), "worktree", "lock", *(("--reason", reason) if reason else ()),
+                  "--", str(path))
+        try:
+            _git(repo, *relock[3:])
+        except CleanupError as lock_error:
+            raise CleanupError(
+                f"{error}. Re-locking failed too ({lock_error}): task worktree {path} is now UNLOCKED "
+                f"and must be locked again before anything prunes it: {shlex.join(relock)}") from error
+        raise CleanupError(f"{error}. The task worktree lock was restored") from error
+
+
 def cleanup_pr(repo: Path, number: int, branch: str, path: Path,
                report: Callable[[str], None],
                series_guard: Callable[[Path], None] | None = None,
-               on_removed: Callable[[Path], None] | None = None) -> bool:
+               removal_lock: Callable[[], ContextManager] | None = None) -> bool:
     """Clean up recorded task artifacts after proving a same-repository merge.
 
     series_guard(path) runs after the merge is verified and before any change;
     it raises CleanupError while other tasks of the worktree's series are
-    unfinished. on_removed(path) runs after the task worktree is removed.
+    unfinished. It runs again under removal_lock() (the registry lock, which
+    task worktree adoption also holds) immediately before the worktree is
+    unlocked and removed, so a task added to the series meanwhile stops removal.
     Returns True when cleanup ran, False when the PR is not merged."""
     overrides = sorted(key for key in os.environ
                        if key in GIT_ROUTING_ENV or key.startswith("GIT_CONFIG_"))
@@ -260,20 +288,11 @@ def cleanup_pr(repo: Path, number: int, branch: str, path: Path,
             _ref_oid(repo, task_ref) != local_tip
         ):
             raise CleanupError("Task worktree or branch changed during cleanup")
-        record = next(wt for wt in _worktrees(repo) if Path(wt["worktree"]).resolve() == path)
-        if "locked" in record:
-            # Unlock only immediately before removal; restore the lock if removal fails.
-            _git(repo, "worktree", "unlock", "--", str(path))
-            try:
-                _git(repo, "worktree", "remove", "--", str(path))
-            except CleanupError:
-                _git(repo, "worktree", "lock", "--reason", record["locked"], "--", str(path), expected=(0, 128))
-                raise
-        else:
-            _git(repo, "worktree", "remove", "--", str(path))
+        with removal_lock() if removal_lock is not None else nullcontext():
+            if series_guard is not None:
+                series_guard(path)
+            _remove_task_worktree(repo, path)
         report(f"Removed task worktree {path}.")
-        if on_removed is not None:
-            on_removed(path)
     if local_tip:
         if any(wt.get("branch") == task_ref for wt in _worktrees(repo)):
             raise CleanupError(f"Local task branch {branch} is checked out")

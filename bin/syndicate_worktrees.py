@@ -13,6 +13,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import tempfile
 import time
@@ -44,6 +46,16 @@ class WorktreeError(Exception):
     """A task worktree could not be created, adopted, or verified."""
 
 
+class RegistryError(WorktreeError):
+    """The registry file exists but cannot be read or is not a valid registry."""
+
+
+BRANCH_CHARS = re.compile(r"[A-Za-z0-9._/-]+")
+# Series names appear in lock reasons and shell commands: one short printable line.
+SERIES_CHARS = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._/:@+-]{0,99}")
+OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
 def git_env(**extra) -> dict:
     env = {k: v for k, v in os.environ.items() if k not in GIT_ROUTING_ENV}
     env.update(extra)
@@ -68,6 +80,21 @@ def lock_reason(series: str, task_id: str) -> str:
 
 def slug(branch: str) -> str:
     return branch.replace("/", "-")
+
+
+def q(value) -> str:
+    """Shell-quote a value interpolated into a command shown to the user."""
+    return shlex.quote(str(value))
+
+
+def verify_base(repo, base: str) -> str:
+    """Return base when it names a commit in repo; never let it act as a git option."""
+    if not isinstance(base, str) or not base or base.startswith("-") or not base.isprintable():
+        raise WorktreeError(f"Base {base!r} is not a valid revision")
+    result = git(repo, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{base}^{{commit}}", check=False)
+    if result.returncode != 0:
+        raise WorktreeError(f"Base {base} does not name a commit in {repo}")
+    return base
 
 
 # ---------------------------------------------------------------- locations
@@ -173,13 +200,29 @@ def _atomic_json(path: Path, data) -> None:
 
 
 def read_registry() -> dict:
+    """The registry, or an empty one when the file does not exist.
+
+    An unreadable or invalid file raises RegistryError; callers that write must
+    never replace it, since it may hold the only record of a locked worktree."""
     try:
-        data = json.loads(REGISTRY.read_text())
-    except (OSError, ValueError, RecursionError):
+        text = REGISTRY.read_text()
+    except FileNotFoundError:
         return {"worktrees": {}}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RegistryError(_registry_problem(f"cannot be read: {exc}")) from exc
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError) as exc:
+        raise RegistryError(_registry_problem("is not valid JSON")) from exc
     if not isinstance(data, dict) or not isinstance(data.get("worktrees"), dict):
-        return {"worktrees": {}}
+        raise RegistryError(_registry_problem('has no "worktrees" object'))
     return data
+
+
+def _registry_problem(why: str) -> str:
+    return (f"Task worktree registry {REGISTRY} {why}. It was left unchanged. Inspect it; if it cannot "
+            f"be repaired, move it aside (for example `mv {q(REGISTRY)} {q(str(REGISTRY) + '.bad')}`) and "
+            "rerun `syndicate tasks worktree` for each task worktree to register it again.")
 
 
 def write_registry(data: dict) -> None:
@@ -207,9 +250,38 @@ def entries_for_task(task_id: str, source=None) -> list[dict]:
 
 def drop_entry(path) -> None:
     with registry_lock():
-        data = read_registry()
+        data = read_registry()  # raises RegistryError rather than overwrite an invalid file
         if data["worktrees"].pop(str(Path(path).resolve()), None) is not None:
             write_registry(data)
+
+
+def series_task_ids(entry: dict) -> list[str]:
+    """Task IDs of every registered worktree sharing entry's source and series."""
+    key = (entry.get("source"), entry.get("series"))
+    ids: list[str] = []
+    for other in read_registry()["worktrees"].values():
+        if isinstance(other, dict) and (other.get("source"), other.get("series")) == key:
+            ids.extend(t for t in other.get("task_ids") or [] if isinstance(t, str) and t not in ids)
+    return ids
+
+
+def delete_snapshots(repo, branch: str) -> list[tuple[str, str]]:
+    """Delete branch's handoff snapshot refs; return (ref, old commit) pairs deleted.
+
+    Refs are deleted with compare-and-delete against the listed commit, and only
+    when the snapshot commit names this branch (slugs of distinct branches can collide)."""
+    prefix = f"{SNAPSHOT_REF}/{slug(branch)}/"
+    listing = git(repo, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(contents:subject)",
+                  "--end-of-options", prefix).stdout
+    deleted = []
+    for line in listing.splitlines():
+        ref, oid, subject = (line.split("\0") + ["", ""])[:3]
+        mine = re.fullmatch(rf"Syndicate handoff snapshot \S+ of {re.escape(branch)} \(task [^)]*\)", subject)
+        if not ref.startswith(prefix) or not OID.fullmatch(oid) or not mine:
+            continue
+        if git(repo, "update-ref", "-d", ref, oid, check=False).returncode == 0:
+            deleted.append((ref, oid))
+    return deleted
 
 
 # ----------------------------------------------------------------- creation
@@ -234,13 +306,29 @@ def default_base(repo: Path) -> str:
 
 def _add_locked(repo: Path, reason: str, target: Path, args: list[str]) -> None:
     result = git(repo, "worktree", "add", "--lock", "--reason", reason, *args, check=False)
-    if result.returncode == 129 and "--reason" in (result.stderr or ""):
+    stderr = result.stderr or ""
+    # Git before 2.37 lacks `add --reason` and reports: error: unknown option `reason'
+    if result.returncode == 129 and "unknown option" in stderr and "reason" in stderr:
         # Older Git lacks `add --reason`: add, then lock immediately.
         git(repo, "worktree", "add", *args)
-        git(repo, "worktree", "lock", "--reason", reason, "--", str(target))
+        lock_now(repo, reason, target)
         return
     if result.returncode != 0:
         raise WorktreeError(f"git worktree add failed: {result.stderr.strip() or result.stdout.strip()}")
+
+
+def lock_now(repo: Path, reason: str, target: Path) -> None:
+    git(repo, "worktree", "lock", "--reason", reason, "--", str(target))
+
+
+def recovery_commands(repo, path, task_id, source, branch, series, snapshot_ref=None) -> list[str]:
+    """Shell commands that recreate a lost task worktree, locked, at the same path."""
+    commands = [f"git -C {q(repo)} worktree unlock {q(path)} && git -C {q(repo)} worktree prune",
+                f"syndicate tasks worktree {q(task_id)} -C {q(source)} --repo {q(repo)} "
+                f"--branch {q(branch)} --series {q(series)}"]
+    if snapshot_ref:
+        commands.append(f"git -C {q(path)} restore --source {q(snapshot_ref)} --worktree -- .")
+    return commands
 
 
 def ensure_worktree(source, repo, task_id: str, branch: str, series: str | None = None,
@@ -252,15 +340,20 @@ def ensure_worktree(source, repo, task_id: str, branch: str, series: str | None 
         raise WorktreeError("A task ID of letters, digits, '.', '_', ':' or '-' is required")
     if not branch or branch.startswith("-") or branch.startswith("refs/") or branch in ("main", "master", "HEAD"):
         raise WorktreeError("A task branch other than main is required (for example work/<task>)")
+    if not BRANCH_CHARS.fullmatch(branch):
+        raise WorktreeError("A task branch may contain only letters, digits, '.', '_', '/' and '-'")
     git(repo, "check-ref-format", "--branch", branch)
-    if series is not None and (not series.strip() or "\n" in series):
-        raise WorktreeError("A series name must be a single non-empty line")
+    if series is not None and not SERIES_CHARS.fullmatch(series):
+        raise WorktreeError("A series name must be one line of at most 100 letters, digits, spaces or "
+                            "'._/:@+-', starting with a letter or digit")
+    if base is not None:
+        verify_base(repo, base)
     common = common_dir(repo)
     target = durable_path(common, branch)
     require_durable(target)
     task_ref = f"refs/heads/{branch}"
     with registry_lock():
-        data = read_registry()
+        data = read_registry()  # raises RegistryError rather than overwrite an invalid file
         previous = data["worktrees"].get(str(target))
         previous = previous if isinstance(previous, dict) else None
         if previous and series and previous.get("series") != series:
@@ -285,15 +378,17 @@ def ensure_worktree(source, repo, task_id: str, branch: str, series: str | None 
                 where = f"a volatile path ({why})" if why else "a path outside the durable worktree root"
                 raise WorktreeError(
                     f"Branch {branch} is already checked out at {held}, {where}. Commit or save its work, "
-                    f"then move it with `git -C {repo} worktree move {held} {target}` (run "
-                    f"`git worktree unlock {held}` first if it is locked) and rerun this command.")
+                    f"then move it with `git -C {q(repo)} worktree move {q(held)} {q(target)}` (run "
+                    f"`git -C {q(repo)} worktree unlock {q(held)}` first if it is locked) and rerun this command.")
             if "prunable" in holder or not target.is_dir():
+                unprune, readd = recovery_commands(repo, target, task_id, source, branch, series)
                 raise WorktreeError(
-                    f"Registered worktree {target} is missing. Recover from the latest snapshot ref under "
-                    f"{SNAPSHOT_REF}/{slug(branch)}/ (see the handoff), then run `git -C {repo} worktree "
-                    f"unlock {target}` and `git -C {repo} worktree prune` before rerunning this command.")
+                    f"Registered worktree {target} is missing. Run `{unprune}`, then rerun this command "
+                    f"(`{readd}`) to add and lock it again, and restore the latest snapshot with "
+                    f"`git -C {q(target)} restore --source <ref> --worktree -- .`, taking <ref> from the "
+                    f"handoff or `git -C {q(repo)} for-each-ref {SNAPSHOT_REF}/{slug(branch)}/`.")
             if "locked" not in holder:
-                git(repo, "worktree", "lock", "--reason", reason, "--", str(target))
+                lock_now(repo, reason, target)
             locked_reason = holder.get("locked") if "locked" in holder else reason
         else:
             if at_target is not None or target.exists():
@@ -308,9 +403,7 @@ def ensure_worktree(source, repo, task_id: str, branch: str, series: str | None 
                                                     f"origin/{branch}"])
                 base = base or f"origin/{branch}"
             else:
-                base = base or default_base(repo)
-                if git(repo, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False).returncode:
-                    raise WorktreeError(f"Base {base} does not name a commit in {repo}")
+                base = verify_base(repo, base or default_base(repo))
                 _add_locked(repo, reason, target, ["--no-track", "-b", branch, "--", str(target), base])
             created = True
             locked_reason = reason
@@ -348,6 +441,32 @@ def _text(path, *args, env=None) -> str | None:
     return out.decode(errors="replace").strip() if out is not None else None
 
 
+def _valid_revision(path, revision) -> bool:
+    """True when a registry-derived revision names a commit and cannot act as an option."""
+    if not isinstance(revision, str) or not revision or revision.startswith("-") or not revision.isprintable():
+        return False
+    return bool(_text(path, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{revision}^{{commit}}"))
+
+
+def _seed_index(path: Path, index: Path, head: str | None, env: dict, copy: bool = True) -> bool:
+    """Seed the temporary index from a copy of the worktree's index (fast: stat data
+    is reused), falling back to HEAD's tree. The worktree's own index is only read."""
+    real = _text(path, "rev-parse", "--path-format=absolute", "--git-path", "index") if copy else None
+    if real:
+        try:
+            shutil.copyfile(real, index)
+            return True
+        except OSError:
+            pass
+    try:
+        index.unlink()
+    except OSError:
+        pass
+    if head:
+        return _capture(path, "read-tree", head, env=env) is not None
+    return True
+
+
 def _snapshot(path: Path, scratch: Path, branch: str, run_id: str, task_id: str) -> tuple[str | None, str | None]:
     """Commit tracked and untracked (non-ignored) state without touching the worktree, index or HEAD."""
     index = scratch / "snapshot.index"
@@ -356,17 +475,23 @@ def _snapshot(path: Path, scratch: Path, branch: str, run_id: str, task_id: str)
                   GIT_COMMITTER_EMAIL="syndicate@localhost")
     try:
         head = _text(path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
-        if head and _capture(path, "read-tree", head, env=env) is None:
+        if head and not OID.fullmatch(head):
+            return None, None
+        if not _seed_index(path, index, head, env):
             return None, None
         if _capture(path, "add", "-A", "--", ".", env=env) is None:
-            return None, None
+            # A copied index the temporary location cannot use (for example a split
+            # index): start again from HEAD.
+            if not _seed_index(path, index, head, env, copy=False) or (
+                    _capture(path, "add", "-A", "--", ".", env=env) is None):
+                return None, None
         tree = _text(path, "write-tree", env=env)
-        if not tree:
+        if not tree or not OID.fullmatch(tree):
             return None, None
         message = f"Syndicate handoff snapshot {run_id} of {branch} (task {task_id})"
         parents = ("-p", head) if head else ()
         commit = _text(path, "commit-tree", "--no-gpg-sign", *parents, "-m", message, tree, env=env)
-        if not commit:
+        if not commit or not OID.fullmatch(commit):
             return None, None
         ref = f"{SNAPSHOT_REF}/{slug(branch)}/{run_id}"
         if _capture(path, "update-ref", "-m", message, ref, commit) is None:
@@ -380,40 +505,62 @@ def _snapshot(path: Path, scratch: Path, branch: str, run_id: str, task_id: str)
                 pass
 
 
-def capture_task_worktrees(target: Path, project: Path, task_id: str | None, run_id: str) -> str:
-    """Write worktrees/<slug>/ evidence and snapshots; return the handoff.md section."""
+def capture_task_worktrees(target: Path, project: Path, task_ids, run_id: str) -> str:
+    """Write worktrees/<slug>/ evidence and snapshots; return the handoff.md section.
+
+    task_ids is the task ID or IDs this run worked on (launcher record first)."""
+    if isinstance(task_ids, str):
+        task_ids = [task_ids]
+    task_ids = [t for t in dict.fromkeys(task_ids or []) if isinstance(t, str) and t]
     lines = ["## Task worktrees", ""]
-    if not task_id:
+    if not task_ids:
         return "\n".join(lines + ["No current task ID was recorded, so no task worktree was captured. "
                                   "Check the checkpoint for the task's worktree and branch.", ""])
+    if len(task_ids) > 1:
+        lines += [f"The launcher recorded task {task_ids[0]} but status.json names "
+                  f"{', '.join(task_ids[1:])}; worktrees of all of them are captured.", ""]
+    entries: dict[str, dict] = {}
     try:
-        entries = entries_for_task(task_id, project)
-    except Exception:  # never abort a handoff on registry trouble
-        entries = []
+        for task_id in task_ids:
+            for entry in entries_for_task(task_id, project):
+                entries.setdefault(str(entry.get("path")), entry)
+    except RegistryError as error:  # never abort a handoff on registry trouble
+        return "\n".join(lines + [f"WARNING: the task worktree registry is unreadable, so no task worktree "
+                                  f"was captured. {error}", ""])
+    except Exception as error:  # noqa: BLE001
+        return "\n".join(lines + [f"WARNING: the task worktree registry could not be read ({error}); "
+                                  "no task worktree was captured.", ""])
     if not entries:
-        return "\n".join(lines + [f"No task worktree is registered for task {task_id}. Diffs above cover "
-                                  "only the launch directory. Create one with `syndicate tasks worktree` "
-                                  "before further edits.", ""])
+        return "\n".join(lines + [f"No task worktree is registered for task {' or '.join(task_ids)}. Diffs "
+                                  "above cover only the launch directory. Create one with `syndicate tasks "
+                                  "worktree` before further edits.", ""])
     lines.append("Continue the task in its worktree below, not in the launch directory. "
                  "Keep it locked; never unlock or remove it before the series is verified complete.")
     lines.append("")
-    for entry in entries:
+    for entry in sorted(entries.values(), key=lambda e: str(e.get("path", ""))):
+        owner = next((t for t in task_ids if t in (entry.get("task_ids") or [])), task_ids[0])
         try:
-            lines.extend(_capture_one(target, entry, task_id, run_id))
+            lines.extend(_capture_one(target, entry, owner, run_id, project))
         except Exception as error:  # noqa: BLE001 - a handoff must still be written
             lines.append(f"- {entry.get('path')}: capture failed ({error})")
     lines.append("")
     return "\n".join(lines)
 
 
-def _capture_one(target: Path, entry: dict, task_id: str, run_id: str) -> list[str]:
+def _evidence_name(branch: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", slug(branch)).lstrip(".")
+    return name or "worktree"
+
+
+def _capture_one(target: Path, entry: dict, task_id: str, run_id: str, project: Path) -> list[str]:
     path = Path(entry.get("path", ""))
-    branch = entry.get("branch") or "unknown"
-    out = target / "worktrees" / slug(branch)
+    branch = entry.get("branch") if isinstance(entry.get("branch"), str) else "unknown"
+    valid_branch = bool(BRANCH_CHARS.fullmatch(branch)) and not branch.startswith("-")
+    out = target / "worktrees" / _evidence_name(branch)
     suffix = 1
     while out.exists():  # the same branch name in another repository
         suffix += 1
-        out = target / "worktrees" / f"{slug(branch)}-{suffix}"
+        out = target / "worktrees" / f"{_evidence_name(branch)}-{suffix}"
     out.mkdir(parents=True, mode=0o700)
     repo = Path(entry.get("repo") or entry.get("git_common_dir") or path)
     records = []
@@ -423,6 +570,7 @@ def _capture_one(target: Path, entry: dict, task_id: str, run_id: str) -> list[s
         pass
     record = next((wt for wt in records if Path(wt.get("worktree", "")).resolve() == path.resolve()), None)
     exists = path.is_dir()
+    series = entry.get("series") or branch
     info = {"path": str(path), "branch": branch, "base": entry.get("base"), "series": entry.get("series"),
             "task_ids": entry.get("task_ids"), "repo": entry.get("repo"), "exists": exists,
             "registered": record is not None,
@@ -442,17 +590,29 @@ def _capture_one(target: Path, entry: dict, task_id: str, run_id: str) -> list[s
         write("untracked.txt", None if untracked is None else
               b"".join(name + b"\n" for name in untracked.split(b"\0") if name))
         upstream = _text(path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
-        if not upstream and _text(path, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"):
+        if not upstream and valid_branch and _text(path, "rev-parse", "--verify", "--quiet", "--end-of-options",
+                                                   f"refs/remotes/origin/{branch}"):
             upstream = f"origin/{branch}"
-        compare = upstream or entry.get("base")
-        log = _capture(path, "log", "--oneline", "--no-decorate", f"{compare}..HEAD") if compare else None
-        write("unpushed.log", None if log is None else
-              f"# Commits on HEAD not in {compare}{' (no upstream; compared with base)' if not upstream else ''}\n"
-              .encode() + log)
-        ref, commit = _snapshot(path, out, branch, run_id, task_id)
-        info.update(snapshot_ref=ref, snapshot_commit=commit)
+        base = entry.get("base")
+        compare = upstream if upstream and _valid_revision(path, upstream) else None
+        note = ""
+        if not compare:
+            note = " (no upstream; compared with base)"
+            compare = base if _valid_revision(path, base) else None
+        if compare:
+            log = _capture(path, "log", "--oneline", "--no-decorate", "--end-of-options", f"{compare}..HEAD")
+            write("unpushed.log", None if log is None else
+                  f"# Commits on HEAD not in {compare}{note}\n".encode() + log)
+        else:
+            write("unpushed.log", f"# No upstream, and the registered base {base!r} is not a valid "
+                                  "revision; unpushed commits were not computed.\n".encode())
+        if valid_branch:
+            ref, commit = _snapshot(path, out, branch, run_id, task_id)
+            info.update(snapshot_ref=ref, snapshot_commit=commit)
     else:
-        info["head"] = _text(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+        if valid_branch:
+            info["head"] = _text(repo, "rev-parse", "--verify", "--quiet", "--end-of-options",
+                                 f"refs/heads/{branch}")
         note = (f"Worktree directory {path} is missing"
                 f"{'; git reports it prunable' if info['prunable'] else ''}. Its uncommitted work is not "
                 "recoverable from here; check earlier snapshot refs.\n").encode()
@@ -462,16 +622,23 @@ def _capture_one(target: Path, entry: dict, task_id: str, run_id: str) -> list[s
     lines = [f"- Path: {path}", f"  Branch: {branch} (series {info['series']}, base {info['base']})",
              f"  HEAD: {info['head'] or 'unavailable'}; locked: {'yes' if info['locked'] else 'no'}",
              f"  Evidence: worktrees/{out.name}/"]
+    if exists and record is not None and not info["locked"]:
+        lines.append(f"  WARNING: this task worktree is NOT locked, so `git worktree prune` could drop it. "
+                     f"Lock it again with `syndicate tasks worktree {q(task_id)} -C "
+                     f"{q(entry.get('source') or project)} --repo {q(repo)} --branch {q(branch)} "
+                     f"--series {q(series)}`.")
+    commands = recovery_commands(repo, path, task_id, entry.get("source") or project, branch, series,
+                                 info["snapshot_ref"] or f"{SNAPSHOT_REF}/{slug(branch)}/<id>")
     if not exists:
         lines.append(f"  MISSING: the directory does not exist{' (prunable)' if info['prunable'] else ''}. "
-                     f"Recover with `git -C {entry.get('repo')} worktree unlock {path}`, `git worktree prune`, "
-                     f"`git worktree add {path} {branch}`, then restore the latest snapshot under "
-                     f"{SNAPSHOT_REF}/{slug(branch)}/ if one exists.")
+                     f"Recover it locked at the same path with `{commands[0]}`, then `{commands[1]}`, then, "
+                     f"if `git -C {q(repo)} for-each-ref {SNAPSHOT_REF}/{slug(branch)}/` lists a snapshot, "
+                     f"`git -C {q(path)} restore --source <latest snapshot ref> --worktree -- .`.")
     elif info["snapshot_ref"]:
-        lines.append(f"  Snapshot: {info['snapshot_ref']} = {info['snapshot_commit']} (tracked and untracked files)")
-        lines.append(f"  If the directory is lost: `git -C {entry.get('repo')} worktree add {path} {branch}`, then "
-                     f"`git -C {path} restore --source {info['snapshot_ref']} --worktree -- .` "
-                     f"(or `git checkout {info['snapshot_ref']} -- .`).")
+        lines.append(f"  Snapshot: {info['snapshot_ref']} = {info['snapshot_commit']} "
+                     "(tracked and untracked, non-ignored files)")
+        lines.append(f"  If the directory is lost: `{commands[0]}`, then `{commands[1]}` (adds and locks it "
+                     f"again), then `{commands[2]}`.")
     else:
         lines.append("  Snapshot: unavailable")
     return lines

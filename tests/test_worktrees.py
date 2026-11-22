@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -72,7 +73,11 @@ class WorktreeCase(unittest.TestCase):
 
 class Creation(WorktreeCase):
     def test_durable_path_layout(self):
-        self.assertEqual(wt.repo_key(Path("/home/nick/workspace/nabt/syndicate/.git")), "syndicate-be1a471b")
+        synthetic = "/srv/example/project/.git"
+        self.assertEqual(wt.repo_key(Path(synthetic)),
+                         f"project-{hashlib.sha1(synthetic.encode()).hexdigest()[:8]}")
+        self.assertEqual(wt.repo_key(Path("/srv/example/bare.git")),
+                         f"bare-{hashlib.sha1(b'/srv/example/bare.git').hexdigest()[:8]}")
         entry = self.ensure()
         common = os.path.realpath(self.repo / ".git")
         expected = self.root / f"repo-{hashlib.sha1(common.encode()).hexdigest()[:8]}" / "work-feature-1"
@@ -175,7 +180,12 @@ class Creation(WorktreeCase):
 
         def old_git(path, *args, **kwargs):
             if args[:3] == ("worktree", "add", "--lock"):
-                return subprocess.CompletedProcess(args, 129, "", "error: unknown option `reason'\nusage: --reason")
+                # What Git before 2.37 prints: the option name without dashes.
+                return subprocess.CompletedProcess(args, 129, "", (
+                    "error: unknown option `reason'\n"
+                    "usage: git worktree add [<options>] <path> [<commit-ish>]\n\n"
+                    "    -f, --force           checkout <branch> even if already checked out in other worktree\n"
+                    "    --lock                keep the new working tree locked\n"))
             return real(path, *args, **kwargs)
 
         with patch.object(wt, "git", side_effect=old_git):
@@ -189,14 +199,105 @@ class Creation(WorktreeCase):
         with self.assertRaisesRegex(wt.WorktreeError, "checked out in the main checkout"):
             self.ensure()
 
-    def test_cli_prints_absolute_path(self):
+    def cli(self, task=TASK, branch="work/cli"):
         args = sy.build_parsers()[1].parse_args(
-            ["tasks", "worktree", TASK, "-C", str(self.source), "--repo", str(self.repo),
-             "--branch", "work/cli", "--series", "s1"])
-        with patch("sys.stdout") as out:
+            ["tasks", "worktree", task, "-C", str(self.source), "--repo", str(self.repo),
+             "--branch", branch, "--series", "s1"])
+        with patch("sys.stdout") as out, patch("sys.stderr") as err:
             self.assertEqual(args.fn(args), 0)
-        printed = "".join(call.args[0] for call in out.write.call_args_list).strip()
+        text = lambda stream: "".join(call.args[0] for call in stream.write.call_args_list)
+        return text(out).strip(), text(err)
+
+    def test_cli_prints_absolute_path(self):
+        (self.source / ".syndicate" / "status.json").write_text(json.dumps(
+            {"current": {"task_id": TASK}, "tasks": [{"id": TASK}]}))
+        printed, warnings = self.cli()
         self.assertTrue(Path(printed).is_absolute() and Path(printed).is_dir())
+        self.assertEqual(warnings, "")
+
+    def test_cli_requires_launch_source_status_and_warns_on_unknown_task(self):
+        args = sy.build_parsers()[1].parse_args(
+            ["tasks", "worktree", TASK, "-C", str(self.repo), "--branch", "work/cli"])
+        with self.assertRaisesRegex(sy.SyndicateError, r"status\.json does not exist.*-C"):
+            args.fn(args)
+        self.assertEqual(len(self.records()), 1)
+        (self.source / ".syndicate" / "status.json").write_text(json.dumps({"current": "not a dict"}))
+        printed, warnings = self.cli(task="task-z")
+        self.assertTrue(Path(printed).is_dir())
+        self.assertIn("task task-z is not listed", warnings)
+
+    def test_base_cannot_inject_git_options(self):
+        pwned = self.tmp / "pwned"
+        for base in (f"--output={pwned}", "-p", "no-such-ref", "main\nx"):
+            with self.subTest(base=base), self.assertRaisesRegex(wt.WorktreeError, "Base"):
+                self.ensure(base=base)
+        # Validated on every path, including an existing branch.
+        self.git(self.repo, "branch", "work/feature-1")
+        with self.assertRaisesRegex(wt.WorktreeError, "Base"):
+            self.ensure(base=f"--output={pwned}")
+        self.assertFalse(list(self.tmp.glob("pwned*")))
+        self.assertEqual(len(self.records()), 1)
+        self.assertEqual(self.ensure(branch="work/based", base="main")["base"], "main")
+
+    def test_branch_and_series_charsets(self):
+        for branch in ("work/a b", "work/caf\u00e9", "work/a;b", "work/$(id)", "work/a`b`", "-x", "work/a\tb"):
+            with self.subTest(branch=branch), self.assertRaises(wt.WorktreeError):
+                self.ensure(branch=branch)
+        for series in ("", " lead", "a\nb", "a\x07b", "-x", "a;b", "a" * 101, "$(id)"):
+            with self.subTest(series=series), self.assertRaisesRegex(wt.WorktreeError, "series name"):
+                self.ensure(series=series)
+        self.assertEqual(len(self.records()), 1)
+        self.assertEqual(self.ensure(branch="work/ok_1.2-x", series="feature 2: part/a")["series"],
+                         "feature 2: part/a")
+
+    def test_invalid_registry_is_never_overwritten(self):
+        registry = self.root / "registry.json"
+        registry.parent.mkdir(parents=True)
+        for content in ("{not json", '{"version": 1}', "[]"):
+            registry.write_text(content)
+            with self.subTest(content=content):
+                with self.assertRaisesRegex(wt.RegistryError, f"{registry}.*left unchanged.*move it aside"):
+                    self.ensure()
+                with self.assertRaises(wt.RegistryError):
+                    wt.drop_entry(self.tmp / "anything")
+                self.assertEqual(registry.read_text(), content)
+        self.assertEqual(len(self.records()), 1)
+        registry.unlink()
+        self.assertTrue(self.ensure()["created"])
+
+    def test_missing_target_gives_working_recovery_commands(self):
+        path = Path(self.ensure()["path"])
+        shutil.rmtree(path)
+        with self.assertRaisesRegex(wt.WorktreeError, "is missing") as caught:
+            self.ensure()
+        message = str(caught.exception)
+        unprune = f"git -C {shlex.quote(str(self.repo))} worktree unlock {shlex.quote(str(path))}"
+        self.assertIn(unprune + f" && git -C {shlex.quote(str(self.repo))} worktree prune", message)
+        self.assertIn("--series work/feature-1", message)
+        subprocess.run(message.split("Run `", 1)[1].split("`", 1)[0], shell=True, check=True,
+                       capture_output=True)
+        again = self.ensure()
+        self.assertTrue(again["created"] and path.is_dir())
+        self.assertEqual(self.record(path)["locked"], again["lock_reason"])
+
+    def test_branch_only_on_origin_tracks_it(self):
+        other = self.tmp / "other"
+        self.git(self.tmp, "clone", str(self.remote), str(other))
+        self.git(other, "config", "user.name", "Other")
+        self.git(other, "config", "user.email", "other@example.com")
+        self.git(other, "switch", "-c", "work/remote-only")
+        (other / "remote.txt").write_text("remote\n")
+        self.git(other, "add", "remote.txt")
+        self.git(other, "commit", "-m", "remote work")
+        self.git(other, "push", "origin", "work/remote-only")
+        tip = self.git(other, "rev-parse", "HEAD")
+        self.git(self.repo, "fetch", "origin")
+        entry = self.ensure(branch="work/remote-only")
+        path = Path(entry["path"])
+        self.assertEqual(self.git(path, "rev-parse", "HEAD"), tip)
+        self.assertEqual(self.git(path, "rev-parse", "--abbrev-ref", "@{upstream}"), "origin/work/remote-only")
+        self.assertEqual(entry["base"], "origin/work/remote-only")
+        self.assertIn("locked", self.record(path))
 
 
 class HandoffCapture(WorktreeCase):
@@ -261,6 +362,34 @@ class HandoffCapture(WorktreeCase):
         for name in ("git-status.txt", "worktree.diff", "staged.diff"):
             self.assertTrue((target / name).is_file())
 
+    def test_snapshot_seeds_from_copied_index_and_falls_back_to_head(self):
+        path = Path(self.ensure()["path"])
+        (path / "new.txt").write_text("untracked\n")
+        real = wt._capture
+        calls = []
+
+        def spy(where, *args, **kwargs):
+            calls.append(args[0])
+            return real(where, *args, **kwargs)
+
+        with patch.object(wt, "_capture", side_effect=spy):
+            info = json.loads((self.handoff("r1") / "worktrees" / "work-feature-1" / "info.json").read_text())
+        self.assertNotIn("read-tree", calls)
+        self.assertEqual(self.git(self.repo, "show", f"{info['snapshot_ref']}:new.txt"), "untracked")
+        calls.clear()
+        copyfile = shutil.copyfile
+
+        def no_index_copy(src, dst, **kwargs):
+            if str(dst).endswith("snapshot.index"):
+                raise OSError("no copy")
+            return copyfile(src, dst, **kwargs)
+
+        with patch.object(wt, "_capture", side_effect=spy), \
+             patch.object(shutil, "copyfile", side_effect=no_index_copy):
+            info = json.loads((self.handoff("r2") / "worktrees" / "work-feature-1" / "info.json").read_text())
+        self.assertIn("read-tree", calls)
+        self.assertEqual(self.git(self.repo, "show", f"{info['snapshot_ref']}:new.txt"), "untracked")
+
     def test_unpushed_log_lists_commits_ahead_of_base(self):
         path = Path(self.ensure()["path"])
         (path / "app.txt").write_text("committed\n")
@@ -279,7 +408,82 @@ class HandoffCapture(WorktreeCase):
         self.assertIn("missing", (target / "worktrees" / "work-feature-1" / "git-status.txt").read_text())
         handoff = (target / "handoff.md").read_text()
         self.assertIn("MISSING", handoff)
-        self.assertIn(f"worktree add {path} work/feature-1", handoff)
+        self.assertIn(f"worktree unlock {path} && git -C {self.repo} worktree prune", handoff)
+        self.assertIn(f"syndicate tasks worktree {TASK} -C {self.source} --repo {self.repo} "
+                      "--branch work/feature-1 --series work/feature-1", handoff)
+        self.assertNotIn("worktree add", handoff)
+
+    def run_recovery(self, handoff):
+        """Follow the handoff's recovery commands; the syndicate one runs in-process."""
+        line = next(l for l in handoff.splitlines() if "If the directory is lost" in l)
+        commands = line.split("`")[1::2]
+        self.assertEqual(len(commands), 3)
+        subprocess.run(commands[0], shell=True, check=True, capture_output=True)
+        argv = shlex.split(commands[1])
+        self.assertEqual(argv[0], "syndicate")
+        args = sy.build_parsers()[1].parse_args(argv[1:])
+        with patch("sys.stdout"):
+            self.assertEqual(args.fn(args), 0)
+        subprocess.run(commands[2], shell=True, check=True, capture_output=True)
+
+    def test_recovery_restores_tracked_and_untracked_files_locked(self):
+        path = Path(self.ensure()["path"])
+        (path / "app.txt").write_text("modified\n")
+        (path / "dir").mkdir()
+        (path / "dir" / "new.txt").write_text("untracked\n")
+        handoff = (self.handoff() / "handoff.md").read_text()
+        shutil.rmtree(path)
+        self.run_recovery(handoff)
+        self.assertEqual((path / "app.txt").read_text(), "modified\n")
+        self.assertEqual((path / "dir" / "new.txt").read_text(), "untracked\n")
+        self.assertIn("syndicate:", self.record(path)["locked"])
+        self.assertEqual(self.git(path, "status", "--porcelain"), "M app.txt\n?? dir/")
+
+    def test_unlocked_worktree_is_flagged_not_relocked(self):
+        path = Path(self.ensure()["path"])
+        self.git(self.repo, "worktree", "unlock", str(path))
+        handoff = (self.handoff() / "handoff.md").read_text()
+        self.assertIn("WARNING: this task worktree is NOT locked", handoff)
+        self.assertNotIn("locked", self.record(path))
+
+    def test_tampered_registry_base_cannot_inject_options(self):
+        path = Path(self.ensure()["path"])
+        registry = self.root / "registry.json"
+        data = json.loads(registry.read_text())
+        pwned = self.tmp / "pwned"
+        data["worktrees"][str(path)]["base"] = f"--output={pwned}"
+        registry.write_text(json.dumps(data))
+        target = self.handoff()
+        self.assertFalse(list(self.tmp.glob("pwned*")))
+        self.assertFalse(list(path.glob("*pwned*")))
+        log = (target / "worktrees" / "work-feature-1" / "unpushed.log").read_text()
+        self.assertIn("not a valid revision", log)
+
+    def test_invalid_registry_is_reported_and_left_alone(self):
+        registry = self.root / "registry.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text("{broken")
+        handoff = (self.handoff() / "handoff.md").read_text()
+        self.assertIn("registry is unreadable", handoff)
+        self.assertIn(str(registry), handoff)
+        self.assertEqual(registry.read_text(), "{broken")
+
+    def test_launcher_task_preferred_and_both_captured_when_they_differ(self):
+        self.ensure()
+        self.ensure(task="task-run", branch="work/feature-2")
+        (self.source / ".syndicate" / "run.json").write_text(json.dumps({"task_id": "task-run"}))
+        target = self.handoff()
+        handoff = (target / "handoff.md").read_text()
+        self.assertIn("launcher recorded task task-run but status.json names task-a", handoff)
+        self.assertTrue((target / "worktrees" / "work-feature-1" / "info.json").is_file())
+        self.assertTrue((target / "worktrees" / "work-feature-2" / "info.json").is_file())
+
+    def test_non_dict_current_uses_run_record(self):
+        self.ensure()
+        (self.source / ".syndicate" / "status.json").write_text(json.dumps({"current": ["odd"]}))
+        (self.source / ".syndicate" / "run.json").write_text(json.dumps({"task_id": TASK}))
+        target = self.handoff()
+        self.assertTrue((target / "worktrees" / "work-feature-1" / "info.json").is_file())
 
     def test_handoff_without_registered_worktree_says_so(self):
         self.ensure(task="another-task")
@@ -326,12 +530,15 @@ class LockedCleanup(WorktreeCase):
                        headRefOid=self.head, mergeCommit={"oid": merge}, mergedAt="2026-11-22T10:00:00Z")
         self.tasks = []
 
-    def cleanup(self, task=TASK):
+    def cleanup(self, task=TASK, fail=()):
+        """Run cleanup-pr; git commands starting with an entry of fail exit 1."""
         run = syndicate_git._run
 
         def fake(path, command, expected=(0,)):
             if command[0] == "gh":
                 return subprocess.CompletedProcess(command, 0, json.dumps(self.pr), "")
+            if any(command[2:2 + len(prefix)] == prefix for prefix in fail):
+                raise syndicate_git.CleanupError(f"git {command[2]} failed: simulated")
             return run(path, command, expected)
 
         argv = ["tasks", "cleanup-pr", "7", "-C", str(self.repo), "--branch", self.branch,
@@ -340,8 +547,12 @@ class LockedCleanup(WorktreeCase):
         rows = [{"tasks": self.tasks, "completed_tasks": [], "ended_tasks": []}]
         with patch.object(syndicate_git, "_run", side_effect=fake), \
              patch.object(syndicate_git, "_github_repository", return_value="github.com/example/project"), \
-             patch.object(sy, "gather_statuses", return_value=rows), patch("builtins.print"):
+             patch.object(sy, "gather_statuses", return_value=rows), patch("builtins.print") as out:
+            self.printed = out
             return args.fn(args)
+
+    def output(self):
+        return "\n".join(" ".join(map(str, call.args)) for call in self.printed.call_args_list)
 
     def assert_intact(self):
         self.assertTrue(self.path.is_dir())
@@ -379,6 +590,124 @@ class LockedCleanup(WorktreeCase):
         self.tasks[0]["state"] = "done"
         self.assertEqual(self.cleanup(), 0)
         self.assertFalse(self.path.exists())
+
+    def test_series_spans_every_worktree_of_the_series(self):
+        self.ensure(task="task-b", branch="work/feature-2", series="work/feature-1")
+        self.tasks = [{"id": "task-b", "source_path": str(self.source), "state": "running"}]
+        with self.assertRaisesRegex(sy.SyndicateError, "still active: task-b") as caught:
+            self.cleanup()
+        self.assertIn(f"syndicate tasks edit TASK_ID --source {self.source} --state ended", str(caught.exception))
+        self.assert_intact()
+        self.tasks[0]["state"] = "ended"
+        self.assertEqual(self.cleanup(), 0)
+        self.assertFalse(self.path.exists())
+
+    def test_not_found_series_task_blocks(self):
+        self.ensure(task="task-gone")
+        with self.assertRaisesRegex(sy.SyndicateError, r"task-gone \(not found\).*task_ids"):
+            self.cleanup()
+        self.assert_intact()
+
+    def test_syndicate_lock_without_registry_entry_fails_closed(self):
+        registry = self.root / "registry.json"
+        registry.write_text(json.dumps({"worktrees": {}}))
+        with self.assertRaisesRegex(sy.SyndicateError, "Syndicate lock but has no entry"):
+            self.cleanup()
+        self.assertTrue(self.path.is_dir())
+        self.assertIn("locked", self.record(self.path))
+        self.assertEqual(self.git(self.remote, "rev-parse", f"refs/heads/{self.branch}"), self.head)
+
+    def test_invalid_registry_fails_closed_and_is_kept(self):
+        registry = self.root / "registry.json"
+        registry.write_text("{broken")
+        with self.assertRaisesRegex(sy.SyndicateError, "cannot be verified.*left unchanged"):
+            self.cleanup()
+        self.assertEqual(registry.read_text(), "{broken")
+        self.assertTrue(self.path.is_dir())
+        self.assertIn("locked", self.record(self.path))
+
+    def test_failed_removal_restores_lock(self):
+        reason = self.record(self.path)["locked"]
+        with self.assertRaisesRegex(sy.SyndicateError, "worktree failed: simulated.*lock was restored"):
+            self.cleanup(fail=(("worktree", "remove"),))
+        self.assertEqual(self.record(self.path)["locked"], reason)
+        self.assertTrue(self.path.is_dir())
+        self.assertIsNotNone(wt.entry_for_path(self.path))
+
+    def test_failed_removal_and_relock_reports_unlocked(self):
+        with self.assertRaisesRegex(sy.SyndicateError, "UNLOCKED.*worktree lock --reason") as caught:
+            self.cleanup(fail=(("worktree", "remove"), ("worktree", "lock")))
+        self.assertIn(shlex.quote(str(self.path)), str(caught.exception))
+        self.assertNotIn("locked", self.record(self.path))
+        self.assertTrue(self.path.is_dir())
+
+    def test_series_rechecked_under_registry_lock_before_removal(self):
+        calls = []
+        real = sy.series_guard
+
+        held = []
+        original_lock = wt.registry_lock
+
+        def tracking_lock():
+            held.append(True)
+            return original_lock()
+
+        def late_guard(repo, task_id):
+            check = real(repo, task_id)
+
+            def wrapped(path):
+                calls.append(path)
+                if len(calls) == 2:
+                    # The re-check runs while the registry lock is held.
+                    self.assertTrue(held)
+                    data = json.loads((self.root / "registry.json").read_text())
+                    data["worktrees"][str(self.path)]["task_ids"].append("task-late")
+                    (self.root / "registry.json").write_text(json.dumps(data))
+                check(path)
+            return wrapped
+
+        with patch.object(sy, "series_guard", side_effect=late_guard), \
+             patch.object(sy.syndicate_worktrees, "registry_lock", side_effect=tracking_lock):
+            with self.assertRaisesRegex(sy.SyndicateError, "task-late"):
+                self.cleanup()
+        self.assertEqual(len(calls), 2)
+        # The remote branch is deleted before removal; the worktree, its lock, the
+        # registry entry and the local branch survive for the late task.
+        self.assertTrue(self.path.is_dir())
+        self.assertIn("locked", self.record(self.path))
+        self.assertIsNotNone(wt.entry_for_path(self.path))
+        self.assertEqual(self.git(self.repo, "rev-parse", f"refs/heads/{self.branch}"), self.head)
+
+    def test_completed_cleanup_deletes_branch_snapshots_only(self):
+        scratch = self.tmp / "scratch"
+        scratch.mkdir()
+        ref, commit = wt._snapshot(self.path, scratch, self.branch, "20261122T1-aa", TASK)
+        self.assertTrue(ref)
+        # Another branch whose slug collides keeps its snapshot.
+        other_commit = self.git(self.repo, "commit-tree", "-m",
+                                "Syndicate handoff snapshot r2 of work-feature/1 (task x)", f"{self.start}^{{tree}}")
+        other = "refs/syndicate/snapshots/work-feature-1/r2"
+        self.git(self.repo, "update-ref", other, other_commit)
+        self.assertEqual(self.cleanup(), 0)
+        self.assertNotEqual(self.git(self.repo, "show-ref", "--verify", "--quiet", ref, check=False).returncode, 0)
+        self.assertEqual(self.git(self.repo, "rev-parse", other), other_commit)
+        self.assertIn(f"Deleted handoff snapshot {ref} ({commit}).", self.output())
+
+    def test_snapshots_kept_while_series_active(self):
+        scratch = self.tmp / "scratch"
+        scratch.mkdir()
+        ref, _ = wt._snapshot(self.path, scratch, self.branch, "20261122T1-aa", TASK)
+        self.ensure(task="task-b")
+        with self.assertRaises(sy.SyndicateError):
+            self.cleanup()
+        self.assertTrue(self.git(self.repo, "rev-parse", ref))
+
+    def test_registry_drop_failure_after_cleanup_is_reported(self):
+        with patch.object(wt, "drop_entry", side_effect=OSError("disk full")):
+            self.assertEqual(self.cleanup(), 0)
+        self.assertFalse(self.path.exists())
+        self.assertIn("registry entry", self.output())
+        self.assertIn("disk full", self.output())
 
     def test_current_task_defaults_from_source_status(self):
         self.ensure(task="task-b")

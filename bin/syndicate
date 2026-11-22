@@ -2168,6 +2168,22 @@ def cmd_tasks_worktree(args):
     """Create or re-adopt the task's durable, locked linked worktree and print its path."""
     source = Path(args.dir).expanduser().resolve()
     repo = Path(args.repo).expanduser().resolve() if args.repo else source
+    status_path = source / LOCAL / "status.json"
+    if not status_path.is_file():
+        raise SyndicateError(
+            f"Task worktree not ready: {status_path} does not exist. Pass the task's launch source "
+            "(the directory whose .syndicate/status.json tracks the task) with -C, and the repository "
+            "checkout with --repo.")
+    # Warn rather than refuse: the orchestrator creates the worktree before its
+    # first edit, which can precede recording the task in status.json.
+    status = runtime.read_json(status_path)
+    current = status.get("current") if isinstance(status.get("current"), dict) else {}
+    tasks = status.get("tasks") if isinstance(status.get("tasks"), list) else []
+    known = {t.get("id") for t in tasks if isinstance(t, dict)}
+    known |= {current.get("task_id"), runtime.read_json(source / LOCAL / "run.json").get("task_id")}
+    if args.task_id not in known:
+        print(f"syndicate: warning: task {args.task_id} is not listed in {status_path}; check -C and the "
+              "task ID. The series check at cleanup looks the task up in that status.", file=sys.stderr)
     try:
         entry = syndicate_worktrees.ensure_worktree(source, repo, args.task_id, args.branch,
                                                     series=args.series, base=args.base)
@@ -2177,17 +2193,37 @@ def cmd_tasks_worktree(args):
     return 0
 
 
-def series_guard(task_id):
-    """Refuse cleanup while another task of the worktree's series is unfinished."""
+def series_guard(repo, task_id):
+    """Refuse cleanup while another task of the worktree's series is unfinished.
+
+    The series spans every registered worktree with the same launch source and
+    series name. A Syndicate-locked worktree without a readable registry entry
+    fails closed: its series cannot be verified."""
     def check(path):
-        entry = syndicate_worktrees.entry_for_path(path)
+        try:
+            entry = syndicate_worktrees.entry_for_path(path)
+            records = syndicate_worktrees.list_worktrees(repo) if path.exists() else []
+        except syndicate_worktrees.WorktreeError as error:
+            raise syndicate_git.CleanupError(
+                f"Task series of {path} cannot be verified: {error}") from error
         if not entry:
+            record = next((r for r in records if Path(r.get("worktree", "")).resolve() == path), None)
+            if (record or {}).get("locked", "").startswith(syndicate_worktrees.LOCK_PREFIX):
+                raise syndicate_git.CleanupError(
+                    f"Worktree {path} carries a Syndicate lock but has no entry in "
+                    f"{syndicate_worktrees.REGISTRY}, so its task series cannot be verified. Register it "
+                    "again with `syndicate tasks worktree TASK_ID -C SOURCE --repo REPO --branch BRANCH "
+                    "--series SERIES` (same branch and series), then rerun cleanup")
             return
         source = entry.get("source")
         current = task_id
         if not current and source:
-            current = ((read_status(source) or {}).get("current") or {}).get("task_id")
-        others = [t for t in entry.get("task_ids") or [] if t != current]
+            status_current = (read_status(source) or {}).get("current")
+            current = status_current.get("task_id") if isinstance(status_current, dict) else None
+        try:
+            others = [t for t in syndicate_worktrees.series_task_ids(entry) if t != current]
+        except syndicate_worktrees.WorktreeError as error:
+            raise syndicate_git.CleanupError(f"Task series of {path} cannot be verified: {error}") from error
         if not others:
             return
         states = {}
@@ -2200,7 +2236,11 @@ def series_guard(task_id):
         if active:
             raise syndicate_git.CleanupError(
                 f"Task series {entry.get('series')} is still active: {', '.join(active)}. "
-                f"Worktree {path}, its lock and the task branches were left intact")
+                f"Worktree {path}, its lock and the task branches were left intact. Finish those tasks, or "
+                f"close an abandoned one with `syndicate tasks edit TASK_ID --source {shlex.quote(str(source))} "
+                "--state ended`, then rerun cleanup. A task reported as not found has no status record "
+                "under that source; confirm with `syndicate tasks list` that it is gone, then remove its ID "
+                f"from task_ids in {syndicate_worktrees.REGISTRY}")
     return check
 
 
@@ -2210,12 +2250,22 @@ def cmd_tasks_cleanup_pr(args):
     try:
         merged = syndicate_git.cleanup_pr(repo, args.number, args.branch, worktree,
                                           lambda message: print(message, flush=True),
-                                          series_guard=series_guard(args.task),
-                                          on_removed=syndicate_worktrees.drop_entry)
+                                          series_guard=series_guard(repo, args.task),
+                                          removal_lock=syndicate_worktrees.registry_lock)
     except syndicate_git.CleanupError as error:
         raise SyndicateError(f"Post-merge cleanup stopped: {error}") from error
-    if merged and not worktree.exists():
-        syndicate_worktrees.drop_entry(worktree)  # already removed earlier; forget it too
+    if not merged or worktree.exists():
+        return 0
+    # Cleanup is complete and the series verified; forget the worktree and its snapshots.
+    try:
+        syndicate_worktrees.drop_entry(worktree)
+    except (syndicate_worktrees.WorktreeError, OSError) as error:
+        print(f"Warning: the registry entry for {worktree} was not removed: {error}", file=sys.stderr)
+    try:
+        for ref, oid in syndicate_worktrees.delete_snapshots(repo, args.branch):
+            print(f"Deleted handoff snapshot {ref} ({oid}).", flush=True)
+    except syndicate_worktrees.WorktreeError as error:
+        print(f"Warning: handoff snapshot refs of {args.branch} were not deleted: {error}", file=sys.stderr)
     return 0
 
 

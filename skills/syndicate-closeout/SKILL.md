@@ -77,9 +77,15 @@ owning task's `delegated_closeout_required` flag when present.
    and reporting why cleanup stopped. A dirty task worktree, including its
    ignored files, stops cleanup. The helper accepts the worktree's Syndicate
    lock, unlocks it only immediately before removal, and stops on any other
-   lock. While another task registered to the same worktree series is not
-   done or ended, it stops before changing anything and leaves the worktree,
-   lock and branches intact; report that the series is still active. A remote branch that is already absent is
+   lock. While another task registered to the same series (in any of its
+   worktrees) is not done or ended, it stops before changing anything and
+   leaves the worktree, lock and branches intact; report that the series is
+   still active. Close a sibling task only if it was really abandoned, with
+   `syndicate tasks edit TASK_ID --source SOURCE --state ended`; ask the user
+   before editing the registry for a task reported as not found. An unreadable
+   registry, or a Syndicate-locked worktree without a registry entry, also
+   stops cleanup. After removal the helper deletes the branch's handoff
+   snapshot refs and reports each one. A remote branch that is already absent is
    safe to skip. Remote deletion is conditional on the inspected tip still
    being current. The helper uses a deletion-only refspec with an explicit
    lease and never force-updates a branch. The existing local main checkout

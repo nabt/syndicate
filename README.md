@@ -249,9 +249,13 @@ syndicate tasks cleanup-pr 42 -C /path/to/repo --branch work/topic-1234 --worktr
 
 Task work happens in a linked worktree that `syndicate tasks worktree` creates
 under `~/.syndicate/worktrees/` and locks until post-merge cleanup proves the
-task series complete. Temporary directories such as `/tmp` are refused. Handoffs
-save each task worktree's status, diffs, untracked files, and a recovery ref.
-See [Task worktrees](docs/handoff.md#task-worktrees).
+task series complete. `-C` names the launch source whose
+`.syndicate/status.json` tracks the task. Temporary directories such as `/tmp`
+are refused. Handoffs save each task worktree's status, diffs, untracked files,
+and a recovery ref under `refs/syndicate/snapshots/`; those refs include
+untracked, non-ignored files, so never push with `--mirror` or a `refs/*`
+refspec. Cleanup deletes them after the series is complete. See
+[Task worktrees](docs/handoff.md#task-worktrees).
 
 Task edits change dashboard metadata; they do not move files, stop processes,
 or change a running agent's working directory. Status and checkpoints remain

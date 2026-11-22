@@ -143,6 +143,7 @@ worktree created by Syndicate. Before any edits, create or re-adopt it with:
 syndicate tasks worktree TASK_ID -C SOURCE --repo REPO --branch work/<topic>-<task> [--series NAME]
 ```
 
+`SOURCE` is the launch source whose `.syndicate/status.json` tracks the task.
 It prints the worktree's absolute path under `~/.syndicate/worktrees`. Give
 specialists that path and branch, and do all task work there. Never create
 task worktrees by hand or under `/tmp` or another temporary directory, and
@@ -150,8 +151,11 @@ never edit the main checkout for task work. A later task continuing the same
 work reruns the command with its own task ID and the same branch and series.
 The worktree stays locked until post-merge cleanup proves the whole series
 complete. Never unlock, move, or remove it on handoff, session exit, or a quota
-stop. After each specialist returns, commit work in progress to the task
-branch. Push `work/*` task branches once a PR is intended.
+stop. If a handoff reports the worktree missing or unlocked, run the recovery
+commands it prints; never re-add it with plain `git worktree add`. After each
+specialist returns, commit work in progress to the task branch. Push `work/*`
+task branches once a PR is intended, never with `--mirror` or a `refs/*`
+refspec: handoff snapshot refs hold untracked files.
 
 ## Session closeout and external outcomes
 Follow [syndicate-closeout](../skills/syndicate-closeout/SKILL.md), included in

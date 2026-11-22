@@ -28,9 +28,14 @@ When asked to continue a handoff, read the handoff directory's `handoff.md`,
 Continue in the task worktree listed under `## Task worktrees`, re-adopting it
 with `syndicate tasks worktree` and the same branch and series. Its
 `worktrees/<branch>/` evidence includes status, diffs, untracked files and
-unpushed commits. If the directory is gone, recreate it at the same path from
-the branch and restore the recorded `refs/syndicate/snapshots/...` ref as
-`handoff.md` describes.
+unpushed commits. If the directory is gone, run the three recovery commands
+`handoff.md` prints, in order: `git -C REPO worktree unlock PATH && git -C REPO
+worktree prune`; `syndicate tasks worktree TASK_ID -C SOURCE --repo REPO
+--branch BRANCH --series SERIES` (adds it at the same path and locks it again);
+then `git -C PATH restore --source <snapshot ref> --worktree -- .` to restore
+tracked and untracked files. Never use plain `git worktree add`, which leaves
+the worktree unlocked. If `handoff.md` warns that a worktree is not locked,
+rerun the `syndicate tasks worktree` command it gives before any edits.
 The snapshot can contain incomplete writes or interrupted tools; verify them.
 A handoff is not completion or review approval. Carry outstanding reviews into
 the new run. Use checkpointed participant IDs as historical evidence for work
