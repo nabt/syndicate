@@ -38,6 +38,7 @@ import syndicate_portfolio as portfolio
 import syndicate_live as live
 import syndicate_git
 import syndicate_worktrees
+import syndicate_completion as completion
 HOME_DIR = SCRIPT.parent.parent
 GLOBAL_ROLES = HOME_DIR / "roles"
 GATE_SCRIPT = HOME_DIR / "hooks" / "require-review.sh"
@@ -3675,6 +3676,204 @@ def cmd_tasks(args: argparse.Namespace) -> int:
     return 0
 
 
+def _completion_projects():
+    items = [("generic", "tasks with no repository")]
+    seen = {"generic"}
+    for entry in load_registry():
+        if not isinstance(entry, dict) or entry.get("group_path"):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name or name in seen:
+            continue
+        seen.add(name)
+        path = entry.get("path") if isinstance(entry.get("path"), str) else ""
+        items.append((name, path))
+    return items
+
+
+def _completion_roles():
+    items = []
+    seen = set()
+
+    def add(directory: Path):
+        if not directory.is_dir():
+            return
+        for path in sorted(directory.glob("*.md")):
+            if path.name.endswith(".append.md") or not ROLE_NAME.match(path.stem) or path.stem in seen:
+                continue
+            seen.add(path.stem)
+            desc = ""
+            try:
+                desc = split_frontmatter(path.read_text()[:4000])[0].get("description") or ""
+            except OSError:
+                pass
+            items.append((path.stem, desc))
+
+    add(GLOBAL_ROLES)
+    add(Path.cwd() / LOCAL / "roles")
+    return items
+
+
+def _completion_workers():
+    """Window names, plus workers parked in the side-by-side view."""
+    try:
+        listed = subprocess.run(
+            ["tmux", "list-windows", "-t", TMUX_SESSION, "-F", "#{window_id}\t#{window_name}"],
+            capture_output=True, text=True, timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if listed.returncode != 0:
+        return []
+    names = []
+    views = []
+    for line in listed.stdout.splitlines():
+        window_id, _, name = line.partition("\t")
+        name = name.strip()
+        if not name:
+            continue
+        if name == VIEW_WINDOW and window_id.strip():
+            views.append(window_id.strip())
+        elif name not in names:
+            names.append(name)
+    for window_id in views:
+        try:
+            panes = subprocess.run(
+                ["tmux", "list-panes", "-t", window_id, "-F", "#{@syndicate-worker}"],
+                capture_output=True, text=True, timeout=1,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if panes.returncode != 0:
+            continue
+        for name in panes.stdout.splitlines():
+            name = name.strip()
+            if name and name not in names:
+                names.append(name)
+    return [(name, "") for name in names]
+
+
+def _completion_tasks():
+    items = []
+    seen = set()
+    paths = []
+    for entry in load_registry():
+        if not isinstance(entry, dict):
+            continue
+        for key in ("group_path", "path"):
+            raw = entry.get(key)
+            if isinstance(raw, str) and raw:
+                paths.append(Path(raw))
+    paths.append(Path.cwd())
+    for path in paths:
+        try:
+            data = json.loads((path / LOCAL / "status.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        tasks = data.get("tasks") if isinstance(data.get("tasks"), list) else []
+        current = data.get("current") if isinstance(data.get("current"), dict) else {}
+        current_id = current.get("task_id")
+        if isinstance(current_id, str) and not any(isinstance(task, dict) and task.get("id") == current_id for task in tasks):
+            tasks = [*tasks, {"id": current_id, "summary": current.get("summary") or "", "state": data.get("state") or ""}]
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            ident = task.get("id")
+            if not isinstance(ident, str) or not ident or ident in seen:
+                continue
+            seen.add(ident)
+            detail = " ".join(part for part in (str(task.get("state") or ""), str(task.get("summary") or "")) if part)
+            items.append((ident, detail))
+    return items
+
+
+def _completion_refs(remotes: bool):
+    args = ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"]
+    if remotes:
+        args.append("refs/remotes")
+    try:
+        listed = subprocess.run(args, capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if listed.returncode != 0:
+        return []
+    names = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+    if remotes and "HEAD" not in names:
+        names.append("HEAD")
+    return [(name, "") for name in names]
+
+
+def _completion_labeled(records, field):
+    items = []
+    seen = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        ident = record.get("id")
+        if not isinstance(ident, str) or not ident or ident in seen:
+            continue
+        seen.add(ident)
+        detail = record.get(field) or ""
+        state = record.get("state")
+        if state and detail:
+            detail = f"{state} {detail}"
+        elif state:
+            detail = str(state)
+        items.append((ident, str(detail)))
+    return items
+
+
+def _completion_sessions():
+    items = []
+    for record in coordination_store().read().get("sessions") or []:
+        if not isinstance(record, dict) or not isinstance(record.get("id"), str):
+            continue
+        detail = " ".join(part for part in (record.get("state"), record.get("task_id"), record.get("provider")) if part)
+        items.append((record["id"], detail))
+    return items
+
+
+def completion_values(kind):
+    """Values completion can offer. Reads only; a failure offers nothing."""
+    try:
+        if kind == "project":
+            return _completion_projects()
+        if kind == "role":
+            return _completion_roles()
+        if kind == "worker":
+            return _completion_workers()
+        if kind == "task":
+            return _completion_tasks()
+        if kind == "branch":
+            return _completion_refs(False)
+        if kind == "ref":
+            return _completion_refs(True)
+        if kind == "runtime":
+            return [(name, "") for name in CLIS]
+        if kind == "decision":
+            return _completion_labeled(portfolio.DecisionStore(portfolio_dir()).read(), "question")
+        if kind == "request":
+            return _completion_labeled(coordination_store().read().get("requests") or [], "message")
+        if kind == "message":
+            return _completion_labeled(live.MessageStore(portfolio_dir()).read(), "message")
+        if kind == "session":
+            return _completion_sessions()
+    except Exception:
+        return []
+    return []
+
+
+def completion_source():
+    return completion.Source(build_parsers()[1], completion_values)
+
+
+def cmd_completion(args: argparse.Namespace) -> int:
+    sys.stdout.write(completion.script(args.shell))
+    return 0
+
+
 def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     run = argparse.ArgumentParser(
         prog="syndicate team task",
@@ -3931,6 +4130,21 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p.set_defaults(fn=cmd_close_worker)
     p = cmds.add_parser('detach', help='detach from the syndicate session and restore side-by-side workers')
     p.set_defaults(fn=cmd_detach_workers)
+    p = cmds.add_parser(
+        "completion",
+        help="print a bash or zsh completion script",
+        description="Print a completion script for bash or zsh. "
+                    "The script completes subcommands, flags, choices, and values syndicate knows: "
+                    "projects, directories, roles, workers, tasks, branches, and record ids.",
+        epilog="Examples:\n"
+               "  source <(syndicate completion bash)\n"
+               "  source <(syndicate completion zsh)\n"
+               "  syndicate completion bash > ~/.local/share/bash-completion/completions/syndicate\n"
+               "  syndicate completion zsh > ~/.zsh/completions/_syndicate",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("shell", choices=("bash", "zsh"), help="shell that will source the script")
+    p.set_defaults(fn=cmd_completion)
     return run, sub
 
 
@@ -3983,9 +4197,11 @@ def main(argv: list[str]) -> int:
             return 0
     if argv == ["_limits-monitor"]:
         return runtime.monitor_forever()
+    if argv and argv[0] == "__complete":
+        return completion.complete_main(argv[1:], completion_source())
     run, sub = build_parsers()
     try:
-        if argv[0] in ("team", "config", "setup-codex-gate", "dashboard", "web", "limits", "tasks", "decisions", "briefing", "briefs", "sessions", "requests", "chief-of-staff", "live", "messages", "list", "show", "attach", "capture", "close", "detach", "message"):
+        if argv[0] in ("team", "config", "setup-codex-gate", "dashboard", "web", "limits", "tasks", "decisions", "briefing", "briefs", "sessions", "requests", "chief-of-staff", "live", "messages", "list", "show", "attach", "capture", "close", "detach", "message", "completion"):
             args = sub.parse_args(argv)
         elif argv[0] in ('-h', '--help'):
             sub.parse_args(argv)
