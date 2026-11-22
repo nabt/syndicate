@@ -355,6 +355,86 @@ def load_config(project: Path, roles: dict[str, Role]) -> tuple[dict[str, str], 
     return config, sources, layers
 
 
+def configured_cli(team: Team, role_name: str) -> str | None:
+    """The CLI a person named for this launch, or None for the built-in fallback.
+
+    A role key or `orchestrator` counts when it comes from the user or project
+    file. `default` counts from those files or from `$SYNDICATE_RUNTIME`. The
+    built-in `default = claude` is not a choice.
+    """
+    if role_name == "orchestrator" and team.config_sources.get("orchestrator") in ("user", "project"):
+        return team.config["orchestrator"]
+    if role_name != "orchestrator" and team.config_sources.get(role_name) in ("user", "project"):
+        return team.config[role_name]
+    if team.config_sources.get("default") in ("user", "project", "environment"):
+        return team.config["default"]
+    return None
+
+
+def configured_default_cli() -> str | None:
+    """The user-file or `$SYNDICATE_RUNTIME` default, ignoring the built-in."""
+    chosen = os.environ.get("SYNDICATE_RUNTIME")
+    chosen = chosen if chosen in CLIS else None
+    path = user_config_path()
+    if path.is_file():
+        for key, value, _where in config_entries(path):
+            if key == "default" and value in CLIS:
+                chosen = value
+    return chosen
+
+
+def select_launch_cli(preferred: str | None, threshold: float, candidates: list[str], cwd=None) -> str | None:
+    """Refresh the readings this choice needs and return the CLI to start.
+
+    A configured CLI that is already current and above `threshold` is used
+    without querying the other engine. A recorded reading that is not current
+    is queried when the choice depends on it. A CLI with no recorded reading
+    is not queried here. None means no candidate is known to be above the
+    threshold.
+    """
+    candidates = [cli for cli in candidates if cli in CLIS and shutil.which(cli)]
+    if preferred not in candidates:
+        preferred = None
+    readings = {cli: runtime.recorded_remaining(cli, threshold) for cli in candidates}
+
+    def observation(cli):
+        return runtime.read_json(runtime.STATE / f"{cli}.json")
+
+    def current(cli):
+        return readings[cli] is not None and runtime.availability(observation(cli))[0] == "current"
+
+    def pull(cli):
+        # Nothing recorded is not a stale reading. Querying it would spend a
+        # turn before any session has published usage.
+        if readings[cli] is None or current(cli):
+            return
+        readings[cli], _refreshed = runtime.ensure_reading(cli, cwd=cwd, threshold=threshold)
+
+    def ranks():
+        return {cli: runtime.readings_by_kind(observation(cli)) for cli in candidates}
+
+    if preferred and current(preferred) and readings[preferred] > threshold:
+        return preferred
+    if preferred:
+        pull(preferred)
+        if readings.get(preferred) is not None and readings[preferred] > threshold:
+            return preferred
+    for cli in candidates:
+        if cli != preferred:
+            pull(cli)
+    return runtime.choose_engine(preferred, readings, threshold, candidates, ranks())
+
+
+def announce_cli_switch(preferred: str | None, chosen: str, threshold: float) -> None:
+    remaining = runtime.recorded_remaining(chosen)
+    detail = f"{remaining:g}% remaining" if remaining is not None else "the latest reading"
+    if preferred:
+        print(f"syndicate: {preferred} is not above the {threshold:g}% reserve; "
+              f"starting on {chosen} ({detail}).", file=sys.stderr)
+    else:
+        print(f"syndicate: no CLI is configured; starting on {chosen} ({detail}).", file=sys.stderr)
+
+
 def resolve_team(project: Path, host_override: str | None = None) -> Team:
     roles, warnings = load_roles(project)
     if "orchestrator" not in roles:
@@ -463,18 +543,20 @@ def generated(project: Path) -> Path:
     return path
 
 
-def relay_command(role: Role, project: Path) -> str:
-    return f"{shlex.quote(str(SCRIPT))} team run-role {role.name} --project {shlex.quote(str(project))} --runtime {role.cli} -"
+def relay_command(role: Role, project: Path, *, pin: bool = False) -> str:
+    pinned = f" --runtime {role.cli}" if pin else ""
+    return (f"{shlex.quote(str(SCRIPT))} team run-role {role.name} --project {shlex.quote(str(project))}"
+            f"{pinned} -")
 
 
-def relay_prompt(role: Role, project: Path) -> str:
+def relay_prompt(role: Role, project: Path, *, pin: bool = False) -> str:
     return f"""\
-You are a relay for the `{role.name}` role, which starts on the {role.cli} CLI in this project. You do not do the work yourself.
+You are a relay for the `{role.name}` role, which is configured for the {role.cli} CLI in this project. You do not do the work yourself. `run-role` keeps that CLI when it has usage above the reserve, and otherwise starts the CLI with the most usage left, compared monthly, then weekly, then the 5-hour window.
 
 1. Write a complete, self-contained brief for the role from the task you were given. The role cannot see this conversation, so include the goal, constraints, relevant file paths, and what to return.
 2. Run exactly this command with Bash, putting the brief in the heredoc:
 
-{relay_command(role, project)} <<'SYNDICATE_BRIEF'
+{relay_command(role, project, pin=pin)} <<'SYNDICATE_BRIEF'
 <the brief>
 SYNDICATE_BRIEF
 
@@ -524,7 +606,7 @@ def build_claude(team: Team, headless: bool, rest: list[str]) -> list[str]:
             relays = True
             agents[name] = {
                 "description": role.description,
-                "prompt": relay_prompt(role, team.project),
+                "prompt": relay_prompt(role, team.project, pin=getattr(team, "pin_runtimes", False)),
                 "tools": ["Bash"],
             }
     settings: dict = {}
@@ -559,7 +641,7 @@ def build_codex(team: Team, headless: bool, rest: list[str]) -> list[str]:
         if role.cli == "codex" and role.can_write:
             instructions, sandbox = role.body, role.sandbox
         else:
-            instructions = relay_prompt(role, team.project)
+            instructions = relay_prompt(role, team.project, pin=getattr(team, "pin_runtimes", False))
             sandbox = "read-only" if role.cli == "codex" and not role.can_write else RELAY_SANDBOX
         f = gen / f"{name}.toml"
         config = f"developer_instructions = {jstr(instructions)}\nsandbox_mode = {jstr(sandbox)}\n"
@@ -2204,7 +2286,7 @@ def cmd_chief_of_staff(args):
                 or not isinstance(current, dict) or current.get("role") != "chief-of-staff"
                 or snapshot_status.get("provider") not in CLIS):
             raise SyndicateError("Not a Chief of Staff handoff with a checkpoint and valid status")
-    provider = args.runtime or snapshot_status.get("provider") or os.environ.get("SYNDICATE_RUNTIME") or "claude"
+    provider = args.runtime or snapshot_status.get("provider") or configured_default_cli() or "claude"
     if provider not in CLIS:
         raise SyndicateError("Chief of Staff runtime must be claude or codex")
     task = args.task or ("Give a concise current cross-project briefing and recommend the next action."
@@ -2223,49 +2305,66 @@ def cmd_chief_of_staff(args):
     require_clis({provider})
     with chief_session_lock() as lock:
         workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
-        local = workspace / LOCAL
-        local.mkdir(parents=True, exist_ok=True, mode=0o700)
-        status_file = local / "status.json"
-        previous = runtime.read_json(status_file)
-        session_id = uuid.uuid4().hex
-        history = previous.get("history") if isinstance(previous.get("history"), list) else []
-        status = dict(pid=os.getpid(), provider=provider, state="running", session_id=session_id,
-                      current=dict(role="chief-of-staff", round=None, summary=task),
-                      history=history[-200:])
-        runtime.atomic_json(status_file, status)
-        checkpoint = local / "checkpoint.md"
-        if not checkpoint.exists():
-            checkpoint.write_text("Chief of Staff session. Read fresh portfolio records; no prior coordination checkpoint is available.\n")
+        probe_token = runtime.begin_usage_probes()
         try:
-            runtime.start_monitor(SCRIPT)
-            print(f"syndicate: Chief of Staff on {provider}; monitoring at {args.reserve:g}% reserve.", file=sys.stderr)
-            # Keep ownership if the supervisor crashes but its CLI survives.
-            result, handoff = runtime.supervise(argv, workspace, {provider}, args.reserve, task, provider,
-                                                headless=args.print, chief=True,
-                                                pass_fds=(lock.fileno(),),
-                                                live=None if getattr(args, 'no_live', False) else dict(directory=workspace.parent, chief=True, **inbox))
-            final = runtime.read_json(status_file) or status
-            if not isinstance(final.get("current"), dict):
-                final["current"] = dict(status["current"])
-            final["current"]["role"] = "chief-of-staff"
-            if handoff is not None:
-                final["state"] = "waiting_on_user"
+            if not args.runtime:
+                if snapshot_status.get("provider") in CLIS:
+                    preferred = snapshot_status["provider"]
+                else:
+                    preferred = configured_default_cli()
+                chosen = select_launch_cli(preferred, args.reserve, list(CLIS), workspace)
+                if chosen and chosen != provider:
+                    announce_cli_switch(preferred, chosen, args.reserve)
+                    provider = chosen
+                    argv = build_chief_of_staff(provider, workspace, args.print, task)
+                    if provider != "claude" and inbox["transport"] == "channel":
+                        raise SyndicateError("Channel transport requires Claude")
+                    require_clis({provider})
+            local = workspace / LOCAL
+            local.mkdir(parents=True, exist_ok=True, mode=0o700)
+            status_file = local / "status.json"
+            previous = runtime.read_json(status_file)
+            session_id = uuid.uuid4().hex
+            history = previous.get("history") if isinstance(previous.get("history"), list) else []
+            status = dict(pid=os.getpid(), provider=provider, state="running", session_id=session_id,
+                          current=dict(role="chief-of-staff", round=None, summary=task),
+                          history=history[-200:])
+            runtime.atomic_json(status_file, status)
+            checkpoint = local / "checkpoint.md"
+            if not checkpoint.exists():
+                checkpoint.write_text("Chief of Staff session. Read fresh portfolio records; no prior coordination checkpoint is available.\n")
+            try:
+                runtime.start_monitor(SCRIPT)
+                print(f"syndicate: Chief of Staff on {provider}; monitoring at {args.reserve:g}% reserve.", file=sys.stderr)
+                # Keep ownership if the supervisor crashes but its CLI survives.
+                result, handoff = runtime.supervise(argv, workspace, {provider}, args.reserve, task, provider,
+                                                    headless=args.print, chief=True,
+                                                    pass_fds=(lock.fileno(),),
+                                                    live=None if getattr(args, 'no_live', False) else dict(directory=workspace.parent, chief=True, **inbox))
+                final = runtime.read_json(status_file) or status
+                if not isinstance(final.get("current"), dict):
+                    final["current"] = dict(status["current"])
+                final["current"]["role"] = "chief-of-staff"
+                if handoff is not None:
+                    final["state"] = "waiting_on_user"
+                    runtime.atomic_json(status_file, final)
+                    print(f"Chief of Staff stopped. Handoff saved: {handoff}")
+                    print("Resume with 'syndicate chief-of-staff --handoff PATH'; use -x only when choosing a provider.")
+                    report_usage_reserve(args, workspace, handoff)
+                    return 75
+                if result != 0:
+                    final["state"] = "failed"
+                elif final.get("state") == "running":
+                    final["state"] = "done"
                 runtime.atomic_json(status_file, final)
-                print(f"Chief of Staff stopped. Handoff saved: {handoff}")
-                print("Resume with 'syndicate chief-of-staff --handoff PATH'; use -x only when choosing a provider.")
-                report_usage_reserve(args, workspace, handoff)
-                return 75
-            if result != 0:
+                return result
+            except BaseException:
+                final = runtime.read_json(status_file) or status
                 final["state"] = "failed"
-            elif final.get("state") == "running":
-                final["state"] = "done"
-            runtime.atomic_json(status_file, final)
-            return result
-        except BaseException:
-            final = runtime.read_json(status_file) or status
-            final["state"] = "failed"
-            runtime.atomic_json(status_file, final)
-            raise
+                runtime.atomic_json(status_file, final)
+                raise
+        finally:
+            runtime.end_usage_probes(probe_token)
 
 
 def decision_owner(args):
@@ -2807,19 +2906,35 @@ def record_cli_owner(project, session, pid) -> None:
 
 
 def run_session(args: argparse.Namespace) -> int | None:
+    token = runtime.begin_usage_probes()
+    try:
+        return _launch_session(args)
+    finally:
+        runtime.end_usage_probes(token)
+
+
+def _launch_session(args: argparse.Namespace) -> int | None:
     project = Path(args.dir).resolve()
     team = resolve_team(project, args.runtime)
     inbox = inbox_options(args, team.config)
-    if team.host != 'claude' and inbox['transport'] == 'channel':
-        raise SyndicateError('Channel transport requires Claude')
     if getattr(args, "all_runtime", None):
         for role in team.roles.values():
             role.cli = args.all_runtime
         team.roles["orchestrator"].cli = team.host
+        team.pin_runtimes = True
     reserve = getattr(args, "reserve", None)
     reserve = float(team.config["handoff-reserve"]) if reserve is None else reserve
     if not 0 < reserve < 100:
         raise SyndicateError("reserve must be between 0 and 100 (exclusive)")
+    if not args.runtime and team.config["handoff"] == "on":
+        preferred = configured_cli(team, "orchestrator")
+        chosen = select_launch_cli(preferred, reserve, list(CLIS), project)
+        if chosen and chosen != team.host:
+            announce_cli_switch(preferred, chosen, reserve)
+            team.host = chosen
+            team.roles["orchestrator"].cli = team.host
+    if team.host != 'claude' and inbox['transport'] == 'channel':
+        raise SyndicateError('Channel transport requires Claude')
     if getattr(args, "handoff_path", None):
         path = Path(args.handoff_path).resolve()
         if not (path / "handoff.md").is_file():
@@ -2879,13 +2994,18 @@ def run_session(args: argparse.Namespace) -> int | None:
             report_usage_reserve(args, project, handoff)
             return 75  # resumable temporary interruption; not successful completion
         require_clis({target})
-        # A stale or awaiting-reset reading still counts: an expected reset is not capacity.
-        remaining = runtime.latest_reading(runtime.read_json(runtime.STATE / f"{target}.json"))
+        # A non-current reading at or below the reserve is checked once, for this
+        # target only. An expected reset is not treated as restored capacity.
+        _observation, remaining, refreshed = runtime.confirm_capacity(target, reserve, cwd=project)
         if remaining is not None and remaining <= reserve:
-            report_usage_reserve(args, project, handoff,
-                                 f"{target} last recorded only {remaining:g}% remaining (reserve {reserve:g}%); "
-                                 "leaving work stopped. A passed reset time does not count as restored capacity; "
-                                 f"{runtime.forget_hint(target)}")
+            if refreshed:
+                detail = (f"{target} still has only {remaining:g}% remaining after a fresh usage check "
+                          f"(reserve {reserve:g}%); leaving work stopped. {runtime.forget_hint(target)}")
+            else:
+                detail = (f"{target} last recorded only {remaining:g}% remaining (reserve {reserve:g}%); "
+                          "leaving work stopped. A passed reset time does not count as restored capacity; "
+                          f"{runtime.forget_hint(target)}")
+            report_usage_reserve(args, project, handoff, detail)
             return 75
         args.runtime = target
         args.all_runtime = target
@@ -2893,18 +3013,18 @@ def run_session(args: argparse.Namespace) -> int | None:
         return None  # cmd_run retains the project lock while starting the confirmed target
 
 
-def specialist_gate(role: Role, reserve: float | None) -> None:
+def specialist_gate(role: Role, reserve: float | None, cwd=None) -> None:
     """Refuse to launch a specialist whose provider is at or below the reserve.
 
-    Decides with the latest real reading (stale or awaiting-reset readings
-    count). No reading at all fails loudly: the runner could not enforce
-    the reserve for this provider. No gate applies with handoff = off.
+    A reading that is not current and is at or below the reserve is refreshed
+    once, for this provider only, before the refusal. A current reading is
+    used as recorded. No reading at all fails loudly: the runner could not
+    enforce the reserve for this provider. No gate applies with handoff = off.
     """
     if reserve is None:
         return
     provider = role.cli
-    observation = runtime.read_json(runtime.STATE / f"{provider}.json")
-    remaining = runtime.latest_reading(observation)
+    observation, remaining, refreshed = runtime.confirm_capacity(provider, reserve, cwd=cwd)
     refused = f"refusing to launch the {role.name} specialist on {provider}; no {provider} CLI was launched. "
     move = (f"move this role to another runtime ('{role.name} = {'codex' if provider == 'claude' else 'claude'}' "
             "in .syndicate/syndicate.conf, or relaunch the team with --all-runtime)")
@@ -2920,10 +3040,14 @@ def specialist_gate(role: Role, reserve: float | None) -> None:
                              f"{reserve:g}% reserve cannot be enforced. " + guidance)
     when = runtime.format_time(runtime.observed_time(observation), missing="at an unknown time")
     if remaining <= reserve:
-        raise SpecialistReserveReached(refused + f"The last {provider} reading (observed {when}) shows {remaining:g}% "
-                                     f"account usage remaining, at or below the {reserve:g}% reserve. A passed reset "
-                                     f"time does not count as restored capacity; check 'syndicate limits', or {move}. "
-                                     f"Recovery: {runtime.forget_hint(provider)}.", 1)
+        if refreshed:
+            basis = (f"A fresh {provider} reading shows {remaining:g}% account usage remaining, "
+                     f"at or below the {reserve:g}% reserve. Check 'syndicate limits', or {move}. ")
+        else:
+            basis = (f"The last {provider} reading (observed {when}) shows {remaining:g}% "
+                     f"account usage remaining, at or below the {reserve:g}% reserve. A passed reset "
+                     f"time does not count as restored capacity; check 'syndicate limits', or {move}. ")
+        raise SpecialistReserveReached(refused + basis + f"Recovery: {runtime.forget_hint(provider)}.", 1)
     state, _ = runtime.availability(observation)
     if state != "current":
         print(f"syndicate: WARNING: {provider} usage telemetry is {state}; launching {role.name} on the last "
@@ -2998,9 +3122,38 @@ def cmd_run_role(args: argparse.Namespace) -> int:
         providers.add(role.cli)
         failure = None
     provider = role.cli
+    token = runtime.begin_usage_probes()
+    try:
+        return _launch_role(args, project, team, role, brief, owner, providers, launch_reserve, reserve,
+                            run_reserve, exhausted, failure, provider)
+    finally:
+        runtime.end_usage_probes(token)
+
+
+def _launch_role(args, project, team, role, brief, owner, providers, launch_reserve, reserve,
+                 run_reserve, exhausted, failure, provider):
+    if (not getattr(args, "runtime", None) and launch_reserve is not None and not exhausted):
+        preferred = configured_cli(team, role.name)
+        candidates = list(CLIS)
+        # A Codex read-only role cannot move onto Claude. Claude may still move onto Codex.
+        if not role.can_write and preferred == "codex":
+            candidates = ["codex"]
+        chosen = select_launch_cli(preferred, reserve, candidates, project)
+        if chosen and chosen != role.cli:
+            announce_cli_switch(preferred, chosen, reserve)
+            role.cli = chosen
+            provider = chosen
+            providers.add(chosen)
+            require_clis({chosen})
     while True:
         if failure is not None:
-            readings = {cli: runtime.recorded_remaining(cli) for cli in sorted(providers)}
+            for cli in sorted(providers):
+                if cli in exhausted:
+                    continue
+                if not role.can_write and cli == "claude" and "codex" in exhausted:
+                    continue
+                runtime.ensure_reading(cli, cwd=project, threshold=reserve)
+            readings = {cli: runtime.recorded_remaining(cli, reserve) for cli in sorted(providers)}
             untried = {cli: remaining for cli, remaining in readings.items() if cli not in exhausted}
             available = [cli for cli, remaining in untried.items() if remaining is not None and remaining > reserve]
             # A Codex read-only role may run shell checks in its isolated
@@ -3029,13 +3182,15 @@ def cmd_run_role(args: argparse.Namespace) -> int:
                     raise failure
                 print(f"syndicate: {failure}", file=sys.stderr)
                 return failure.exit_code
-            provider = max(available, key=readings.__getitem__)
+            ranks = {cli: runtime.readings_by_kind(runtime.read_json(runtime.STATE / f"{cli}.json"))
+                     for cli in available}
+            provider = runtime.choose_engine(None, readings, reserve, available, ranks)
             print(f"syndicate: {failure}; retrying {role.name} on {provider} "
                   f"({readings[provider]:g}% last recorded remaining).", file=sys.stderr)
         attempt = copy(role)
         attempt.cli = provider
         try:
-            specialist_gate(attempt, reserve if launch_reserve is not None else None)
+            specialist_gate(attempt, reserve if launch_reserve is not None else None, cwd=project)
             with ExitStack() as stack:
                 enter_specialist_lease(stack, project, team, attempt)
                 attempt_brief = brief
@@ -3694,9 +3849,27 @@ def main(argv: list[str]) -> int:
     original_argv = list(argv)
     if not argv:
         argv = ['chief-of-staff']
-    if argv == ["_claude-usage"]:
+    if argv and argv[0] == "_claude-usage":
+        args = argv[1:]
+        capture = None
+        while args:
+            if len(args) >= 2 and args[0] == "--state":
+                runtime.STATE = Path(args[1])
+                args = args[2:]
+            elif len(args) >= 2 and args[0] == "--capture":
+                capture = Path(args[1])
+                args = args[2:]
+            else:
+                print("syndicate: usage: _claude-usage [--state DIR] [--capture FILE]", file=sys.stderr)
+                return 2
         try:
-            observation = runtime.save_observation("claude", json.load(sys.stdin))
+            raw = sys.stdin.read()
+            if capture is not None:
+                try:
+                    capture.write_text(raw)
+                except OSError:
+                    pass
+            observation = runtime.save_observation("claude", json.loads(raw))
             state, remaining = runtime.availability(observation)
             print(f"Syndicate: Claude {remaining:g}% account usage remaining" if remaining is not None else f"Syndicate: Claude usage {state}")
             return 0

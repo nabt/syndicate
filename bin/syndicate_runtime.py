@@ -5,13 +5,16 @@ checkpoint or a Codex quota refresh. Claude publishes via its status line.
 """
 from __future__ import annotations
 
+import contextvars
 import fcntl
 import json
 import math
 import os
 import pty
 import re
+import select
 import selectors
+import shlex
 import shutil
 import signal
 import subprocess
@@ -28,6 +31,11 @@ from stat import S_ISREG
 STATE = Path.home() / ".syndicate" / "limits"
 STALE_SECONDS = 180
 POLL_SECONDS = 30
+# One print turn is enough for Claude to publish rate_limits. Kept short so a
+# stale reading cannot stall launch, and small enough that the turn itself
+# cannot wander into tool use.
+USAGE_PROBE_TIMEOUT = 90
+USAGE_PROBE_PROMPT = "ok"
 LEASE_DIRECTORY = "specialists"
 LEASE_MAX_BYTES = 4096
 LEASE_SCAN_LIMIT = 64  # lease-named entries examined per scan
@@ -76,12 +84,69 @@ def atomic_json(path, data):
             os.unlink(name)
 
 
-def window(name, used, reset):
+# Longer budgets are decided before shorter ones. A monthly cap outranks the
+# weekly window, which outranks the 5-hour window.
+WINDOW_KINDS = ("monthly", "weekly", "five_hour")
+
+
+def _percent_used(value, allow_over=False):
+    """Used-percent in [0, 100]. Spend caps may report more than 100 once exceeded."""
+    if allow_over and _real(value, 0, 1e6) and value > 100:
+        return 100.0
+    return value
+
+
+def window(name, used, reset, kind=None):
     if not _real(used, 0, 100):
         return None
     if not _real(reset, 1, MAX_TIMESTAMP):
         reset = None
-    return {"name": name, "remaining_percent": 100 - used, "resets_at": reset}
+    record = {"name": name, "remaining_percent": 100 - used, "resets_at": reset}
+    if kind in WINDOW_KINDS:
+        record["kind"] = kind
+    return record
+
+
+def _kind_from_minutes(minutes):
+    """Map a Codex window length onto monthly, weekly, or 5-hour."""
+    if not _real(minutes, 1, 1e7):
+        return None
+    if minutes <= 12 * 60:
+        return "five_hour"
+    if minutes <= 14 * 24 * 60:
+        return "weekly"
+    return "monthly"
+
+
+def _claude_kind(name, value):
+    if name == "five_hour":
+        return "five_hour"
+    if name == "seven_day":
+        return "weekly"
+    period = value.get("period") if isinstance(value, dict) else None
+    return {"daily": "five_hour", "weekly": "weekly", "monthly": "monthly"}.get(period, "monthly")
+
+
+def _limit_windows(bucket, rates):
+    """Windows from one Codex rate-limit snapshot, including its spend cap."""
+    found = []
+    if not isinstance(rates, dict):
+        return found
+    for slot, default_kind in (("primary", "five_hour"), ("secondary", "weekly")):
+        value = rates.get(slot)
+        if not isinstance(value, dict):
+            continue
+        kind = _kind_from_minutes(value.get("windowDurationMins")) or default_kind
+        found.append(window(f"{bucket}/{slot}", _percent_used(value.get("usedPercent"), True),
+                            value.get("resetsAt"), kind))
+    limit = rates.get("individualLimit")
+    if isinstance(limit, dict):
+        remaining = limit.get("remainingPercent")
+        used = None if not _real(remaining, 0, 100) else 100 - remaining
+        found.append(window(f"{bucket}/monthly", used, limit.get("resetsAt"), "monthly"))
+    if rates.get("spendControlReached") is True and not any(item and item.get("kind") == "monthly" for item in found):
+        found.append(window(f"{bucket}/monthly", 100, None, "monthly"))
+    return found
 
 
 def normalize(provider, data, now=None):
@@ -93,19 +158,17 @@ def normalize(provider, data, now=None):
         for name in ("five_hour", "seven_day", "spend_limit"):
             value = rates.get(name)
             if isinstance(value, dict):
-                windows.append(window(name, value.get("used_percentage"), value.get("resets_at")))
+                windows.append(window(name, _percent_used(value.get("used_percentage"), name == "spend_limit"),
+                                      value.get("resets_at"), _claude_kind(name, value)))
     else:
         # Preserve all returned buckets: a model-specific exhausted limit must
         # not disappear merely because the default bucket is still available.
+        # primary/secondary are slots, so the duration (not the slot) decides
+        # whether a window is 5-hour, weekly, or monthly.
         buckets = data.get("rateLimitsByLimitId") or {"codex": data.get("rateLimits")}
         buckets = buckets if isinstance(buckets, dict) else {}
         for bucket, rates in buckets.items():
-            if not isinstance(rates, dict):
-                continue
-            for name in ("primary", "secondary"):
-                value = rates.get(name)
-                if isinstance(value, dict):
-                    windows.append(window(f"{bucket}/{name}", value.get("usedPercent"), value.get("resetsAt")))
+            windows.extend(_limit_windows(bucket, rates))
     return {"provider": provider, "observed_at": time.time() if now is None else now,
             "windows": [w for w in windows if w], "source": "claude-statusline" if provider == "claude" else "codex-app-server"}
 
@@ -215,17 +278,58 @@ def availability(observation, now=None):
     return "current", min(w["remaining_percent"] for w in windows)
 
 
-def latest_reading(observation):
-    """Most constrained window of the last real reading, whatever its age.
+def window_kind(record):
+    """monthly, weekly, or five_hour for a stored window, else None."""
+    if not isinstance(record, dict):
+        return None
+    kind = record.get("kind")
+    if kind in WINDOW_KINDS:
+        return kind
+    name = record.get("name")
+    if not isinstance(name, str):
+        return None
+    if name == "five_hour" or name.endswith("/primary"):
+        return "five_hour"
+    if name in ("seven_day", "weekly") or name.endswith("/secondary"):
+        return "weekly"
+    if name == "spend_limit" or name.endswith("/monthly") or "monthly" in name:
+        return "monthly"
+    return None
 
-    None means no usable reading was ever recorded. A passed reset time does
-    not restore capacity, and no quota is inferred from tokens or elapsed time.
+
+def readings_by_kind(observation):
+    """Remaining percent for each recognized budget, tightest window of that kind."""
+    found = {}
+    for record in usage_windows(observation):
+        kind = window_kind(record)
+        if kind is None:
+            continue
+        remaining = record["remaining_percent"]
+        found[kind] = remaining if kind not in found else min(found[kind], remaining)
+    return found
+
+
+def latest_reading(observation, threshold=None):
+    """Remaining percent the reserve decision uses, whatever the reading's age.
+
+    Windows are judged monthly, then weekly, then 5-hour. The first of those
+    at or below `threshold` is the deciding one. When every recognized window
+    is above the threshold, the tightest window still counts, so a short window
+    can block on its own. None means no usable reading was ever recorded. A
+    passed reset time does not restore capacity, and no quota is inferred from
+    tokens or elapsed time.
     """
+    if threshold is not None:
+        ranked = readings_by_kind(observation)
+        for kind in WINDOW_KINDS:
+            remaining = ranked.get(kind)
+            if remaining is not None and remaining <= threshold:
+                return remaining
     return min((w["remaining_percent"] for w in usage_windows(observation)), default=None)
 
 
-def recorded_remaining(provider):
-    return latest_reading(read_json(STATE / f"{provider}.json"))
+def recorded_remaining(provider, threshold=None):
+    return latest_reading(read_json(STATE / f"{provider}.json"), threshold)
 
 
 class RoleUsageLimit(Exception):
@@ -401,17 +505,19 @@ def run_specialist_process(argv, *, cwd, env=None, reserve=None, claude_text=Fal
     return proc.returncode
 
 
-def supervision_usage(observation, chief=False, now=None):
+def supervision_usage(observation, chief=False, now=None, threshold=None):
     """(state, remaining) for enforcing the reserve with the latest real reading.
 
     Every supervised provider is enforced with its most recent recorded
     percentages, including stale readings and readings awaiting reset
     confirmation; unknown or stale telemetry never stops a session by itself.
-    Chief sessions report the fixed state "last observed". Project sessions
-    report the freshness state from availability() so the supervisor can warn
-    that the reading may be outdated. Neither establishes current capacity.
+    The remaining percent walks monthly, then weekly, then the 5-hour window
+    when `threshold` is set. Chief sessions report the fixed state "last
+    observed". Project sessions report the freshness state from availability()
+    so the supervisor can warn that the reading may be outdated. Neither
+    establishes current capacity.
     """
-    remaining = latest_reading(observation)
+    remaining = latest_reading(observation, threshold)
     if chief:
         return "last observed", remaining
     return availability(observation, now)[0], remaining
@@ -434,6 +540,289 @@ def usage_warning(provider, state, observation):
     when = format_time(observed_time(observation), "%H:%M", "unknown time")
     return (f"{provider} usage telemetry is {state} (last observed {when}, {remaining:g}% remaining); "
             "enforcing the reserve with the last real reading")
+
+
+def claude_usage_probe_command(capture=None):
+    """One short Claude turn whose status line records account limits.
+
+    Print mode does not run the status line, so this is an interactive session
+    on a terminal. Tools are disabled, effort is low, and the model is Sonnet,
+    so the turn is a few tokens. `capture`, when set, receives the status-line
+    JSON (including the throwaway session path) before it is recorded.
+    """
+    script = Path(__file__).resolve().parent / "syndicate"
+    command = [sys.executable, str(script), "_claude-usage", "--state", str(STATE)]
+    if capture is not None:
+        command += ["--capture", str(capture)]
+    settings = {"statusLine": {"type": "command", "command": shlex.join(command)}}
+    return ["claude",
+            "--model", "sonnet",
+            "--tools", "",
+            "--disable-slash-commands",
+            "--permission-mode", "dontAsk",
+            "--effort", "low",
+            "--system-prompt", "Reply with the single word ok.",
+            "--settings", json.dumps(settings)]
+
+
+def _discard_probe_session(capture, started):
+    """Remove the one-word session the probe created, and nothing older."""
+    try:
+        payload = json.loads(Path(capture).read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(payload, dict):
+        return
+    projects = (Path.home() / ".claude" / "projects").resolve()
+    temporary = Path(tempfile.gettempdir()).resolve()
+
+    def fresh(path):
+        try:
+            info = path.lstat()
+        except OSError:
+            return False
+        return not path.is_symlink() and info.st_ctime >= started - 2
+
+    transcript = payload.get("transcript_path")
+    if isinstance(transcript, str):
+        path = Path(transcript)
+        try:
+            if path.is_file() and fresh(path) and projects in path.resolve().parents:
+                path.unlink()
+        except OSError:
+            pass
+    scratch = payload.get("scratchpad_dir")
+    if isinstance(scratch, str):
+        path = Path(scratch)
+        try:
+            resolved = path.resolve()
+            if path.is_dir() and fresh(path) and (resolved == temporary or temporary in resolved.parents):
+                shutil.rmtree(path)
+        except OSError:
+            pass
+
+
+def _run_claude_usage_probe(before, cwd):
+    """Type one word into a Claude terminal and stop once limits are recorded."""
+    started = time.time()
+    with tempfile.TemporaryDirectory(prefix="syndicate-usage-") as tmp:
+        capture = Path(tmp) / "statusline.json"
+        work = str(cwd) if cwd else tmp
+        master, slave = pty.openpty()
+        proc = None
+        try:
+            try:
+                proc = subprocess.Popen(claude_usage_probe_command(capture), cwd=work,
+                                        stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+            finally:
+                os.close(slave)
+            sent = False
+            seen = b""
+            deadline = time.monotonic() + USAGE_PROBE_TIMEOUT
+            while time.monotonic() < deadline:
+                if _probe_published("claude", before):
+                    break
+                remaining = deadline - time.monotonic()
+                ready, _, _ = select.select([master], [], [], min(0.2, max(0, remaining)))
+                if not ready:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                try:
+                    chunk = os.read(master, 8192)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                seen = (seen + chunk)[-8192:]
+                if b"trust this folder" in seen or b"Not logged in" in seen:
+                    break
+                if not sent and b"Claude Code" in seen:
+                    try:
+                        os.write(master, b"ok\r")
+                    except OSError:
+                        break
+                    sent = True
+        finally:
+            if proc is not None and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    proc.wait(timeout=2)
+            os.close(master)
+        _discard_probe_session(capture, started)
+    return _probe_published("claude", before)
+
+
+def _probe_published(provider, before):
+    """The observation written by a probe, if it is newer than `before`."""
+    updated = read_json(STATE / f"{provider}.json")
+    observed = observed_time(updated)
+    if usage_windows(updated) and observed is not None and observed != before:
+        return updated
+    return None
+
+
+_usage_probes = contextvars.ContextVar("syndicate_usage_probes", default=None)
+
+
+def begin_usage_probes():
+    """Start one launch decision. Returns a token, or None if a decision is already open."""
+    if _usage_probes.get() is not None:
+        return None
+    return _usage_probes.set(set())
+
+
+def end_usage_probes(token):
+    if token is not None:
+        _usage_probes.reset(token)
+
+
+def _note_probe(provider):
+    probes = _usage_probes.get()
+    if probes is not None:
+        probes.add(provider)
+
+
+def _already_probed(provider):
+    probes = _usage_probes.get()
+    return probes is not None and provider in probes
+
+
+def choose_engine(preferred, readings, threshold, candidates, ranks=None):
+    """Pick the CLI to start from remaining-usage percentages.
+
+    `preferred` wins when its remaining usage is above `threshold`. Otherwise
+    the candidate with the most usage left above `threshold` wins. That
+    comparison walks monthly, then weekly, then the 5-hour window. None means
+    no candidate is above the threshold. A missing reading is not usage.
+    `ranks` maps a CLI to the remaining percent of each kind it reported.
+    """
+    usable = [name for name in candidates
+              if readings.get(name) is not None and readings[name] > threshold]
+    if preferred in usable:
+        return preferred
+    if not usable:
+        return None
+
+    def better(left, right):
+        left_rank = (ranks or {}).get(left) or {}
+        right_rank = (ranks or {}).get(right) or {}
+        for kind in WINDOW_KINDS:
+            left_remaining, right_remaining = left_rank.get(kind), right_rank.get(kind)
+            if left_remaining is None or right_remaining is None or left_remaining == right_remaining:
+                continue
+            return left if left_remaining > right_remaining else right
+        if readings[left] != readings[right]:
+            return left if readings[left] > readings[right] else right
+        if preferred in (left, right):
+            return preferred
+        return left if candidates.index(left) < candidates.index(right) else right
+
+    winner = usable[0]
+    for name in usable[1:]:
+        winner = better(winner, name)
+    return winner
+
+
+def ensure_reading(provider, cwd=None, now=None, threshold=None):
+    """Return (remaining, refreshed) for one provider.
+
+    A current reading is kept. Any other state is queried once. A failed query
+    leaves the recorded reading in place and does not invent capacity.
+    `threshold` selects the deciding window: monthly, then weekly, then 5-hour.
+    """
+    now = clock() if now is None else now
+    observation = read_json(STATE / f"{provider}.json")
+    remaining = latest_reading(observation, threshold)
+    if remaining is not None and availability(observation, now)[0] == "current":
+        return remaining, False
+    state = availability(observation, now)[0]
+    if remaining is None:
+        print(f"Syndicate: no {provider} usage reading yet; checking {provider} before choosing a CLI.",
+              file=sys.stderr)
+    else:
+        print(f"Syndicate: {provider} usage telemetry is {state} ({remaining:g}% remaining); "
+              f"checking {provider} before choosing a CLI.", file=sys.stderr)
+    refreshed = refresh_usage(provider, cwd=cwd)
+    if not refreshed or latest_reading(refreshed) is None:
+        if remaining is None:
+            print(f"Syndicate: {provider} usage check did not return a reading.", file=sys.stderr)
+        else:
+            print(f"Syndicate: {provider} usage check did not return a new reading; "
+                  "the last recorded reading still applies.", file=sys.stderr)
+        return remaining, False
+    remaining = latest_reading(refreshed, threshold)
+    print(f"Syndicate: {provider} usage check recorded {remaining:g}% remaining.", file=sys.stderr)
+    return remaining, True
+
+
+def refresh_usage(provider, cwd=None):
+    """Query one provider for a new usage reading. Returns it, or None.
+
+    Codex uses the app-server rate-limit read and starts no model turn.
+    Claude types one word into a terminal session and stops when its status
+    line publishes rate limits. Print mode does not publish that status line.
+    A failure leaves the recorded reading untouched. `cwd` is the trusted
+    directory the Claude terminal runs in; an untrusted directory cannot
+    publish limits.
+    """
+    if provider not in PROVIDERS:
+        return None
+    _note_probe(provider)
+    before = observed_time(read_json(STATE / f"{provider}.json"))
+    observation = None
+    try:
+        if provider == "codex":
+            observation = save_observation("codex", codex_limits())
+        else:
+            observation = _run_claude_usage_probe(before, cwd)
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        observation = None
+    published = _probe_published(provider, before)
+    if published:
+        return published
+    if observation and usage_windows(observation):
+        return observation
+    return None
+
+
+def confirm_capacity(provider, threshold, now=None, cwd=None):
+    """Return (observation, remaining, refreshed) for one launch decision.
+
+    A current reading is used as recorded. A reading that is not current and
+    is at or below `threshold` is refreshed once, for this provider only, and
+    the new reading replaces it when the query returns one. A failed query
+    leaves the recorded reading in place; nothing is inferred from the failure.
+    """
+    now = clock() if now is None else now
+    observation = read_json(STATE / f"{provider}.json")
+    remaining = latest_reading(observation, threshold)
+    state = availability(observation, now)[0]
+    if remaining is None or remaining > threshold or state == "current":
+        return observation, remaining, False
+    if _already_probed(provider):
+        observation = read_json(STATE / f"{provider}.json")
+        return observation, latest_reading(observation, threshold), False
+    print(f"Syndicate: {provider} usage telemetry is {state} ({remaining:g}% remaining); "
+          f"checking {provider} once before applying the {threshold:g}% reserve.",
+          file=sys.stderr)
+    refreshed = refresh_usage(provider, cwd=cwd)
+    if not refreshed or latest_reading(refreshed) is None:
+        print(f"Syndicate: {provider} usage check did not return a new reading; "
+              "the last recorded reading still applies.", file=sys.stderr)
+        return observation, remaining, False
+    remaining = latest_reading(refreshed, threshold)
+    print(f"Syndicate: {provider} usage check recorded {remaining:g}% remaining.", file=sys.stderr)
+    return refreshed, remaining, True
 
 
 # Specialist leases. A delegated specialist (team run-role) creates a randomly
@@ -736,7 +1125,9 @@ def describe_limits():
             text += " (observed " + format_time(observed) + ")"
         if remaining is not None:
             text += f", {remaining:g}% remaining (most constrained window)"
-        for w in usage_windows(data):
+        ordered = sorted(usage_windows(data), key=lambda record: (
+            WINDOW_KINDS.index(window_kind(record)) if window_kind(record) in WINDOW_KINDS else len(WINDOW_KINDS)))
+        for w in ordered:
             when = format_time(w.get("resets_at"))
             text += f'\n  {w.get("name")}: last observed {w["remaining_percent"]:g}% remaining; reset {when}'
         lines.append(text)
@@ -864,7 +1255,9 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
     providers are enforced for the whole run (the host). In project sessions
     the CLI receives SYNDICATE_RUN_ID. Specialists of this run enforce their
     own quota and backoff. Legacy leases still use supervisor enforcement.
-    Enforcement uses the latest real reading.
+    Enforcement uses the latest real reading. A non-current reading at or
+    below the reserve is refreshed once before it can refuse launch, and only
+    for the CLI this session is about to run.
 
     on_start(pid), if given, is called once the CLI child has been started,
     so the caller can record it as an owner of the session."""
@@ -873,12 +1266,25 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
     run_id = write_run_record(project, task, host, threshold, task_owner)
     warned = {}  # provider -> telemetry state last warned about (one warning per transition)
     for provider in sorted(providers):
+        now = clock()
         observation = read_json(STATE / f"{provider}.json")
-        state, remaining = supervision_usage(observation, chief=chief, now=clock())
+        state, remaining = supervision_usage(observation, chief=chief, now=now, threshold=threshold)
+        refreshed = False
+        # Other providers in the set keep their recorded readings. Querying
+        # them would spend a turn on a CLI this session is not running.
+        if (provider == host and remaining is not None and remaining <= threshold
+                and availability(observation, now)[0] != "current"):
+            observation, remaining, refreshed = confirm_capacity(provider, threshold, now=now, cwd=project)
+            state = supervision_usage(observation, chief=chief, now=now, threshold=threshold)[0]
         if remaining is not None and remaining <= threshold:
             reason = f"{provider}: {remaining:g}% account usage remaining (reserve {threshold:g}%); no CLI launched"
-            print(f"Syndicate: {reason}. The last recorded reading counts even if it is stale or its reset "
-                  f"time has passed; {forget_hint(provider)}.", file=sys.stderr)
+            if refreshed:
+                detail = (f"A fresh {provider} reading is still at or below the reserve; "
+                          f"{forget_hint(provider)}")
+            else:
+                detail = ("The last recorded reading counts even if it is stale or its reset "
+                          f"time has passed; {forget_hint(provider)}")
+            print(f"Syndicate: {reason}. {detail}.", file=sys.stderr)
             return 75, create_handoff(project, host, task, reason, run_id, limited=provider)
         if not chief:
             warned[provider] = state
@@ -1018,7 +1424,7 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
                             sys.stderr.flush()
                 for provider, role in enforced.items():
                     observation = read_json(STATE / f"{provider}.json")
-                    state, remaining = supervision_usage(observation, chief=chief, now=now)
+                    state, remaining = supervision_usage(observation, chief=chief, now=now, threshold=threshold)
                     if remaining is not None and remaining <= threshold:
                         reason = f"{provider}: {remaining:g}% account usage remaining (reserve {threshold:g}%)"
                         trigger = provider

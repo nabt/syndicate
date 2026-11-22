@@ -33,6 +33,31 @@ class Quotas(unittest.TestCase):
             "model": {"secondary": {"usedPercent": 100, "resetsAt": 1000}}}}, now=100)
         self.assertEqual(rt.availability(data, 101), ("current", 0))
 
+    def test_budgets_are_judged_monthly_then_weekly_then_five_hour(self):
+        claude = rt.normalize("claude", {"rate_limits": {
+            "five_hour": {"used_percentage": 10, "resets_at": 200},
+            "seven_day": {"used_percentage": 40, "resets_at": 300},
+            "spend_limit": {"used_percentage": 95, "resets_at": 400, "period": "monthly"}}}, now=100)
+        self.assertEqual(rt.readings_by_kind(claude), {"five_hour": 90, "weekly": 60, "monthly": 5})
+        # Monthly is at the reserve, so it decides before the healthier shorter windows.
+        self.assertEqual(rt.latest_reading(claude, 10), 5)
+        weekly_spend = rt.normalize("claude", {"rate_limits": {
+            "spend_limit": {"used_percentage": 150, "period": "weekly"}}})
+        self.assertEqual(rt.readings_by_kind(weekly_spend), {"weekly": 0})
+        codex = rt.normalize("codex", {"rateLimits": {
+            "primary": {"usedPercent": 80, "windowDurationMins": 10080, "resetsAt": 900},
+            "secondary": {"usedPercent": 10, "windowDurationMins": 300, "resetsAt": 500},
+            "individualLimit": {"remainingPercent": 25, "resetsAt": 2000}}}, now=100)
+        self.assertEqual(rt.readings_by_kind(codex), {"weekly": 20, "five_hour": 90, "monthly": 25})
+        # The primary slot is weekly here. At a 20% reserve it is the first budget that fails.
+        self.assertEqual(rt.latest_reading(codex, 20), 20)
+        ranks = {"claude": {"monthly": 40, "weekly": 90, "five_hour": 15},
+                 "codex": {"monthly": 80, "weekly": 30, "five_hour": 12}}
+        # Both clear a 10% reserve. Monthly is compared before the tighter 5-hour window.
+        self.assertEqual(rt.choose_engine(None, {"claude": 15, "codex": 12}, 10, ["claude", "codex"], ranks), "codex")
+        self.assertEqual(rt.choose_engine("claude", {"claude": 15, "codex": 12}, 10, ["claude", "codex"], ranks),
+                         "claude")
+
     def test_invalid_values_unknown_not_available(self):
         for value in (None, True, "90", float("nan"), -1, 101):
             data = rt.normalize("claude", {"rate_limits": {"five_hour": {"used_percentage": value}}})
@@ -223,7 +248,9 @@ class Handoffs(ProjectCase):
         observation = rt.normalize("claude", {"rate_limits": {
             "five_hour": {"used_percentage": 91, "resets_at": 200}}}, now=100)
         rt.atomic_json(rt.STATE / "claude.json", observation)
-        with patch.object(rt.subprocess, "Popen") as launch, patch.object(rt, "create_handoff", return_value=Path("snapshot")):
+        with patch.object(rt.subprocess, "Popen") as launch, \
+             patch.object(rt, "create_handoff", return_value=Path("snapshot")), \
+             patch.object(rt, "refresh_usage", return_value=None):
             result, path = rt.supervise(["false"], self.project, {"claude"}, 10,
                                         "task", "claude", headless=True, chief=True)
         launch.assert_not_called()
@@ -541,17 +568,84 @@ class ProjectUsagePolicy(ProjectCase):
     def test_host_stale_reading_at_reserve_still_hands_off(self):
         self.reading("claude", 90, observed_at=100)
         marker = self.project / "launched"
-        result, handoff = self.supervise(f"open({str(marker)!r}, 'w')", {"claude"}, "claude", clock=False)
+        with patch.object(rt, "refresh_usage", return_value=None):
+            result, handoff = self.supervise(f"open({str(marker)!r}, 'w')", {"claude"}, "claude", clock=False)
         self.assertFalse(marker.exists())
         self.assertEqual(result, 75)
         self.assertIn("10% account usage remaining (reserve 10%); no CLI launched",
                       (handoff / "handoff.md").read_text())
+        self.assertIn("did not return a new reading", self.errors())
         self.assertIn("syndicate limits --forget claude", self.errors())
         # Mid-run: a stale low reading recorded after launch also stops the run.
+        # That reading is already the latest sample, so it is not queried again.
         self.reading("claude", 50, observed_at=100)
         result, handoff = self.supervise("import time; time.sleep(30)", {"claude"}, "claude",
                                          on_start=lambda pid: self.reading("claude", 95, observed_at=100))
         self.assertIn("5% account usage remaining (reserve 10%)", (handoff / "handoff.md").read_text())
+
+    def _fresh(self, provider, used):
+        payload = ({"rate_limits": {"five_hour": {"used_percentage": used}}} if provider == "claude"
+                   else {"rateLimits": {"primary": {"usedPercent": used}}})
+        observation = rt.normalize(provider, payload)
+        rt.atomic_json(rt.STATE / f"{provider}.json", observation)
+        return observation
+
+    def test_stale_low_host_launches_after_its_own_fresh_reading(self):
+        self.reading("claude", 95, observed_at=100)
+        self.reading("codex", 95, observed_at=100)
+        codex_before = (rt.STATE / "codex.json").read_text()
+
+        def refresh(provider, cwd=None):
+            self.assertEqual(provider, "claude")
+            return self._fresh("claude", 20)
+
+        with patch.object(rt, "refresh_usage", side_effect=refresh) as called:
+            result, handoff = self.supervise("import sys; sys.exit(0)", {"claude"}, "claude", clock=False)
+        called.assert_called_once_with("claude", cwd=self.project)
+        self.assertEqual((result, handoff), (0, None))
+        self.assertIn("checking claude once", self.errors())
+        self.assertIn("usage check recorded 80% remaining", self.errors())
+        self.assertEqual((rt.STATE / "codex.json").read_text(), codex_before)
+
+    def test_stale_low_host_stops_when_the_fresh_reading_is_still_low(self):
+        self.reading("claude", 90, observed_at=100)
+        marker = self.project / "launched"
+        with patch.object(rt, "refresh_usage", side_effect=lambda provider, cwd=None: self._fresh(provider, 96)):
+            result, handoff = self.supervise(f"open({str(marker)!r}, 'w')", {"claude"}, "claude", clock=False)
+        self.assertFalse(marker.exists())
+        self.assertEqual(result, 75)
+        self.assertIn("A fresh claude reading is still at or below the reserve", self.errors())
+        self.assertIn("4% account usage remaining", (handoff / "handoff.md").read_text())
+
+    def test_current_low_reading_does_not_query_the_cli(self):
+        rt.save_observation("claude", {"rate_limits": {"five_hour": {"used_percentage": 95}}})
+        with patch.object(rt, "refresh_usage") as refresh, patch.object(rt.subprocess, "Popen") as launch, \
+             patch.object(rt, "create_handoff", return_value=Path("snapshot")):
+            result, path = rt.supervise(["false"], self.project, {"claude"}, 10, "task", "claude")
+        refresh.assert_not_called()
+        launch.assert_not_called()
+        self.assertEqual((result, path), (75, Path("snapshot")))
+
+    def test_a_blocking_reading_for_another_cli_is_not_queried(self):
+        # Claude would refuse on its own stale reading, but this session runs Codex.
+        self.reading("claude", 96, observed_at=100)
+        self.reading("codex", 20, observed_at=100)
+        with patch.object(rt, "refresh_usage") as refresh:
+            result, handoff = self.supervise("import sys; sys.exit(0)", {"claude", "codex"}, "codex", clock=False)
+        refresh.assert_not_called()
+        self.assertEqual(result, 75)
+        self.assertIn("claude: 4% account usage remaining", (handoff / "handoff.md").read_text())
+
+    def test_only_the_host_is_queried_when_its_reading_would_block(self):
+        self.reading("claude", 20, observed_at=100)  # stale, but above the reserve
+        self.reading("codex", 96, observed_at=100)
+        calls = []
+        with patch.object(rt, "refresh_usage", side_effect=lambda provider, cwd=None: calls.append(provider) or None):
+            result, handoff = self.supervise("import sys; sys.exit(0)", {"claude", "codex"}, "codex", clock=False)
+        self.assertEqual(calls, ["codex"])
+        self.assertEqual(result, 75)
+        self.assertIn("codex: 4% account usage remaining", (handoff / "handoff.md").read_text())
+        self.assertIn("claude usage telemetry is stale", self.errors())
 
     def test_host_fresh_reading_dropping_below_reserve_hands_off(self):
         self.reading("codex", 50, observed_at=None)
@@ -931,11 +1025,39 @@ class ProjectUsagePolicy(ProjectCase):
         with patch.object(sy, "require_clis"), patch.object(sy, "register_project"), \
              patch.object(rt, "start_monitor"), patch.object(rt, "supervise", return_value=(75, snapshot)) as run, \
              patch.object(rt, "choose_target", return_value="codex"), \
+             patch.object(rt, "refresh_usage", return_value=None), \
              patch("sys.stderr", self.err), patch("sys.stdout", self.out):
             self.assertEqual(sy.cmd_run(args), 75)
         self.assertEqual(run.call_count, 1)
         self.assertIn("codex last recorded only 5% remaining", self.errors())
         self.assertIn("syndicate limits --forget codex", self.errors())
+
+    def test_post_handoff_target_continues_when_its_fresh_reading_recovers(self):
+        self.reading("codex", 95, observed_at=100)
+        snapshot = self.project / "snapshot"
+        snapshot.mkdir()
+        (snapshot / "handoff.md").write_text("continue\n")
+        calls = {"n": 0}
+
+        def stopped(*args, **kwargs):
+            calls["n"] += 1
+            return (75, snapshot) if calls["n"] == 1 else (0, None)
+
+        def refresh(provider, cwd=None):
+            self.assertEqual(Path(cwd), self.project)
+            if provider == "codex":
+                return self._fresh("codex", 5)
+            return None
+
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "task"])
+        with patch.object(sy, "require_clis"), patch.object(sy, "register_project"), \
+             patch.object(rt, "start_monitor"), patch.object(rt, "supervise", side_effect=stopped), \
+             patch.object(rt, "choose_target", return_value="codex"), \
+             patch.object(rt, "refresh_usage", side_effect=refresh), \
+             patch("sys.stderr", self.err), patch("sys.stdout", self.out):
+            self.assertEqual(sy.cmd_run(args), 0)
+        self.assertEqual(calls["n"], 2)
+        self.assertIn("usage check recorded 95% remaining", self.errors())
 
 
 class SpecialistProcess(ProjectCase):
@@ -1033,7 +1155,8 @@ class SpecialistGate(ProjectCase):
     def test_refuses_at_or_below_reserve_without_launching(self):
         for used in (90, 97):
             self.usage("claude", used, observed_at=100)
-            result, seen, _ = self.run_role("claude")
+            with patch.object(rt, "refresh_usage", return_value=None):
+                result, seen, _ = self.run_role("claude")
             self.assertEqual(seen, [])
             for part in ("refusing to launch the backend-engineer specialist on claude",
                          f"{100 - used}% account usage remaining", "10% reserve", "observed 19",
@@ -1319,9 +1442,29 @@ class SpecialistGate(ProjectCase):
         self.assertEqual(err.count("telemetry is stale"), 1)
         self.assertIn("claude usage telemetry is stale", err)
         self.usage("claude", 95, observed_at=100)  # the inner refusal still applies
-        code, err = main("_in-tmux")
+        with patch.object(rt, "refresh_usage", return_value=None):
+            code, err = main("_in-tmux")
         self.assertEqual(code, 1)
         self.assertIn("no claude CLI was launched", err)
+
+    def test_stale_low_specialist_launches_after_a_fresh_reading(self):
+        self.usage("claude", 95, observed_at=100)
+        self.usage("codex", 99, observed_at=100)
+        codex_before = (rt.STATE / "codex.json").read_text()
+
+        def refresh(provider, cwd=None):
+            self.assertEqual(provider, "claude")
+            self.assertEqual(Path(cwd), self.project)
+            observation = rt.normalize("claude", {"rate_limits": {"five_hour": {"used_percentage": 10}}})
+            rt.atomic_json(rt.STATE / "claude.json", observation)
+            return observation
+
+        with patch.object(rt, "refresh_usage", side_effect=refresh):
+            result, seen, err = self.run_role("claude")
+        self.assertEqual(result, 0)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("usage check recorded 90% remaining", err)
+        self.assertEqual((rt.STATE / "codex.json").read_text(), codex_before)
 
 
 class LimitsOutput(ProjectCase):
@@ -1516,6 +1659,205 @@ class TerminalIntegration(unittest.TestCase):
                     os.kill(pid, signal.SIGTERM)
                     os.waitpid(pid, 0)
                 os.close(master)
+
+
+class LaunchChoice(ProjectCase):
+    """Startup picks an engine from fresh readings unless the command line pinned one."""
+
+    def which(self, name):
+        return f"/usr/bin/{name}" if name in ("claude", "codex") else None
+
+    def test_choose_engine_prefers_a_configured_cli_above_the_reserve(self):
+        readings = {"claude": 40, "codex": 90}
+        self.assertEqual(rt.choose_engine("claude", readings, 10, ["claude", "codex"]), "claude")
+        self.assertEqual(rt.choose_engine("claude", {"claude": 4, "codex": 90}, 10, ["claude", "codex"]), "codex")
+        self.assertIsNone(rt.choose_engine("claude", {"claude": 4, "codex": 3}, 10, ["claude", "codex"]))
+        self.assertEqual(rt.choose_engine(None, readings, 10, ["claude", "codex"]), "codex")
+        self.assertEqual(rt.choose_engine(None, {"claude": 50, "codex": 50}, 10, ["claude", "codex"]), "claude")
+        self.assertIsNone(rt.choose_engine(None, {"claude": None, "codex": None}, 10, ["claude", "codex"]))
+
+    def test_configured_default_is_kept_when_it_is_already_above_the_reserve(self):
+        self.config("default = claude\n")
+        self.usage("claude", 40)
+        self.usage("codex", 5)
+        team = sy.resolve_team(self.project)
+        self.assertEqual(sy.configured_cli(team, "orchestrator"), "claude")
+        with patch.object(rt, "refresh_usage") as refresh, patch.object(sy.shutil, "which", side_effect=self.which):
+            chosen = sy.select_launch_cli("claude", 10, ["claude", "codex"], self.project)
+        refresh.assert_not_called()
+        self.assertEqual(chosen, "claude")
+
+    def test_no_configured_cli_uses_the_fuller_engine_without_a_query(self):
+        self.usage("claude", 40)
+        self.usage("codex", 10)
+        team = sy.resolve_team(self.project)
+        self.assertIsNone(sy.configured_cli(team, "orchestrator"))
+        with patch.object(rt, "refresh_usage") as refresh, patch.object(sy.shutil, "which", side_effect=self.which):
+            chosen = sy.select_launch_cli(None, 10, ["claude", "codex"], self.project)
+        refresh.assert_not_called()
+        self.assertEqual(chosen, "codex")
+
+    def test_stale_low_default_refreshes_both_and_starts_the_fuller_engine(self):
+        self.usage("claude", 95, observed_at=100)
+        self.usage("codex", 80, observed_at=100)
+        calls = []
+
+        def refresh(provider, cwd=None):
+            calls.append(provider)
+            return self._fresh(provider, 20 if provider == "codex" else 96)
+
+        with patch.object(rt, "refresh_usage", side_effect=refresh), \
+             patch.object(sy.shutil, "which", side_effect=self.which):
+            chosen = sy.select_launch_cli("claude", 10, ["claude", "codex"], self.project)
+        self.assertEqual(calls, ["claude", "codex"])
+        self.assertEqual(chosen, "codex")
+
+    def _fresh(self, provider, used):
+        payload = ({"rate_limits": {"five_hour": {"used_percentage": used}}} if provider == "claude"
+                   else {"rateLimits": {"primary": {"usedPercent": used}}})
+        observation = rt.normalize(provider, payload)
+        rt.atomic_json(rt.STATE / f"{provider}.json", observation)
+        return observation
+
+    def test_session_without_a_configured_cli_launches_the_fuller_engine(self):
+        self.usage("claude", 50)
+        self.usage("codex", 10)
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "-p", "task"])
+        with patch.object(sy, "require_clis"), patch.object(sy, "register_project"), \
+             patch.object(rt, "start_monitor"), patch.object(rt, "supervise", return_value=(0, None)) as run, \
+             patch.object(sy.shutil, "which", side_effect=self.which), \
+             patch.object(rt, "refresh_usage") as refresh:
+            self.assertEqual(sy.cmd_run(args), 0)
+        refresh.assert_not_called()
+        self.assertEqual(run.call_args.args[5], "codex")
+        self.assertEqual(run.call_args.args[2], {"codex"})
+
+    def test_explicit_runtime_does_not_switch(self):
+        self.usage("claude", 20)
+        self.usage("codex", 95, observed_at=100)
+        args = sy.build_parsers()[0].parse_args(["--project", str(self.project), "-x", "claude", "-p", "task"])
+        with patch.object(sy, "require_clis"), patch.object(sy, "register_project"), \
+             patch.object(rt, "start_monitor"), patch.object(rt, "supervise", return_value=(0, None)) as run, \
+             patch.object(rt, "refresh_usage") as refresh:
+            self.assertEqual(sy.cmd_run(args), 0)
+        refresh.assert_not_called()
+        self.assertEqual(run.call_args.args[5], "claude")
+
+    def test_unpinned_specialist_moves_off_a_low_default(self):
+        self.config("default = claude\n")
+        self.usage("claude", 95, observed_at=100)
+        self.usage("codex", 20)
+        calls = []
+
+        def refresh(provider, cwd=None):
+            calls.append(provider)
+            return self._fresh("claude", 96)
+
+        args = argparse.Namespace(dir=str(self.project), role="backend-engineer", runtime=None,
+                                  brief="work", backoff_from=None)
+        with patch.object(sy, "require_clis"), patch.object(rt, "run_specialist_process", return_value=0) as launch, \
+             patch.object(rt, "refresh_usage", side_effect=refresh), \
+             patch.object(sy.shutil, "which", side_effect=self.which), \
+             patch.dict(os.environ, {rt.RUN_ENV: "20260101T000000-0123abcd"}, clear=False):
+            self.assertEqual(sy.cmd_run_role(args), 0)
+        self.assertEqual(calls, ["claude"])
+        self.assertEqual(launch.call_args.args[0][0], "codex")
+
+    def test_read_only_codex_role_does_not_move_to_claude(self):
+        self.config("code-reviewer = codex\n")
+        self.usage("codex", 95, observed_at=100)
+        self.usage("claude", 10)
+
+        def refresh(provider, cwd=None):
+            self.assertEqual(provider, "codex")
+            return self._fresh("codex", 96)
+
+        args = argparse.Namespace(dir=str(self.project), role="code-reviewer", runtime=None,
+                                  brief="work", backoff_from=None)
+        with patch.object(sy, "require_clis"), patch.object(rt, "run_specialist_process", return_value=0) as launch, \
+             patch.object(rt, "refresh_usage", side_effect=refresh), \
+             patch.object(sy.shutil, "which", side_effect=self.which):
+            with self.assertRaises(sy.SyndicateError) as raised:
+                sy.cmd_run_role(args)
+        launch.assert_not_called()
+        self.assertIn("no codex CLI was launched", str(raised.exception))
+
+
+class UsageProbe(unittest.TestCase):
+    """The preflight query talks to one CLI, and Claude's turn stays minimal."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name)
+        patcher = patch.object(rt, "STATE", self.state)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_claude_probe_is_one_short_turn_and_records_only_claude(self):
+        rt.atomic_json(self.state / "codex.json", rt.normalize(
+            "codex", {"rateLimits": {"primary": {"usedPercent": 10}}}, now=50))
+        untouched = (self.state / "codex.json").read_text()
+        bindir = self.state / "bin"
+        bindir.mkdir()
+        fake = bindir / "claude"
+        fake.write_text(
+            f"#!{sys.executable}\n"
+            "import json, shlex, subprocess, sys\n"
+            "argv = sys.argv[1:]\n"
+            "assert '-p' not in argv\n"
+            "assert argv[argv.index('--tools') + 1] == ''\n"
+            "assert argv[argv.index('--effort') + 1] == 'low'\n"
+            "assert argv[argv.index('--model') + 1] == 'sonnet'\n"
+            "assert argv[argv.index('--system-prompt') + 1] == 'Reply with the single word ok.'\n"
+            "assert 'codex' not in argv\n"
+            "settings = json.loads(argv[argv.index('--settings') + 1])\n"
+            "payload = json.dumps({'session_id': 'probe', 'rate_limits': {'five_hour': "
+            "{'used_percentage': 15, 'resets_at': 4000000000}}})\n"
+            "subprocess.run(shlex.split(settings['statusLine']['command']), input=payload, text=True, check=True)\n"
+        )
+        fake.chmod(0o700)
+        with patch.dict(os.environ, {"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"}):
+            observation = rt.refresh_usage("claude")
+        self.assertEqual(rt.latest_reading(observation), 85)
+        self.assertEqual((self.state / "codex.json").read_text(), untouched)
+        command = rt.claude_usage_probe_command()
+        self.assertEqual(command[0], "claude")
+        self.assertNotIn("-p", command)
+        self.assertNotIn("codex", command)
+
+    def test_codex_refresh_reads_account_limits_without_a_model_turn(self):
+        with patch.object(rt, "codex_limits", return_value={"rateLimits": {"primary": {"usedPercent": 4}}}) as limits, \
+             patch.object(rt.subprocess, "run") as run:
+            observation = rt.refresh_usage("codex")
+        limits.assert_called_once()
+        run.assert_not_called()
+        self.assertEqual(rt.latest_reading(observation), 96)
+
+    def test_current_low_reading_is_not_queried(self):
+        rt.save_observation("claude", {"rate_limits": {"five_hour": {"used_percentage": 95}}})
+        with patch.object(rt, "refresh_usage") as refresh:
+            _observation, remaining, refreshed = rt.confirm_capacity("claude", 10)
+        refresh.assert_not_called()
+        self.assertFalse(refreshed)
+        self.assertEqual(remaining, 5)
+
+    def test_stale_low_reading_queries_only_the_named_provider(self):
+        rt.atomic_json(self.state / "claude.json", rt.normalize(
+            "claude", {"rate_limits": {"five_hour": {"used_percentage": 95}}}, now=100))
+        rt.atomic_json(self.state / "codex.json", rt.normalize(
+            "codex", {"rateLimits": {"primary": {"usedPercent": 95}}}, now=100))
+
+        def refresh(provider, cwd=None):
+            self.assertEqual(provider, "claude")
+            return rt.save_observation("claude", {"rate_limits": {"five_hour": {"used_percentage": 10}}})
+
+        with patch.object(rt, "refresh_usage", side_effect=refresh) as called:
+            _observation, remaining, refreshed = rt.confirm_capacity("claude", 10, now=10**9)
+        called.assert_called_once_with("claude", cwd=None)
+        self.assertTrue(refreshed)
+        self.assertEqual(remaining, 90)
+        self.assertEqual(rt.observed_time(rt.read_json(self.state / "codex.json")), 100)
 
 
 if __name__ == "__main__":

@@ -164,6 +164,17 @@ user) > the `default` key (project, otherwise user, otherwise
 `$SYNDICATE_RUNTIME`) > `claude`. For any other role: its own key (project,
 otherwise user) > `default` by that same chain.
 
+At launch, a command-line CLI (`-x`, `run-role --runtime`, or `--all-runtime`)
+is used as given. A CLI named in the user or project file, or by
+`$SYNDICATE_RUNTIME`, is used only when its remaining usage is above
+`handoff-reserve`. Otherwise Syndicate starts the installed CLI with the most
+remaining usage that is still above that reserve, compared monthly, then
+weekly, then the 5-hour window. With no CLI named in either
+file or the environment, it starts the one with the most remaining usage,
+using that same order.
+The built-in `claude` fallback is not a named CLI. See
+[Usage-aware handoffs](handoff.md).
+
 ## Project role files
 
 ### `.syndicate/roles/<role>.md`: replace a role, or add a new one
