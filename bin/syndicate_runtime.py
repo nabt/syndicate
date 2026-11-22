@@ -28,6 +28,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from stat import S_ISREG
 
+import syndicate_worktrees
+
 STATE = Path.home() / ".syndicate" / "limits"
 STALE_SECONDS = 180
 POLL_SECONDS = 30
@@ -1155,6 +1157,16 @@ def create_handoff(project, provider, task, reason, run_id, limited=None):
         except (OSError, subprocess.TimeoutExpired):
             (target / filename).write_text("Git snapshot unavailable.\n")
     atomic_json(target / "limits.json", {p: read_json(STATE / f"{p}.json") for p in ("claude", "codex")})
+    # The launcher writes run.json; status.json is agent-written. Prefer the
+    # launcher's task and also capture the status task when they differ.
+    current = read_json(local / "status.json").get("current")
+    task_ids = [read_json(local / "run.json").get("task_id"),
+                current.get("task_id") if isinstance(current, dict) else None]
+    task_ids = [t for t in dict.fromkeys(task_ids) if isinstance(t, str) and t]
+    try:
+        worktrees = syndicate_worktrees.capture_task_worktrees(target, project.resolve(), task_ids, run_id)
+    except Exception as error:  # noqa: BLE001 - the handoff itself must still be written
+        worktrees = f"## Task worktrees\n\nTask worktree capture failed: {error}\n"
     (target / "handoff.md").write_text(
         f"# Interrupted Syndicate work\n\nProvider: {provider}\n\nReason: {reason}\n\n"
         f"## Original request\n\n{task}\n\n"
@@ -1162,13 +1174,14 @@ def create_handoff(project, provider, task, reason, run_id, limited=None):
         "including untracked files; diffs are evidence, not a complete backup. "
         "Tools may have been interrupted. Complete outstanding tests and reviews. "
         "Native session IDs and conversations do not transfer.\n\n"
+        f"{worktrees}\n"
         f"Session output: .syndicate/runs/{run_id}.log\n")
     record = {"path": str(target), "provider": provider, "reason": reason, "state": "waiting_on_user"}
     if limited in PROVIDERS:
         record["limited_provider"] = limited
     atomic_json(local / "handoff.json", record)
     status = read_json(local / "status.json")
-    current = status.get("current") or {}
+    current = status.get("current") if isinstance(status.get("current"), dict) else {}
     current.update(role="chief-of-staff" if current.get("role") == "chief-of-staff" else "orchestrator",
                    round="handoff", summary=reason)
     status.update(state="waiting_on_user", current=current)
