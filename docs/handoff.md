@@ -65,9 +65,12 @@ monitor; use `syndicate limits --stop` for that.
    choose the current host after a legacy specialist lease causes a handoff.
    The prompt then names the exhausted provider and offers the host for every
    role. Pressing Enter, EOF, or non-interactive
-   input leaves work stopped. A target whose last recorded reading is at or
-   below the reserve is not launched, even if that reading is stale or its
-   reset time has passed; the message names `syndicate limits --forget`.
+   input leaves work stopped. A target whose recorded reading is not current
+   and is at or below the reserve is checked once, for that CLI only, before
+   it is refused. If the fresh reading is still at or below the reserve, it
+   is not launched. A reading that is already current is not queried again.
+   The refusal names `syndicate limits --forget` when the recorded reading
+   still decides, and again when a fresh reading is still too low.
 4. An approved switch starts a new conversation reading that handoff and uses
    the selected CLI for every role in that run. Saved project assignments are
    unchanged. Outstanding tests and reviews remain outstanding.
@@ -118,12 +121,44 @@ Syndicate launches, and provider configuration directories are not modified.
   the other providers. The host's own reserve still triggers the project
   handoff, which needs user confirmation to switch providers.
 - **Latest real reading:** enforcement uses each provider's most recently
-  recorded percentages (the most constrained window), even when that reading
-  is stale (older than 180 seconds) or its reset time has passed. A passed
-  reset is never treated as restored capacity, and no quota is inferred from
-  tokens or elapsed time. Limitation: consumption after the last reading goes
+  recorded percentages, even when that reading is stale (older than 180
+  seconds) or its reset time has passed. A passed reset is never treated as
+  restored capacity, and no quota is inferred from tokens or elapsed time.
+  Three budgets are recognized: monthly, weekly, and 5-hour. They are judged
+  in that order. The first one at or below the reserve decides the refusal.
+  When every recognized budget is above the reserve, the tightest one still
+  counts, so a 5-hour window can block on its own. Choosing the engine with
+  the most usage left compares those same budgets in that order. Claude's
+  status line supplies `five_hour`, `seven_day`, and `spend_limit` (a monthly
+  total unless its `period` says weekly or daily). Codex slots are not names:
+  `windowDurationMins` classifies each one, and `individualLimit` is the
+  monthly spend cap. Limitation: consumption after the last reading goes
   undetected until a new reading arrives, so a silent provider can cross the
   reserve unnoticed.
+- **Choosing a CLI at startup:** before a host session, a specialist, or the
+  Chief starts, Syndicate chooses the engine unless the command line named one
+  (`-x`, `run-role --runtime`, or `--all-runtime`). A CLI named in the user or
+  project file, or by `$SYNDICATE_RUNTIME`, is used when its remaining usage is
+  above the reserve. Otherwise the installed CLI with the most remaining usage
+  above the reserve is used, compared monthly, then weekly, then 5-hour.
+  With no CLI named in either file or the
+  environment, that fullest engine is always the one started. The built-in
+  `claude` fallback is not a named CLI. A configured CLI that is already
+  current and above the reserve is not compared with the other engine. A
+  recorded reading the choice still depends on is queried when it is not
+  current. A CLI that has never recorded a reading is not queried.
+  Codex uses `account/rateLimits/read` and starts no model turn. Claude's
+  status line does not run in print mode, so its check is one short terminal
+  turn: Sonnet, low effort, tools disabled, and the prompt `ok`. The session
+  stops as soon as `rate_limits` are recorded, and that throwaway session is
+  removed. A current reading is not queried again. If a query fails, the last
+  recorded reading still decides. A read-only role configured for Codex does
+  not move onto Claude.
+- **One check before a stale refusal:** when the CLI is already chosen and the
+  reading that would refuse its launch is stale or awaiting reset confirmation,
+  Syndicate queries that CLI once and decides from the new reading. The same
+  Codex read and Claude turn described above are used. A launch decision does
+  not query that CLI a second time.
 - **Unknown or stale data (project sessions):** stale, awaiting-reset, or
   missing telemetry never stops a running session by itself. The supervisor
   warns once per provider per state change: it prints a warning when a
@@ -136,12 +171,13 @@ Syndicate launches, and provider configuration directories are not modified.
   itself the source of Claude telemetry, so refusing would prevent the first
   reading. Malformed telemetry files (non-numeric, out-of-range, or
   non-finite values) are treated as no reading.
-- **Specialist backoff:** `run-role` starts with the configured provider.
-  Upon a provider usage-limit failure or a refusal at the reserve, it reads
-  the global last-known usage of each supported CLI on `PATH` and retries on
-  the provider with the highest recorded usable percentage. Each provider
-  gets at most one attempt. A missing reading is unknown. If all installed
-  providers are known to have reached a limit or reserve, the task is marked
+- **Specialist backoff:** without `--runtime`, `run-role` applies the startup
+  choice above, then starts that provider. `--runtime` pins the first attempt.
+  Upon a provider usage-limit failure or a refusal at the reserve, it refreshes
+  any non-current reading for the remaining CLIs on `PATH` and retries on the
+  provider with the highest usable percentage. Each provider gets at most one
+  attempt. A missing reading is unknown. If all installed providers are known
+  to have reached a limit or reserve, the task is marked
   **On hold** and the command exits with status 75. The launcher passes a run
   ID in `SYNDICATE_RUN_ID` so a specialist can update its owning task. Keep
   this variable in the host CLI's shell environment policy. An unbound,
@@ -149,7 +185,9 @@ Syndicate launches, and provider configuration directories are not modified.
   their isolated workspace to run shell checks and cannot fall back to Claude.
   The launch gate uses the stricter of the configured `handoff-reserve` and
   the active run's reserve.
-  A stale reading above that gate is accepted with a warning. The command
+  A non-current reading at or below that gate is refreshed once for that
+  provider before the specialist is refused. A stale reading above the gate
+  is accepted with a warning, without another query. The command
   continues using the active run's reserve while the specialist runs.
   Claude roles in text mode use structured results internally and print the
   result text. Explicit JSON and streaming JSON output pass through directly.
@@ -221,11 +259,12 @@ Syndicate launches, and provider configuration directories are not modified.
   supervised run is live (no `run.json`, or `session.lock` missing or free;
   for example, `syndicate team run-role` started by hand), the runner enforces
   the configured reserve locally and does not write a lease.
-- **Recovering from an outdated low reading:** a Claude reading only refreshes
-  while an interactive Claude session runs through Syndicate, so a stale
-  reading at or below the reserve would otherwise block Claude host preflight,
-  Claude specialists, and a Claude handoff target indefinitely. If you know it
-  is outdated (for example, the window has since reset), run
+- **Recovering from an outdated low reading:** before a stale or
+  awaiting-reset reading at or below the reserve can refuse a launch,
+  Syndicate queries that one CLI as described above. A fresh reading above
+  the reserve is launched. If the query fails, or the fresh reading is still
+  at or below the reserve, the launch stays refused. If you know a recorded
+  reading is outdated and the query cannot replace it, run
   `syndicate limits --forget claude` (or `codex`). It removes only
   `~/.syndicate/limits/<provider>.json` (never through a symbolic link) and
   says so; until a new reading is recorded, the reserve cannot be enforced for
@@ -234,8 +273,10 @@ Syndicate launches, and provider configuration directories are not modified.
   reset on its own. The preflight block, the launch-gate refusal, and the
   post-handoff "leaving work stopped" message all name this command.
 - **Chief of Staff:** missing, stale, or awaiting-reset telemetry
-  never triggers a Chief shutdown. Preflight and running supervision enforce
-  the latest recorded percentages, even after their expected reset. If an
+  never triggers a Chief shutdown by itself. Preflight refreshes a non-current
+  reading at or below the reserve once, for the Chief's CLI only, then enforces
+  that reading. Running supervision keeps enforcing the latest recorded
+  percentages, even after their expected reset. If an
   active statusline stops updating, consumption past the reserve goes undetected
   until the next reading; silence does not prove capacity. This applies with
   `--no-live` and in headless mode too. Unlike project sessions, the Chief does

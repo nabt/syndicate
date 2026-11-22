@@ -92,14 +92,22 @@ commands and maintains its own checkpoint; it does not implement project work
 or directly delegate to specialists.
 
 Quota supervision uses the existing monitor and defaults to a 10% reserve;
-`--reserve` changes it. Chief sessions enforce the most recent real usage
-reading, including stale readings or readings awaiting reset confirmation.
-Unknown or missing usage never stops a Chief, including headless runs and runs
-with `--no-live`. A recorded value at or below the reserve still stops it;
-a reset time passing does not replenish recorded capacity. Project sessions
-apply the same latest-reading rule to their host (and to a delegated provider
-while its specialist runs) but also print telemetry warnings and gate
-specialist launches; see [Usage-aware handoffs](handoff.md#usage-sources-and-limitations).
+`--reserve` changes it. Without `-x`, startup uses the same choice as a
+project session: the snapshot provider on resume, otherwise the user-file or
+`$SYNDICATE_RUNTIME` default, and only while that CLI is above the reserve.
+Otherwise the Chief starts on the engine with the most usage left, compared
+monthly, then weekly, then the 5-hour window. `-x` pins
+the CLI. Before a non-current reading at or below the reserve can stop
+preflight, that CLI is queried once (Codex through the app-server rate-limit
+read, which starts no model turn; Claude through one short Sonnet turn on a
+terminal, stopped once its status line publishes limits). A fresh reading that
+is still at or below the reserve stops the session. A current reading is enforced as recorded, including after
+its expected reset. Unknown or missing usage never stops a Chief, including
+headless runs and runs with `--no-live`. A reset time passing does not
+replenish recorded capacity. Project sessions apply the same rule to their
+host (and to a delegated provider while its specialist runs) but also print
+telemetry warnings and gate specialist launches; see
+[Usage-aware handoffs](handoff.md#usage-sources-and-limitations).
 
 Claude's statusline may stop updating while the Chief waits for its inbox. It
 may also stop updating during active work: in that case consumption can cross
@@ -115,8 +123,9 @@ syndicate chief-of-staff --handoff /path/to/chief/handoff
 syndicate chief-of-staff -x codex --handoff /path/to/chief/handoff
 ```
 
-A resumed session defaults to the snapshot's provider, even when the runtime
-environment default has changed. Only Chief of Staff snapshots with valid
+A resumed session prefers the snapshot's provider when that CLI is above the
+reserve, even when the runtime environment default has changed. `-x` pins the
+resume to one CLI. Only Chief of Staff snapshots with valid
 status and checkpoints are accepted. On resume, the agent reads the snapshot
 and reconciles it with fresh portfolio records; it preserves unresolved work
 without assuming that interrupted actions succeeded.

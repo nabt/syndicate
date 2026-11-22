@@ -159,9 +159,11 @@ class Closeout(ProjectCase):
         self.usage('claude', 99, observed_at=100)
         self.fake_cli('codex', 'raise AssertionError("no quota left")')
         self.fake_cli('claude', 'raise AssertionError("no quota left")')
-        result, out, err = self.invoke_role('--runtime', 'codex')
+        with patch.object(sy.runtime, 'refresh_usage', return_value=None):
+            result, out, err = self.invoke_role('--runtime', 'codex')
         self.assertEqual((result, out), (75, ''))
         self.assertIn('task is on hold', err)
+        self.assertIn('did not return a new reading', err)
         self.assertEqual(sy.read_status(str(self.project))['state'], 'on_hold')
 
     def test_role_from_previous_run_cannot_hold_new_owning_task(self):
