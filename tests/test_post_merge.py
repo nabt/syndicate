@@ -64,7 +64,44 @@ class PostMergeCleanupTests(unittest.TestCase):
                        mergedAt="2026-11-21T10:00:00Z")
         return merge
 
-    def cleanup(self, *, move_remote=False, switch_main=False, worktree=None):
+    def squash(self, *, edit=None, push=True):
+        """Squash-merge the PR on main; edit(path) may change the work tree before committing."""
+        self.git(self.integrator, "fetch", "origin")
+        self.git(self.integrator, "merge", "--squash", f"origin/{self.branch}")
+        if edit:
+            edit(self.integrator)
+            self.git(self.integrator, "add", "-A")
+        self.git(self.integrator, "commit", "-m", "squashed PR")
+        merge = self.git(self.integrator, "rev-parse", "HEAD")
+        if push:
+            self.git(self.integrator, "push", "origin", "main")
+        self.pr.update(state="MERGED", mergeCommit={"oid": merge}, mergedAt="2026-11-21T10:00:00Z")
+        return merge
+
+    def task_commit(self, name, text, message):
+        (self.task / name).write_text(text)
+        self.git(self.task, "add", name)
+        self.git(self.task, "commit", "-m", message)
+        self.head = self.git(self.task, "rev-parse", "HEAD")
+        self.git(self.task, "push", "origin", self.branch)
+        self.pr["headRefOid"] = self.head
+        return self.head
+
+    def main_commit(self, name, text):
+        (self.integrator / name).write_text(text)
+        self.git(self.integrator, "add", name)
+        self.git(self.integrator, "commit", "-m", f"main change to {name}")
+        self.git(self.integrator, "push", "origin", "main")
+
+    def assert_cleaned(self, target, repo=None):
+        repo = repo or self.repo
+        self.assertFalse(self.task.exists())
+        self.assertEqual(self.git(repo, "branch", "--list", self.branch), "")
+        self.assertEqual(self.git(self.remote, "branch", "--list", self.branch), "")
+        self.assertEqual(self.git(repo, "rev-parse", "HEAD"), target)
+
+    def cleanup(self, *, move_remote=False, switch_main=False, worktree=None, repo=None,
+                series_guard=None):
         run = syndicate_git._run
 
         def run_with_mock_pr(path, command, expected=(0,)):
@@ -83,8 +120,8 @@ class PostMergeCleanupTests(unittest.TestCase):
         with patch.object(syndicate_git, "_run", side_effect=run_with_mock_pr), patch.object(
             syndicate_git, "_github_repository", return_value="github.com/example/project"
         ):
-            syndicate_git.cleanup_pr(self.repo, 123, self.branch, worktree or self.task,
-                                     self.messages.append)
+            syndicate_git.cleanup_pr(repo or self.repo, 123, self.branch, worktree or self.task,
+                                     self.messages.append, series_guard=series_guard)
 
     def assert_artifacts(self, main=None):
         self.assertTrue(self.task.is_dir())
@@ -219,8 +256,12 @@ class PostMergeCleanupTests(unittest.TestCase):
     def test_main_not_checked_out_leaves_artifacts_intact(self):
         self.merge()
         self.git(self.repo, "switch", "-c", "different-task")
-        with self.assertRaisesRegex(syndicate_git.CleanupError, "No local main checkout"):
+        with self.assertRaisesRegex(syndicate_git.CleanupError, "No local main checkout") as caught:
             self.cleanup()
+        self.assertIn(f"registered in {self.repo}", str(caught.exception))
+        self.assertIn("clean checkout of main", str(caught.exception))
+        self.assertIn("before changing any task branch or worktree", str(caught.exception))
+        self.assertIn("worktree add PATH main", str(caught.exception))
         self.assert_artifacts()
         self.assertEqual(self.git(self.repo, "branch", "--show-current"), "different-task")
 
@@ -252,9 +293,186 @@ class PostMergeCleanupTests(unittest.TestCase):
         self.assert_artifacts()
         self.assertTrue(other.is_dir())
 
-    def test_unproven_squash_ancestry_preserves_task_artifacts(self):
-        self.merge(squash=True)
-        with self.assertRaisesRegex(syndicate_git.CleanupError, "cannot be proven"):
+    def test_squash_merge_with_edited_content_preserves_task_artifacts(self):
+        # Conflict resolution (or a concurrent main change) altered a PR file in the merge commit.
+        self.squash(edit=lambda path: (path / "feature.txt").write_text("resolved differently\n"))
+        with self.assertRaisesRegex(syndicate_git.CleanupError,
+                                    "content could not be proven.*feature.txt.*were preserved"):
+            self.cleanup()
+        self.assert_artifacts()
+
+    def test_squash_merge_after_concurrent_main_change_to_pr_file_preserves(self):
+        self.task_commit("shared.txt", "task version\n", "task edits shared file")
+        self.main_commit("shared.txt", "main version\n")
+        # Squash the PR's other file only; main keeps its own shared.txt.
+        self.git(self.integrator, "checkout", f"origin/{self.branch}", "--", "feature.txt")
+        self.git(self.integrator, "commit", "-m", "partial squash")
+        self.git(self.integrator, "push", "origin", "main")
+        self.pr.update(state="MERGED", mergeCommit={"oid": self.git(self.integrator, "rev-parse", "HEAD")})
+        with self.assertRaisesRegex(syndicate_git.CleanupError, "content could not be proven.*shared.txt"):
+            self.cleanup()
+        self.assert_artifacts()
+
+    def test_merge_commit_lacking_pr_changes_preserves_task_artifacts(self):
+        # GitHub reports a main commit that does not carry the PR's change.
+        self.main_commit("unrelated.txt", "main only\n")
+        self.pr.update(state="MERGED", mergeCommit={"oid": self.git(self.integrator, "rev-parse", "HEAD")})
+        with self.assertRaisesRegex(syndicate_git.CleanupError, "content could not be proven"):
+            self.cleanup()
+        self.assert_artifacts()
+
+    def test_squash_merge_missing_pr_deletion_preserves_task_artifacts(self):
+        self.git(self.task, "rm", "-q", ".gitignore")
+        self.git(self.task, "commit", "-m", "drop ignore file")
+        self.head = self.git(self.task, "rev-parse", "HEAD")
+        self.git(self.task, "push", "origin", self.branch)
+        self.pr["headRefOid"] = self.head
+        self.squash(edit=lambda path: (path / ".gitignore").write_text("*.cache\n"))
+        with self.assertRaisesRegex(syndicate_git.CleanupError, "content could not be proven.*gitignore"):
+            self.cleanup()
+        self.assert_artifacts()
+
+    def test_squash_merge_cleans_task_artifacts(self):
+        target = self.squash()
+        self.cleanup()
+        self.assert_cleaned(target)
+        self.assertEqual((self.repo / "feature.txt").read_text(), "task change\n")
+        self.assertTrue(any(f"Verified squash/rebase merge: task branch tip {self.head} equals PR head and "
+                            f"its 1 changed paths match merge commit {target}" in message
+                            for message in self.messages))
+
+    def test_squash_merge_with_renames_deletions_and_modes_cleans_up(self):
+        self.git(self.task, "mv", "feature.txt", "renamed.txt")
+        self.git(self.task, "rm", "-q", ".gitignore")
+        (self.task / "tool.sh").write_text("#!/bin/sh\n")
+        (self.task / "tool.sh").chmod(0o755)
+        (self.task / "blob.bin").write_bytes(bytes(range(256)))
+        self.git(self.task, "add", "-A")
+        self.git(self.task, "commit", "-m", "rename, delete, executable and binary")
+        self.head = self.git(self.task, "rev-parse", "HEAD")
+        self.git(self.task, "push", "origin", self.branch)
+        self.pr["headRefOid"] = self.head
+        self.main_commit("unrelated.txt", "concurrent main change\n")
+        target = self.squash()
+        self.cleanup()
+        self.assert_cleaned(target)
+        self.assertTrue(any("its 4 changed paths match" in message for message in self.messages))
+
+    def test_squash_merge_with_changed_mode_in_merge_commit_preserves(self):
+        (self.task / "tool.sh").write_text("#!/bin/sh\n")
+        (self.task / "tool.sh").chmod(0o755)
+        self.git(self.task, "add", "tool.sh")
+        self.git(self.task, "commit", "-m", "add tool")
+        self.head = self.git(self.task, "rev-parse", "HEAD")
+        self.git(self.task, "push", "origin", self.branch)
+        self.pr["headRefOid"] = self.head
+        self.squash(edit=lambda path: (path / "tool.sh").chmod(0o644))
+        with self.assertRaisesRegex(syndicate_git.CleanupError, "content could not be proven.*tool.sh"):
+            self.cleanup()
+        self.assert_artifacts()
+
+    def test_squash_merge_checks_gitlink_entries(self):
+        (self.task / "vendored").mkdir()  # An unpopulated submodule keeps a clean status.
+        self.git(self.task, "update-index", "--add", "--cacheinfo", f"160000,{self.head},vendored")
+        self.git(self.task, "commit", "-m", "add gitlink")
+        self.head = self.git(self.task, "rev-parse", "HEAD")
+        self.git(self.task, "push", "origin", self.branch)
+        self.pr["headRefOid"] = self.head
+        self.squash(edit=lambda path: self.git(path, "update-index", "--cacheinfo",
+                                               f"160000,{self.start},vendored"))
+        with self.assertRaisesRegex(syndicate_git.CleanupError, "content could not be proven.*vendored"):
+            self.cleanup()
+        self.assert_artifacts()
+
+    def test_rebase_merge_cleans_task_artifacts(self):
+        first = self.head
+        self.task_commit("second.txt", "second\n", "second task change")
+        self.main_commit("unrelated.txt", "concurrent main change\n")
+        self.git(self.integrator, "fetch", "origin")
+        for commit in (first, self.head):
+            self.git(self.integrator, "cherry-pick", commit)
+        target = self.git(self.integrator, "rev-parse", "HEAD")
+        self.git(self.integrator, "push", "origin", "main")
+        self.pr.update(state="MERGED", mergeCommit={"oid": target}, mergedAt="2026-11-21T10:00:00Z")
+        self.cleanup()
+        self.assert_cleaned(target)
+        self.assertTrue(any("its 2 changed paths match" in message for message in self.messages))
+
+    def test_squash_merge_with_extra_local_commit_preserves(self):
+        self.squash()
+        self.git(self.task, "commit", "--allow-empty", "-m", "local task work")
+        local_tip = self.git(self.task, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(syndicate_git.CleanupError,
+                                    f"Local task branch tip {local_tip} .*differs from PR head"):
+            self.cleanup()
+        self.assertTrue(self.task.is_dir())
+        self.assertEqual(self.git(self.repo, "rev-parse", self.task_ref), local_tip)
+        self.assertEqual(self.git(self.remote, "rev-parse", self.task_ref), self.head)
+        self.assertEqual(self.git(self.repo, "rev-parse", "HEAD"), self.start)
+
+    def test_squash_merge_with_local_tip_behind_pr_head_preserves(self):
+        first = self.head
+        self.task_commit("second.txt", "second\n", "second task change")
+        self.squash()
+        self.git(self.task, "reset", "-q", "--hard", first)
+        with self.assertRaisesRegex(syndicate_git.CleanupError, f"Local task branch tip {first}"):
+            self.cleanup()
+        self.assertTrue(self.task.is_dir())
+        self.assertEqual(self.git(self.repo, "rev-parse", self.task_ref), first)
+        self.assertEqual(self.git(self.remote, "rev-parse", self.task_ref), self.head)
+        self.assertEqual(self.git(self.repo, "rev-parse", "HEAD"), self.start)
+
+    def test_squash_merge_with_different_remote_tip_preserves(self):
+        self.squash()
+        self.git(self.task, "commit", "--allow-empty", "-m", "pushed after merge")
+        moved = self.git(self.task, "rev-parse", "HEAD")
+        self.git(self.task, "push", "origin", self.branch)
+        self.git(self.task, "reset", "-q", "--hard", self.head)
+        with self.assertRaisesRegex(syndicate_git.CleanupError, f"Remote task branch tip {moved}"):
+            self.cleanup()
+        self.assertTrue(self.task.is_dir())
+        self.assertEqual(self.git(self.repo, "rev-parse", self.task_ref), self.head)
+        self.assertEqual(self.git(self.remote, "rev-parse", self.task_ref), moved)
+        self.assertEqual(self.git(self.repo, "rev-parse", "HEAD"), self.start)
+
+    def test_squash_merge_fetches_missing_pr_head_without_creating_refs(self):
+        target = self.squash()
+        fresh = self.task.parent / "fresh"
+        self.git(self.task.parent, "clone", "-q", "--no-local", "--single-branch", "--branch", "main", str(self.remote),
+                 str(fresh))
+        self.git(fresh, "reset", "-q", "--hard", self.start)
+        refs_before = self.git(fresh, "for-each-ref", "--format=%(refname)")
+        self.assertNotEqual(subprocess.run(("git", "cat-file", "-e", self.head), cwd=fresh).returncode, 0)
+        self.cleanup(repo=fresh, worktree=self.task.parent / "absent task")
+        self.assertEqual(self.git(self.remote, "branch", "--list", self.branch), "")
+        self.assertEqual(self.git(fresh, "rev-parse", "HEAD"), target)
+        self.assertEqual(self.git(fresh, "for-each-ref", "--format=%(refname)"), refs_before)
+        self.assertTrue(any("Verified squash/rebase merge" in message for message in self.messages))
+
+    def test_squash_merge_honors_syndicate_lock_and_series_guard(self):
+        self.git(self.repo, "worktree", "lock", "--reason", "syndicate: task-123", str(self.task))
+        target = self.squash()
+        active = [True]
+        calls = []
+
+        def guard(path):
+            calls.append(path)
+            if active[0]:
+                raise syndicate_git.CleanupError("series work/task-123 is still active: task-b")
+
+        with self.assertRaisesRegex(syndicate_git.CleanupError, "still active"):
+            self.cleanup(series_guard=guard)
+        self.assert_artifacts()
+        self.assertIn("locked syndicate: task-123", self.git(self.repo, "worktree", "list", "--porcelain"))
+        active[0] = False
+        self.cleanup(series_guard=guard)
+        self.assert_cleaned(target)
+        self.assertEqual(calls, [self.task.resolve()] * 3)
+
+    def test_squash_merge_rejects_foreign_lock(self):
+        self.git(self.repo, "worktree", "lock", "--reason", "someone else's", str(self.task))
+        self.squash()
+        with self.assertRaisesRegex(syndicate_git.CleanupError, "locked by another tool"):
             self.cleanup()
         self.assert_artifacts()
 

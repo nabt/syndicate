@@ -120,9 +120,64 @@ def _clean(path: Path, label: str, *, ignored: bool = False) -> None:
             raise CleanupError(f"{label} has a Git operation in progress: {name}")
 
 
-def _check_tip(repo: Path, tip: str | None, pr_head: str, main_tip: str, label: str) -> None:
-    if tip and (not _ancestor(repo, tip, main_tip) or not _ancestor(repo, tip, pr_head)):
-        raise CleanupError(f"{label} tip {tip} cannot be proven part of the merged PR history")
+def _has_commit(repo: Path, oid: str) -> bool:
+    return _git(repo, "rev-parse", "--quiet", "--verify", f"{oid}^{{commit}}",
+                expected=(0, 1)).returncode == 0
+
+
+def _merged_by_ancestry(repo: Path, tips: list[tuple[str, str]], pr_head: str, main_tip: str) -> bool:
+    """True when every existing task tip is in both origin/main and the PR head history."""
+    return all(_has_commit(repo, tip) and _has_commit(repo, pr_head)
+               and _ancestor(repo, tip, main_tip) and _ancestor(repo, tip, pr_head) for _, tip in tips)
+
+
+def _tree_entries(repo: Path, commit: str) -> dict[str, tuple[str, str]]:
+    """Map every blob and gitlink path of commit to its (mode, object id)."""
+    entries = {}
+    for record in _git(repo, "ls-tree", "-r", "-z", "--full-tree", commit).stdout.split("\0"):
+        if record:
+            meta, _, name = record.partition("\t")
+            mode, _, oid = meta.split(" ")
+            entries[name] = (mode, oid)
+    return entries
+
+
+def _squash_changed_paths(repo: Path, pr_head: str, commit: str) -> int:
+    """Prove a squash or rebase merge commit carries the PR head's content.
+
+    The PR's changes are the paths that differ between pr_head and its merge
+    base with the merge commit (the fork point main had when the PR merged; with
+    several bases, the union of their differences). Each such path must have the
+    same mode and object id at the merge commit as at pr_head, or be absent from
+    both. Raises CleanupError otherwise; returns the number of paths verified."""
+    bases = _git(repo, "merge-base", "--all", pr_head, commit, expected=(0, 1)).stdout.split()
+    if not bases:
+        raise CleanupError(f"PR head {pr_head} shares no history with merge commit {commit}")
+    paths: set[str] = set()
+    for base in bases:
+        # Plumbing with -z and --no-renames: renames count as delete plus add, and
+        # deletions, mode changes, gitlinks and binary files are listed like any path.
+        changed = _git(repo, "diff-tree", "-r", "-z", "--no-renames", "--no-ext-diff", "--no-textconv",
+                       "--ignore-submodules=none", "--name-only", base, pr_head).stdout
+        paths.update(name for name in changed.split("\0") if name)
+    head_entries = _tree_entries(repo, pr_head)
+    merged_entries = _tree_entries(repo, commit)
+    differing = sorted(name for name in paths if head_entries.get(name) != merged_entries.get(name))
+    if differing:
+        shown = ", ".join(differing[:5]) + (f" and {len(differing) - 5} more" if len(differing) > 5 else "")
+        raise CleanupError(
+            f"Squash/rebase merge content could not be proven: {len(differing)} of {len(paths)} paths "
+            f"changed by PR head {pr_head} differ in merge commit {commit} ({shown}). "
+            "Task branches and worktree were preserved")
+    return len(paths)
+
+
+def _check_exact_tip(tip: str | None, pr_head: str, label: str) -> None:
+    if tip and tip != pr_head:
+        raise CleanupError(
+            f"{label} tip {tip} cannot be proven part of the merged PR history: it is not contained in "
+            f"origin/main and differs from PR head {pr_head}. A squash or rebase merge is accepted only "
+            "when every task branch tip equals the PR head exactly. Task branches and worktree were preserved")
 
 
 def _delete_remote_branch(repo: Path, push_url: str, task_ref: str, remote_tip: str) -> None:
@@ -258,14 +313,17 @@ def cleanup_pr(repo: Path, number: int, branch: str, path: Path,
     worktrees = _worktrees(repo)
     main_record = next((wt for wt in worktrees if wt.get("branch") == MAIN), None)
     if main_record is None:
-        raise CleanupError("No local main checkout is registered")
+        raise CleanupError(
+            f"No local main checkout is registered in {repo}. Cleanup needs a clean checkout of main to "
+            "synchronize after removing task artifacts, so it stopped before changing any task branch or "
+            "worktree. Add one and rerun cleanup, for example: "
+            f"git -C {shlex.quote(str(repo))} worktree add PATH main")
     main_path = Path(main_record["worktree"])
     main_head = _check_main(main_path, main_tip)
     path = path.resolve()
     task_exists = _check_task_worktree(repo, path, task_ref, worktrees)
 
     local_tip = _ref_oid(repo, task_ref)
-    _check_tip(repo, local_tip, pr_head, main_tip, "Local task branch")
     push_urls = _git(repo, "remote", "get-url", "--push", "--all", "origin").stdout.splitlines()
     if len(push_urls) != 1 or _github_repository(push_urls[0]).casefold() != repository.casefold():
         raise CleanupError("Origin push URL does not match the verified GitHub repository")
@@ -276,7 +334,23 @@ def cleanup_pr(repo: Path, number: int, branch: str, path: Path,
         if len(parts) != 2 or not OID.fullmatch(parts[0]) or parts[1] != task_ref:
             raise CleanupError(f"Could not verify remote task branch {task_ref}")
         remote_tip = parts[0]
-    _check_tip(repo, remote_tip, pr_head, main_tip, "Remote task branch")
+    tips = [(label, tip) for label, tip in (("Local task branch", local_tip),
+                                            ("Remote task branch", remote_tip)) if tip]
+    if not _merged_by_ancestry(repo, tips, pr_head, main_tip):
+        # Squash or rebase merge: the tips must be exactly the PR head and the
+        # merge commit must carry every change of the PR head.
+        for label, tip in tips:
+            _check_exact_tip(tip, pr_head, label)
+        if not _has_commit(repo, pr_head):
+            # Download the inspected remote tip's objects without updating any ref.
+            _git(repo, "fetch", "--no-tags", "--no-prune", "--no-prune-tags", "--no-auto-maintenance",
+                 "--no-recurse-submodules", "--no-write-fetch-head", "--refmap=", "origin", task_ref)
+            if not _has_commit(repo, pr_head):
+                raise CleanupError(f"PR head {pr_head} is not available locally, so the squash/rebase "
+                                   "merge content cannot be verified. Task branches and worktree were preserved")
+        count = _squash_changed_paths(repo, pr_head, commit)
+        report(f"Verified squash/rebase merge: task branch tip {pr_head} equals PR head and its "
+               f"{count} changed paths match merge commit {commit}.")
 
     if remote_tip:
         _delete_remote_branch(repo, push_urls[0], task_ref, remote_tip)
