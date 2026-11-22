@@ -58,9 +58,10 @@ monitor; use `syndicate limits --stop` for that.
    the model loop, so this does not require another inference request.
 2. It creates `.syndicate/handoffs/<id>/` containing the original request,
    semantic checkpoint, previous status/history, quota observations, and staged
-   and unstaged diffs. Session output is retained in `.syndicate/runs/<id>.log`.
-   The live worktree, including untracked files, remains in place. The snapshot
-   is recovery context, not a complete project backup.
+   and unstaged diffs of the launch directory. Session output is retained in
+   `.syndicate/runs/<id>.log`. The live worktree, including untracked files,
+   remains in place. See [Task worktrees](#task-worktrees) for the snapshot of
+   the task's own worktree.
 3. It asks whether to stop or choose a CLI for continuation. You can also
    choose the current host after a legacy specialist lease causes a handoff.
    The prompt then names the exhausted provider and offers the host for every
@@ -82,6 +83,72 @@ are also terminated with PID identity checks. Unrelated terminal sessions are
 not stopped. Independently daemonized work that escapes tracking is outside
 this supervisor; do not launch such workers for managed tasks. A killed tool
 may leave partial changes that the next orchestrator must inspect.
+
+## Task worktrees
+
+Every project task works in a linked worktree that Syndicate creates and
+locks:
+
+```sh
+syndicate tasks worktree TASK_ID -C SOURCE --repo REPO --branch work/topic-1234 \
+  [--series NAME] [--base REF] [--json]
+```
+
+The worktree lives at
+`~/.syndicate/worktrees/<repo>-<hash>/<branch with / replaced by ->`, where
+`<hash>` is the first 8 hex digits of the SHA-1 of the repository's real Git
+common directory. `$SYNDICATE_WORKTREE_ROOT` replaces `~/.syndicate/worktrees`.
+Locations that do not survive a restart are refused: the system temporary
+directory, `/tmp`, `/var/tmp`, `/dev/shm`, `/run`, `$TMPDIR`,
+`$XDG_RUNTIME_DIR`, and on Linux any tmpfs or ramfs mount. The command prints
+the absolute path (or the registry entry with `--json`).
+
+An existing branch is checked out. A new branch starts from `--base` (default
+`origin/main`, else `main`, else `HEAD`) without upstream tracking, so a push
+cannot reach the base branch by accident. A branch that exists only on origin
+tracks `origin/<branch>`. The worktree is locked against `git worktree prune`
+as it is created, with the reason
+`syndicate: task series <series> (task <id>); do not prune until series complete`.
+The series defaults to the branch name. Rerunning the command is safe: it
+re-adopts the worktree, locks it again if needed, and adds a later task ID of
+the same series. A branch already checked out somewhere else, for example in
+an ad hoc `/tmp` worktree, is not moved silently; the error explains how to
+move it.
+
+`~/.syndicate/worktrees/registry.json` records each worktree's path, main
+checkout, Git common directory, branch, series, base, task IDs, launch source,
+creation time and lock reason. A handoff looks up the current task's worktrees
+there (and others of its series) and writes `worktrees/<branch>/` in the
+handoff directory:
+
+| File | Contents |
+|---|---|
+| `info.json` | path, branch, HEAD, base, series, `exists`, `locked`, snapshot ref and commit |
+| `git-status.txt` | `git status --porcelain=v1 --branch --untracked-files=all` |
+| `worktree.diff` / `staged.diff` | `git diff --binary HEAD` / `git diff --cached --binary` |
+| `untracked.txt` | untracked, non-ignored files |
+| `unpushed.log` | commits not on the upstream (or base, when there is none) |
+
+It also records a recovery commit of tracked and untracked, non-ignored files
+at `refs/syndicate/snapshots/<branch>/<handoff id>` in the shared repository.
+A temporary index inside the handoff directory builds it; the worktree, its
+index and `HEAD` are unchanged. `handoff.md` lists each worktree under
+`## Task worktrees`, or says that none is registered. A missing worktree
+directory is reported, not fatal. To recover a lost directory:
+
+```sh
+git -C REPO worktree unlock PATH && git -C REPO worktree prune
+git -C REPO worktree add PATH BRANCH
+git -C PATH restore --source refs/syndicate/snapshots/<branch>/<id> --worktree -- .
+```
+
+Handoffs, session exits and quota stops never unlock or remove a task
+worktree. `syndicate tasks cleanup-pr` does that after it verifies the merge:
+it accepts only a lock whose reason starts with `syndicate:`, refuses while
+another registered task of the series is neither done nor ended, then unlocks
+immediately before `git worktree remove` and drops the registry entry.
+Pass `--task TASK_ID` for the task running the cleanup; it defaults to the
+current task of the worktree's launch source.
 
 ## The bundled skill
 

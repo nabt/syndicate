@@ -27,6 +27,16 @@ dependent work and close the task as blocked with `--role-blocker ROLE REASON`.
 Preserve completed work and outstanding verification. A relay counts only once
 its underlying specialist actually performs the work.
 
+## Task worktrees
+
+Create each project task's worktree with `syndicate tasks worktree TASK_ID -C
+SOURCE --repo REPO --branch TASK_BRANCH` before any edits, never under a
+temporary directory, and keep task work out of the main checkout. Commit work
+in progress to the task branch after each specialist returns; push `work/*`
+branches once a PR is intended. Leave the worktree and its Syndicate lock in
+place at every stop, including handoffs, quota stops, and session exit. Only
+post-merge cleanup unlocks and removes it.
+
 ## Closeout checklist
 
 Requester-reported external outcomes must be verified before confirming them.
@@ -44,7 +54,7 @@ owning task's `delegated_closeout_required` flag when present.
    PR, run the post-merge check before committing closeout:
 
    ```sh
-   syndicate tasks cleanup-pr NUMBER -C REPO --branch TASK_BRANCH --worktree TASK_WORKTREE
+   syndicate tasks cleanup-pr NUMBER -C REPO --branch TASK_BRANCH --worktree TASK_WORKTREE --task TASK_ID
    ```
 
    Take the PR, branch and absolute linked worktree path from the current
@@ -65,7 +75,11 @@ owning task's `delegated_closeout_required` flag when present.
    both fetched `origin/main` and the PR head reported by GitHub. Squash or
    rebase merges can lack that ancestry and then require preserving the branch
    and reporting why cleanup stopped. A dirty task worktree, including its
-   ignored files, stops cleanup. A remote branch that is already absent is
+   ignored files, stops cleanup. The helper accepts the worktree's Syndicate
+   lock, unlocks it only immediately before removal, and stops on any other
+   lock. While another task registered to the same worktree series is not
+   done or ended, it stops before changing anything and leaves the worktree,
+   lock and branches intact; report that the series is still active. A remote branch that is already absent is
    safe to skip. Remote deletion is conditional on the inspected tip still
    being current. The helper uses a deletion-only refspec with an explicit
    lease and never force-updates a branch. The existing local main checkout

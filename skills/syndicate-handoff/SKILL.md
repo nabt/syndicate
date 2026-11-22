@@ -19,9 +19,18 @@ including any launch failure. Preserve attribution for finished work so that
 the resumed task can include it at closeout.
 This file is the semantic checkpoint if the launcher must interrupt you without
 another model response. Update it before launching a long task as well.
+At the same points, commit work in progress to the task branch in its
+Syndicate worktree (`syndicate tasks worktree`). Never unlock or remove that
+worktree when stopping; it stays locked until the series is verified complete.
 
 When asked to continue a handoff, read the handoff directory's `handoff.md`,
 `checkpoint.md`, and `status.json`, then inspect the current worktree and diff.
+Continue in the task worktree listed under `## Task worktrees`, re-adopting it
+with `syndicate tasks worktree` and the same branch and series. Its
+`worktrees/<branch>/` evidence includes status, diffs, untracked files and
+unpushed commits. If the directory is gone, recreate it at the same path from
+the branch and restore the recorded `refs/syndicate/snapshots/...` ref as
+`handoff.md` describes.
 The snapshot can contain incomplete writes or interrupted tools; verify them.
 A handoff is not completion or review approval. Carry outstanding reviews into
 the new run. Use checkpointed participant IDs as historical evidence for work

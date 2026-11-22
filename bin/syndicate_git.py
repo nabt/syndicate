@@ -11,6 +11,7 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 MAIN = "refs/heads/main"
+SYNDICATE_LOCK = "syndicate:"
 ORIGIN_MAIN = "refs/remotes/origin/main"
 OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 GIT_ROUTING_ENV = {
@@ -159,8 +160,11 @@ def _check_task_worktree(repo: Path, path: Path, task_ref: str,
     task_record = next((wt for wt in worktrees if Path(wt["worktree"]).resolve() == path), None)
     registered = [wt for wt in worktrees if wt.get("branch") == task_ref]
     if task_record:
-        if registered != [task_record] or "locked" in task_record or "prunable" in task_record:
-            raise CleanupError(f"Recorded task worktree is locked, prunable, or does not own {task_ref}")
+        # Syndicate locks every task worktree until its series is complete; accept only that lock.
+        foreign_lock = "locked" in task_record and not task_record["locked"].startswith(SYNDICATE_LOCK)
+        if registered != [task_record] or foreign_lock or "prunable" in task_record:
+            raise CleanupError(f"Recorded task worktree is locked by another tool, prunable, "
+                               f"or does not own {task_ref}")
         _clean(path, "Task worktree", ignored=True)
     elif registered or path.exists():
         raise CleanupError("Recorded task worktree is not registered to the task branch")
@@ -168,8 +172,15 @@ def _check_task_worktree(repo: Path, path: Path, task_ref: str,
 
 
 def cleanup_pr(repo: Path, number: int, branch: str, path: Path,
-               report: Callable[[str], None]) -> None:
-    """Clean up recorded task artifacts after proving a same-repository merge."""
+               report: Callable[[str], None],
+               series_guard: Callable[[Path], None] | None = None,
+               on_removed: Callable[[Path], None] | None = None) -> bool:
+    """Clean up recorded task artifacts after proving a same-repository merge.
+
+    series_guard(path) runs after the merge is verified and before any change;
+    it raises CleanupError while other tasks of the worktree's series are
+    unfinished. on_removed(path) runs after the task worktree is removed.
+    Returns True when cleanup ran, False when the PR is not merged."""
     overrides = sorted(key for key in os.environ
                        if key in GIT_ROUTING_ENV or key.startswith("GIT_CONFIG_"))
     if overrides:
@@ -194,7 +205,7 @@ def cleanup_pr(repo: Path, number: int, branch: str, path: Path,
         raise CleanupError("Could not read PR state from GitHub") from exc
     if state != "MERGED":
         report(f"PR {url} is {state}. Post-merge cleanup skipped.")
-        return
+        return False
     if pr.get("baseRefName") != "main" or pr.get("headRefName") != branch or (
         pr.get("isCrossRepository") is not False
     ):
@@ -213,6 +224,8 @@ def cleanup_pr(repo: Path, number: int, branch: str, path: Path,
     if not main_tip or not _ancestor(repo, commit, main_tip):
         raise CleanupError(f"PR merge commit {commit} is absent from fetched origin/main")
     report(f"Verified PR {url} merged at {pr.get('mergedAt')} as {commit} on origin/main.")
+    if series_guard is not None:
+        series_guard(path.resolve())
 
     worktrees = _worktrees(repo)
     main_record = next((wt for wt in worktrees if wt.get("branch") == MAIN), None)
@@ -247,8 +260,20 @@ def cleanup_pr(repo: Path, number: int, branch: str, path: Path,
             _ref_oid(repo, task_ref) != local_tip
         ):
             raise CleanupError("Task worktree or branch changed during cleanup")
-        _git(repo, "worktree", "remove", "--", str(path))
+        record = next(wt for wt in _worktrees(repo) if Path(wt["worktree"]).resolve() == path)
+        if "locked" in record:
+            # Unlock only immediately before removal; restore the lock if removal fails.
+            _git(repo, "worktree", "unlock", "--", str(path))
+            try:
+                _git(repo, "worktree", "remove", "--", str(path))
+            except CleanupError:
+                _git(repo, "worktree", "lock", "--reason", record["locked"], "--", str(path), expected=(0, 128))
+                raise
+        else:
+            _git(repo, "worktree", "remove", "--", str(path))
         report(f"Removed task worktree {path}.")
+        if on_removed is not None:
+            on_removed(path)
     if local_tip:
         if any(wt.get("branch") == task_ref for wt in _worktrees(repo)):
             raise CleanupError(f"Local task branch {branch} is checked out")
@@ -262,3 +287,4 @@ def cleanup_pr(repo: Path, number: int, branch: str, path: Path,
         report(f"Fast-forwarded local main to {main_tip}.")
     else:
         report(f"Local main is already at {main_tip}.")
+    return True

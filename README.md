@@ -243,7 +243,15 @@ syndicate tasks list --json
 syndicate tasks edit TASK_ID --project graphcue
 syndicate tasks edit TASK_ID --summary "Updated task title" --state done
 syndicate tasks edit TASK_ID --state ended   # close without claiming completion
+syndicate tasks worktree TASK_ID -C . --repo /path/to/repo --branch work/topic-1234
+syndicate tasks cleanup-pr 42 -C /path/to/repo --branch work/topic-1234 --worktree PATH --task TASK_ID
 ```
+
+Task work happens in a linked worktree that `syndicate tasks worktree` creates
+under `~/.syndicate/worktrees/` and locks until post-merge cleanup proves the
+task series complete. Temporary directories such as `/tmp` are refused. Handoffs
+save each task worktree's status, diffs, untracked files, and a recovery ref.
+See [Task worktrees](docs/handoff.md#task-worktrees).
 
 Task edits change dashboard metadata; they do not move files, stop processes,
 or change a running agent's working directory. Status and checkpoints remain

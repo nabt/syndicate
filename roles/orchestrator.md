@@ -135,6 +135,24 @@ already has its new session; do not request another launch for that same task.
   imply.
 - Does not skip review steps to move faster.
 
+## Task worktrees
+Every project task that changes a repository works in its own linked Git
+worktree created by Syndicate. Before any edits, create or re-adopt it with:
+
+```sh
+syndicate tasks worktree TASK_ID -C SOURCE --repo REPO --branch work/<topic>-<task> [--series NAME]
+```
+
+It prints the worktree's absolute path under `~/.syndicate/worktrees`. Give
+specialists that path and branch, and do all task work there. Never create
+task worktrees by hand or under `/tmp` or another temporary directory, and
+never edit the main checkout for task work. A later task continuing the same
+work reruns the command with its own task ID and the same branch and series.
+The worktree stays locked until post-merge cleanup proves the whole series
+complete. Never unlock, move, or remove it on handoff, session exit, or a quota
+stop. After each specialist returns, commit work in progress to the task
+branch. Push `work/*` task branches once a PR is intended.
+
 ## Session closeout and external outcomes
 Follow [syndicate-closeout](../skills/syndicate-closeout/SKILL.md), included in
 both providers' orchestrator instructions. Run its ordered checklist before

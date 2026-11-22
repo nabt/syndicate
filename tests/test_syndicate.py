@@ -48,6 +48,11 @@ class ProjectCase(unittest.TestCase):
         state = unittest.mock.patch.object(sy.runtime, "STATE", self.project / "usage-state")
         state.start()
         self.addCleanup(state.stop)
+        # Handoffs read the task worktree registry; never consult the real ~/.syndicate.
+        worktrees = unittest.mock.patch.object(sy.syndicate_worktrees, "REGISTRY",
+                                               self.project / "worktrees" / "registry.json")
+        worktrees.start()
+        self.addCleanup(worktrees.stop)
 
     def usage(self, provider, used, observed_at=None):
         """Record a provider usage reading (used percent) in the patched state."""
