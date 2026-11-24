@@ -15,6 +15,9 @@ import time
 import uuid
 from contextlib import contextmanager
 
+sys.dont_write_bytecode = True  # also when started directly as the channel MCP server
+
+import syndicate_identity as identity
 import syndicate_runtime as runtime
 import syndicate_portfolio as portfolio
 
@@ -338,6 +341,15 @@ def poll(project, seen=None, scheduled=None):
         return dict(schema_version=1, events=record['pending'], has_more=len(pending) > 20)
 
 
+def channel_server(path):
+    """Claude MCP entry for the live channel: pinned interpreter, -B, this module's real path.
+
+    No `env` key: the server inherits the session environment (which already
+    carries PYTHONDONTWRITEBYTECODE=1) rather than a reduced default one."""
+    argv = identity.python_argv(identity.LIVE_MODULE)
+    return dict(command=argv[0], args=[*argv[1:], 'channel', str(path)])
+
+
 class Delivery:
     def __init__(self, directory, project, run_id, provider, chief=False, interval=5, transport='auto'):
         self.directory = Path(directory)
@@ -368,8 +380,7 @@ class Delivery:
     def prepare(self, argv):
         if self.mode != 'channel':
             return argv
-        config = dict(mcpServers={'syndicate-live': dict(command=sys.executable,
-                      args=[str(Path(__file__).resolve()), 'channel', str(self.path)])})
+        config = dict(mcpServers={'syndicate-live': channel_server(self.path)})
         return [argv[0], '--mcp-config', json.dumps(config),
                 '--dangerously-load-development-channels', 'server:syndicate-live'] + argv[1:]
 

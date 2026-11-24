@@ -457,7 +457,9 @@ class LaunchCommands(ProjectCase):
         self.assertIn("SYNDICATE_BRIEF", reviewer["prompt"])
         self.assertIn("Read", agents["backend-engineer"]["tools"])
         settings = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
-        self.assertEqual(settings["permissions"]["allow"], [f"Bash({sy.SCRIPT} team run-role *)"])
+        prefix = sy.shlex.join([sy.identity.interpreter(), "-B", str(sy.SCRIPT)])
+        self.assertEqual(settings["permissions"]["allow"], [f"Bash({prefix} team run-role *)"])
+        self.assertIn(f"{prefix} team run-role code-reviewer --project", reviewer["prompt"])
 
     def test_gate_off_removes_hook(self):
         self.config("review-gate = off\nhandoff = off\n")
@@ -487,7 +489,7 @@ class LaunchCommands(ProjectCase):
         argv = sy.build_codex(team, headless=True, rest=["task"])
         self.assertEqual(argv[:6], ["codex", "exec", "-C", str(self.project), "-s", "workspace-write"])
         self.assertEqual(argv[-1], "task")
-        gen = self.project / ".syndicate" / ".generated" / "codex"
+        gen = sy.generated(self.project) / "codex"
         self.assertIn("run-role code-reviewer", (gen / "code-reviewer.toml").read_text())
         self.assertIn('sandbox_mode = "workspace-write"', (gen / "code-reviewer.toml").read_text())
         self.assertIn('sandbox_mode = "workspace-write"', (gen / "qa-engineer.toml").read_text())
@@ -505,7 +507,7 @@ class LaunchCommands(ProjectCase):
     def test_codex_native_reviewer_uses_isolated_relay(self):
         self.config("default = codex\n")
         sy.build_codex(sy.resolve_team(self.project, "codex"), False, [])
-        gen = self.project / ".syndicate" / ".generated" / "codex"
+        gen = sy.generated(self.project) / "codex"
         self.assertIn("run-role code-reviewer", (gen / "code-reviewer.toml").read_text())
         import tomllib
         reviewer = tomllib.loads((gen / "code-reviewer.toml").read_text())
@@ -520,7 +522,7 @@ class LaunchCommands(ProjectCase):
 
     def test_codex_removes_stale_agent_files(self):
         self.config("orchestrator = codex\n")
-        gen = self.project / ".syndicate" / ".generated" / "codex"
+        gen = sy.generated(self.project) / "codex"
         gen.mkdir(parents=True)
         (gen / "gone.toml").write_text("x")
         sy.build_codex(sy.resolve_team(self.project), False, [])
@@ -531,7 +533,7 @@ class LaunchCommands(ProjectCase):
         self.role_file("data-engineer.md", '---\ndescription: say "hi"\n---\nline1\n"quoted" \\ back\n')
         self.config("default = codex\n")
         sy.build_codex(sy.resolve_team(self.project, "codex"), False, [])
-        toml = tomllib.loads((self.project / ".syndicate/.generated/codex/data-engineer.toml").read_text())
+        toml = tomllib.loads((sy.generated(self.project) / "codex" / "data-engineer.toml").read_text())
         self.assertEqual(toml["developer_instructions"], 'line1\n"quoted" \\ back')
 
     def test_reported_outcome_rule_reaches_both_providers(self):

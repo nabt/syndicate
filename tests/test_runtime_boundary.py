@@ -1,0 +1,563 @@
+"""Runtime boundary: pinned self-invocation, resource lookup, identity, dev mode.
+
+Every subprocess runs with a disposable HOME, XDG directories, provider homes,
+TMPDIR and TMUX_TMPDIR, and without inherited SYNDICATE_* or TMUX variables.
+"""
+import contextlib
+import io
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from test_syndicate import ProjectCase, sy
+
+identity = sy.identity
+runtime = sy.runtime
+live = sy.live
+dev = sy.syndicate_dev
+CHECKOUT = Path(sy.SCRIPT).parent.parent
+COMMIT = "a" * 40
+OTHER = "b" * 40
+
+
+def disposable_env(base: Path, **extra) -> dict:
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("SYNDICATE_") and k not in ("TMUX", "TMUX_PANE", "PYTHONDONTWRITEBYTECODE")}
+    for name in ("home", "config", "data", "cache", "codex", "claude", "tmp", "tmux"):
+        (base / name).mkdir(parents=True, exist_ok=True)
+    env.update(HOME=str(base / "home"), XDG_CONFIG_HOME=str(base / "config"),
+               XDG_DATA_HOME=str(base / "data"), XDG_CACHE_HOME=str(base / "cache"),
+               CODEX_HOME=str(base / "codex"), CLAUDE_CONFIG_DIR=str(base / "claude"),
+               TMPDIR=str(base / "tmp"), TMUX_TMPDIR=str(base / "tmux"))
+    env.update(extra)
+    return env
+
+
+def tree(root: Path) -> dict:
+    """Relative path -> (size, mtime_ns) for every entry under root."""
+    result = {}
+    for directory, dirs, files in os.walk(root):
+        for name in dirs + files:
+            path = Path(directory) / name
+            info = path.lstat()
+            result[str(path.relative_to(root))] = (info.st_size, info.st_mtime_ns)
+    return result
+
+
+def caches(root: Path) -> list[str]:
+    return [str(p) for p in root.rglob("*") if p.name == "__pycache__" or p.suffix in (".pyc", ".pyo")]
+
+
+def git(repo: Path, *args: str) -> str:
+    env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                          text=True, env=env).stdout.strip()
+
+
+class Fixture:
+    """A fake installed release and a throwaway Syndicate Git checkout, built once.
+
+    Paths contain spaces; the release is reached through `current` and a
+    launcher symlink, as the installed shim does."""
+
+    def __init__(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="syndicate boundary ")
+        self.base = Path(self.tmp.name).resolve()
+        data = self.base / "data home" / "syndicate"
+        self.release = data / "releases" / COMMIT
+        dev.stage_snapshot(CHECKOUT, self.release)
+        (self.release / "RELEASE.json").write_text(json.dumps(
+            {"format": 1, "commit": COMMIT, "files": {}, "python_min": "3.11"}))
+        (data / "current").symlink_to(Path("releases") / COMMIT)
+        (data / "activations.jsonl").write_text("\n".join([
+            json.dumps({"at": "2026-01-01T00:00:00Z", "commit": COMMIT, "tag": "v0.1.0"}),
+            "{not json",
+            json.dumps({"at": "2026-02-01T00:00:00Z", "commit": OTHER, "tag": "v0.2.0"}),
+            json.dumps({"at": "2026-03-01T00:00:00Z", "commit": COMMIT, "tag": "v0.1.1",
+                        "previous_commit": OTHER}),
+        ]) + "\n")
+        self.shim = self.base / "local bin" / "syndicate"
+        self.shim.parent.mkdir()
+        self.shim.symlink_to(data / "current" / "bin" / "syndicate")
+        self.data = data
+        # A Syndicate checkout with history, for dev mode.
+        self.repo = self.base / "dev checkout"
+        dev.stage_snapshot(CHECKOUT, self.repo)
+        for path in self.repo.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                path.chmod(path.stat().st_mode | 0o200)
+        (self.repo / ".gitignore").write_text("ignored.txt\n__pycache__/\n")
+        git(self.repo, "init", "-q", "-b", "feature")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "fixture")
+        self.repo_commit = git(self.repo, "rev-parse", "HEAD")
+
+    def cleanup(self):
+        for path in self.base.rglob("*"):
+            if not path.is_symlink():
+                try:
+                    path.chmod(path.stat().st_mode | 0o700 if path.is_dir() else path.stat().st_mode | 0o600)
+                except OSError:
+                    pass
+        self.tmp.cleanup()
+
+
+class SubprocessCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = Fixture()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixture.cleanup()
+
+    def setUp(self):
+        self._scratch = tempfile.TemporaryDirectory(prefix="syndicate env ")
+        self.addCleanup(self._scratch.cleanup)
+        self.scratch = Path(self._scratch.name).resolve()
+        self.env = disposable_env(self.scratch)
+        self.foreign = self.scratch / "foreign cwd"
+        self.foreign.mkdir()
+
+    def run_cli(self, *argv, launcher=None, python_flags=("-B",), env=None, cwd=None, stdin=None):
+        launcher = launcher or self.fixture.shim
+        return subprocess.run([sys.executable, *python_flags, str(launcher), *argv],
+                              cwd=cwd or self.foreign, env=env or self.env, capture_output=True,
+                              text=True, input=stdin, timeout=120)
+
+
+class Pinning(ProjectCase):
+    def prefix(self):
+        return shlex.join([identity.interpreter(), "-B", str(sy.SCRIPT)])
+
+    def test_pinned_argv_is_absolute_interpreter_dash_b_real_launcher(self):
+        argv = identity.pinned_argv()
+        self.assertTrue(os.path.isabs(argv[0]))
+        self.assertEqual(argv[1:], ["-B", str(Path(sy.SCRIPT).resolve())])
+        self.assertEqual(shlex.split(identity.pinned_prefix()), argv)
+        self.assertEqual(identity.LAUNCHER, sy.SCRIPT)
+
+    def test_prefix_quotes_paths_with_spaces(self):
+        with tempfile.TemporaryDirectory(prefix="with space ") as tmp:
+            launcher = Path(tmp) / "bin dir" / "syndicate"
+            launcher.parent.mkdir()
+            launcher.write_text("")
+            with patch.object(identity, "LAUNCHER", launcher), \
+                 patch.object(identity.sys, "executable", "/opt/py thon/bin/python3"):
+                prefix = identity.pinned_prefix()
+                self.assertEqual(shlex.split(prefix), ["/opt/py thon/bin/python3", "-B", str(launcher)])
+                self.assertEqual(shlex.split(identity.pinned_command("team", "run-role", "a b")),
+                                 ["/opt/py thon/bin/python3", "-B", str(launcher), "team", "run-role", "a b"])
+                self.assertEqual(sy.relay_allow_rule(), f"Bash({prefix} team run-role *)")
+
+    def test_claude_relay_heredoc_and_allow_rule_are_byte_parity(self):
+        self.config("code-reviewer = codex\n")
+        team = sy.resolve_team(self.project)
+        argv = sy.build_claude(team, headless=False, rest=[])
+        agents = json.loads(argv[argv.index("--agents") + 1])
+        settings = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
+        rule = settings["permissions"]["allow"][0]
+        self.assertTrue(rule.startswith("Bash(") and rule.endswith(" *)"))
+        granted = rule[len("Bash("):-len("*)")]
+        command = sy.relay_command(team.roles["code-reviewer"], self.project)
+        self.assertTrue(command.startswith(granted), (command, granted))
+        self.assertEqual(granted, self.prefix() + " team run-role ")
+        heredoc = f"{command} <<'SYNDICATE_BRIEF'\n"
+        self.assertIn(heredoc, agents["code-reviewer"]["prompt"])
+        self.assertEqual(shlex.split(command)[:3], identity.pinned_argv())
+
+    def test_codex_relay_tomls_use_pinned_prefix_in_per_run_directory(self):
+        self.config("orchestrator = codex\ndefault = codex\ncode-reviewer = claude\n")
+        argv = sy.build_codex(sy.resolve_team(self.project), headless=True, rest=["task"])
+        gen = sy.generated(self.project) / "codex"
+        self.assertEqual(gen.parent.parent, self.project / ".syndicate" / ".generated")
+        self.assertRegex(gen.parent.name, sy.GENERATED_RUN.pattern)
+        reviewer = tomllib.loads((gen / "code-reviewer.toml").read_text())
+        self.assertIn(f"{self.prefix()} team run-role code-reviewer --project {shlex.quote(str(self.project))} -"
+                      " <<'SYNDICATE_BRIEF'", reviewer["developer_instructions"])
+        self.assertIn(f"agents.code-reviewer.config_file={sy.jstr(str(gen / 'code-reviewer.toml'))}", argv)
+
+    def test_backoff_and_live_inbox_use_pinned_prefix(self):
+        team = sy.resolve_team(self.project)
+        body = sy.orchestrator_body(team)
+        self.assertIn(f"`{self.prefix()} team run-role ROLE --project {shlex.quote(str(self.project))} "
+                      "--backoff-from PROVIDER -`", body)
+        self.assertIn(f"Syndicate executable prefix: {self.prefix()}\n", body)
+
+    def test_bundled_session_commands_render_pinned_and_user_commands_stay(self):
+        team = sy.resolve_team(self.project)
+        body = sy.orchestrator_body(team)
+        self.assertIn(f"`{self.prefix()} decisions list --json`", body)
+        self.assertIn(f"{self.prefix()} tasks worktree TASK_ID -C SOURCE", body)
+        self.assertNotRegex(body, r"(?m)(`|^\s*)syndicate (tasks|decisions|requests|messages|briefs) ")
+        chief = sy.chief_instructions(self.project)
+        self.assertIn(f"`{self.prefix()} briefing --json`", chief)
+        self.assertIn("printed `syndicate show` command", chief)
+        self.assertIn(f"Use this exact executable prefix for every Syndicate command: {self.prefix()}\n", chief)
+        self.assertIn(".syndicate/status.json", body)  # paths are not commands
+
+    def test_status_line_and_usage_probe_use_pinned_prefix(self):
+        argv = sy.build_claude(sy.resolve_team(self.project), False, [])
+        settings = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
+        self.assertEqual(settings["statusLine"]["command"], f"{self.prefix()} _claude-usage")
+        chief = sy.build_chief_of_staff("claude", self.project, False, "hi")
+        chief_settings = json.loads(chief[chief.index("--settings") + 1])
+        self.assertEqual(chief_settings["statusLine"]["command"], f"{self.prefix()} _claude-usage")
+        probe = json.loads(runtime.claude_usage_probe_command()[-1])["statusLine"]["command"]
+        self.assertEqual(shlex.split(probe)[:4], [*identity.pinned_argv(), "_claude-usage"])
+
+    def test_review_gate_hook_resolves_from_release_root(self):
+        argv = sy.build_claude(sy.resolve_team(self.project), False, [])
+        settings = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
+        hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        self.assertEqual(shlex.split(hook), [str(identity.ROOT / "hooks" / "require-review.sh")])
+        with patch.object(Path, "home", return_value=self.project / "home"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            sy.cmd_setup_codex_gate(sy.argparse.Namespace(remove=False))
+        hooks = json.loads((self.project / "home" / ".codex" / "hooks.json").read_text())
+        self.assertEqual(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], hook)
+
+    def test_monitor_spawn_argv_and_environment(self):
+        with patch.object(runtime.subprocess, "Popen") as popen:
+            runtime.start_monitor(sy.SCRIPT)
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv, [*identity.pinned_argv(), "_limits-monitor"])
+        self.assertEqual(popen.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_channel_mcp_argv(self):
+        server = live.channel_server(self.project / "live.json")
+        self.assertEqual(server["command"], identity.interpreter())
+        self.assertEqual(server["args"], ["-B", str((Path(sy.SCRIPT).parent / "syndicate_live.py").resolve()),
+                                          "channel", str(self.project / "live.json")])
+        self.assertNotIn("env", server)
+
+    def test_tmux_on_wraps_pinned_argv_and_off_keeps_the_same_instructions(self):
+        started = []
+        with patch.object(sy.shutil, "which", return_value="/usr/bin/tmux"), \
+             patch.object(sy, "_release_replaced_windows"), \
+             patch.object(sy, "_start_tmux_window", side_effect=lambda d, n, c, **k: started.append(c) or "@1"), \
+             patch.object(sy.sys.stdin, "isatty", return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sy.launch_tmux(["team", "task", "do it now"], self.project, "w"), 0)
+        self.assertEqual(shlex.split(started[0]),
+                         [*identity.pinned_argv(), "_in-tmux", "team", "task", "do it now"])
+        self.assertIn(f"run-shell {shlex.quote(shlex.join([*identity.pinned_argv(), '_restore-view']))}",
+                      sy._view_hook())
+        flags = sy._tmux_env_flags()
+        self.assertIn("PYTHONDONTWRITEBYTECODE=1", flags)
+        team = sy.resolve_team(self.project)
+        with patch.object(sy, "tmux_enabled", return_value=True):
+            on = sy.orchestrator_body(team)
+        off = sy.orchestrator_body(team)
+        self.assertEqual(on, off)
+
+    def test_config_precedence_unchanged_from_foreign_cwd(self):
+        os.chdir(Path(self._tmp.name) / ".syndicate")
+        with patch.dict(os.environ, {"SYNDICATE_RUNTIME": "codex"}):
+            team = sy.resolve_team(self.project)
+            self.assertEqual(team.config["default"], "codex")
+            self.assertEqual(team.config_sources["default"], "environment")
+            self.user_config("default = claude\n")
+            self.assertEqual(sy.resolve_team(self.project).config["default"], "claude")
+            self.config("default = codex\nreview-gate = off\n")
+            team = sy.resolve_team(self.project)
+        self.assertEqual((team.config["default"], team.config_sources["default"]), ("codex", "project"))
+        self.assertEqual(team.config_sources["tmux"], "default")
+        self.assertEqual(team.roles["orchestrator"].sources[0], "global")
+
+    def test_resources_resolve_from_root_and_local_overrides_still_win(self):
+        root = Path(sy.SCRIPT).parent.parent
+        for path in (sy.GLOBAL_ROLES, sy.WEB_DIR, sy.CHIEF_ROLE, sy.GATE_SCRIPT, sy.INBOX_SKILL,
+                     sy.PROJECT_SKILL, sy.CLOSEOUT_SKILL, sy.HANDOFF_SKILL):
+            self.assertTrue(path.exists(), path)
+            self.assertEqual(root, path.parents[len(path.relative_to(root).parts) - 1])
+        self.role_file("code-reviewer.md", "---\ndescription: local reviewer\n---\nLocal body.\n")
+        roles, _ = sy.load_roles(self.project)
+        self.assertEqual(roles["code-reviewer"].body, "Local body.")
+
+
+class GeneratedSettings(ProjectCase):
+    def test_runs_do_not_overwrite_each_others_files(self):
+        older = self.project / ".syndicate" / ".generated" / "20200101T000000-1-deadbeef"
+        older.mkdir(parents=True)
+        (older / "claude-settings.json").write_text("older session")
+        legacy = self.project / ".syndicate" / ".generated" / "claude-settings.json"
+        legacy.write_text("legacy session")
+        argv = sy.build_claude(sy.resolve_team(self.project), False, [])
+        path = Path(argv[argv.index("--settings") + 1])
+        self.assertEqual(path.parent, sy.generated(self.project))
+        self.assertNotEqual(path.parent, older)
+        self.assertEqual(legacy.read_text(), "legacy session")
+        owner = json.loads((path.parent / "owner.json").read_text())
+        self.assertEqual(owner["pid"], os.getpid())
+        self.assertIn(owner["release"]["mode"], ("checkout", "release", "dev"))
+
+    def test_prune_removes_only_old_directories_of_gone_owners(self):
+        root = self.project / ".syndicate" / ".generated"
+        dead = subprocess.Popen([sys.executable, "-B", "-c", ""])
+        dead.wait()
+        names = {"gone": f"20200101T000000-{dead.pid}-00000001",
+                 "alive": f"20200101T000000-{os.getpid()}-00000002",
+                 "recent": f"20200101T000000-{dead.pid}-00000003",
+                 "other": "not-a-run"}
+        for key, name in names.items():
+            (root / name).mkdir(parents=True)
+            (root / name / "f").write_text(key)
+            if key != "recent":
+                old = time.time() - sy.GENERATED_MIN_AGE - 60
+                os.utime(root / name, (old, old))
+        current = sy.generated(self.project)
+        self.assertFalse((root / names["gone"]).exists())
+        for key in ("alive", "recent", "other"):
+            self.assertTrue((root / names[key]).exists(), key)
+        self.assertTrue(current.is_dir())
+
+
+class RunIdentity(ProjectCase):
+    def test_run_record_carries_release_identity_and_older_records_still_read(self):
+        runtime.write_run_record(self.project, "task", "claude", 10, None)
+        record = json.loads((self.project / ".syndicate" / "run.json").read_text())
+        self.assertEqual(record["release"]["root"], str(identity.ROOT))
+        self.assertEqual(record["release"]["interpreter"], identity.interpreter())
+        self.assertIn(record["release"]["mode"], ("checkout", "release", "dev"))
+        del record["release"]
+        runtime.atomic_json(self.project / ".syndicate" / "run.json", record)
+        state, loaded = sy.read_run_record(self.project)
+        self.assertEqual(state, "valid")
+        self.assertNotIn("release", loaded)
+
+    def test_monitor_state_records_its_release(self):
+        # No provider probe runs: codex and notify-send are reported absent.
+        with patch.object(runtime, "MONITOR_RELEASE", {"mode": "release", "commit": COMMIT}), \
+             patch.object(runtime.shutil, "which", return_value=None):
+            runtime.monitor_tick()
+        state = runtime.read_json(runtime.STATE / "monitor.json")
+        self.assertEqual(state["release"], {"mode": "release", "commit": COMMIT})
+
+
+class DevGuard(ProjectCase):
+    def test_dev_mode_refuses_production_state(self):
+        prod = self.project / "prod"
+        env = {identity.DEV_ENV: "1", identity.DEV_PRODUCTION_HOME_ENV: str(prod),
+               "TMUX_TMPDIR": str(self.project / "tmux")}
+        env.pop("TMUX", None)
+        with patch.dict(os.environ, env), patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TMUX", None)
+            with patch.object(sy, "REGISTRY_PATH", prod / ".syndicate" / "projects.json"), \
+                 patch.object(sy, "TMUX_SESSION", "syndicate-dev-x"):
+                problems = sy.dev_guard()
+            self.assertTrue(any("production Syndicate state" in p for p in problems), problems)
+            with patch.object(sy, "TMUX_SESSION", "the-syndicate"):
+                self.assertTrue(any("the-syndicate" in p for p in sy.dev_guard()))
+            with patch.object(sy, "TMUX_SESSION", "syndicate-dev-x"), \
+                 patch.object(runtime, "STATE", self.project / "dev" / "limits"), \
+                 patch.object(sy.syndicate_worktrees, "STATE_DIR", self.project / "dev"):
+                self.assertEqual(sy.dev_guard(), [])
+                os.environ["TMUX"] = "/tmp/tmux-1000/default,1,0"
+                self.assertTrue(any("TMUX points" in p for p in sy.dev_guard()))
+                del os.environ["TMUX"]
+            registry = prod / ".syndicate" / "projects.json"
+            registry.parent.mkdir(parents=True)
+            target = self.project / "target"
+            registry.write_text(json.dumps({"projects": [{"path": str(target)}]}))
+            with self.assertRaisesRegex(sy.SyndicateError, "production project"):
+                sy.register_project(target)
+            sy.register_project(self.project / "elsewhere")
+        self.assertEqual(sy.dev_guard(), [])  # outside dev mode nothing is checked
+
+    def test_dev_environment_is_isolated_and_namespaced(self):
+        base = {"HOME": "/home/real", "TMUX": "/tmp/tmux-1/default,1,0", "TMUX_PANE": "%1",
+                "SYNDICATE_RUNTIME": "codex", "SYNDICATE_RUN_ID": "x", "PATH": "/usr/bin",
+                "CODEX_HOME": "/home/real/.codex"}
+        home, root = self.project / "h", self.project / "r"
+        state = {"commit": COMMIT, "branch": "feature", "dirty": True}
+        env = dev.dev_environment(base, home, root, state, self.project, "syndicate-dev-1", False)
+        self.assertNotIn("TMUX", env)
+        self.assertNotIn("TMUX_PANE", env)
+        self.assertNotIn("SYNDICATE_RUNTIME", env)
+        self.assertNotIn("SYNDICATE_RUN_ID", env)
+        self.assertEqual(env["HOME"], str(home))
+        self.assertEqual(env["CODEX_HOME"], str(home / ".codex"))
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(home / ".claude"))
+        self.assertEqual(env["TMUX_TMPDIR"], str(root / "tmux"))
+        self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertEqual(env[identity.DEV_TMUX_SESSION_ENV], "syndicate-dev-1")
+        self.assertEqual(env[identity.DEV_PRODUCTION_HOME_ENV], "/home/real")
+        self.assertEqual((env[identity.DEV_COMMIT_ENV], env[identity.DEV_DIRTY_ENV]), (COMMIT, "1"))
+        shared = dev.dev_environment(base, home, root, state, self.project, "s", True)
+        self.assertEqual(shared["CODEX_HOME"], "/home/real/.codex")
+        self.assertEqual(shared["CLAUDE_CONFIG_DIR"], "/home/real/.claude")
+
+
+class Version(SubprocessCase):
+    def test_checkout_version_is_side_effect_free(self):
+        before_home = tree(self.scratch)
+        before_git = git(CHECKOUT, "status", "--porcelain", "--ignored")
+        result = self.run_cli("--version", launcher=CHECKOUT / "bin" / "syndicate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mode: checkout\n", result.stdout)
+        self.assertIn(f"commit: {git(CHECKOUT, 'rev-parse', 'HEAD')}", result.stdout)
+        self.assertIn(f"interpreter: {os.path.abspath(sys.executable)}\n", result.stdout)
+        self.assertIn(f"root: {CHECKOUT}\n", result.stdout)
+        self.assertEqual(tree(self.scratch), before_home)
+        self.assertEqual(git(CHECKOUT, "status", "--porcelain", "--ignored"), before_git)
+
+    def test_release_version_through_current_symlink_from_foreign_cwd(self):
+        before = tree(self.scratch)
+        before_release = tree(self.fixture.release)
+        result = self.run_cli("version", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        info = json.loads(result.stdout)
+        self.assertEqual(info["mode"], "release")
+        self.assertEqual(info["commit"], COMMIT)
+        self.assertEqual(info["tag"], "v0.1.1")  # latest activation of this commit
+        self.assertEqual(info["activation"]["previous_commit"], OTHER)
+        self.assertEqual(info["root"], str(self.fixture.release))
+        self.assertNotIn("current", Path(info["root"]).parts)
+        self.assertEqual(info["interpreter"], os.path.abspath(sys.executable))
+        text = self.run_cli("--version").stdout
+        self.assertIn("mode: release\n", text)
+        self.assertIn("tag: v0.1.1\n", text)
+        self.assertEqual(tree(self.scratch), before)
+        self.assertEqual(tree(self.fixture.release), before_release)
+
+    def test_release_version_tolerates_missing_activation_log(self):
+        log = self.fixture.data / "activations.jsonl"
+        saved = log.read_text()
+        log.unlink()
+        try:
+            info = json.loads(self.run_cli("--version", "--json").stdout)
+        finally:
+            log.write_text(saved)
+        self.assertEqual((info["mode"], info["commit"]), ("release", COMMIT))
+        self.assertNotIn("tag", info)
+
+    def test_release_resources_and_prefix_are_pinned_to_real_release(self):
+        code = ("import importlib.machinery, importlib.util, json, sys\n"
+                "loader = importlib.machinery.SourceFileLoader('syndicate', sys.argv[1])\n"
+                "spec = importlib.util.spec_from_loader('syndicate', loader)\n"
+                "sy = importlib.util.module_from_spec(spec); loader.exec_module(sy)\n"
+                "print(json.dumps(dict(roles=str(sy.GLOBAL_ROLES), web=str(sy.WEB_DIR), chief=str(sy.CHIEF_ROLE),"
+                " gate=str(sy.GATE_SCRIPT), prefix=sy.identity.pinned_prefix(), rule=sy.relay_allow_rule(),"
+                " live=sy.live.channel_server('/x')['args'][1])))\n")
+        result = subprocess.run([sys.executable, "-B", "-c", code, str(self.fixture.shim)], cwd=self.foreign,
+                                env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        paths = json.loads(result.stdout)
+        release = self.fixture.release
+        self.assertEqual(paths["roles"], str(release / "roles"))
+        self.assertEqual(paths["web"], str(release / "web"))
+        self.assertEqual(paths["chief"], str(release / "portfolio" / "chief-of-staff.md"))
+        self.assertEqual(paths["gate"], str(release / "hooks" / "require-review.sh"))
+        self.assertEqual(paths["live"], str(release / "bin" / "syndicate_live.py"))
+        self.assertEqual(shlex.split(paths["prefix"]),
+                         [os.path.abspath(sys.executable), "-B", str(release / "bin" / "syndicate")])
+        self.assertIn(" ", paths["prefix"])
+        self.assertEqual(paths["rule"], f"Bash({paths['prefix']} team run-role *)")
+
+
+class NoBytecode(SubprocessCase):
+    def test_entry_paths_create_no_caches(self):
+        release = self.fixture.release
+        # Legacy direct entry without -B and without PYTHONDONTWRITEBYTECODE.
+        for launcher in (self.fixture.shim, CHECKOUT / "bin" / "syndicate"):
+            result = self.run_cli("--version", launcher=launcher, python_flags=())
+            self.assertEqual(result.returncode, 0, result.stderr)
+        # Status line path, as Claude runs it.
+        usage = subprocess.run(shlex.split(f"{shlex.quote(sys.executable)} -B "
+                                           f"{shlex.quote(str(self.fixture.shim))} _claude-usage"),
+                               input="{}", cwd=self.foreign, env=self.env, capture_output=True, text=True,
+                               timeout=60)
+        self.assertEqual(usage.returncode, 0, usage.stderr)
+        # Channel MCP path: the endpoint is inactive, so the server exits at end of input.
+        endpoint = self.scratch / "live.json"
+        endpoint.write_text(json.dumps({"active": False}))
+        channel = subprocess.run([sys.executable, str(release / "bin" / "syndicate_live.py"), "channel",
+                                  str(endpoint)], input="", cwd=self.foreign, env=self.env,
+                                 capture_output=True, text=True, timeout=60)
+        self.assertEqual(channel.returncode, 0, channel.stderr)
+        # Relay path: argument validation runs after every import.
+        relay = self.run_cli("team", "run-role", "no-such-role", "--project", str(self.foreign), "-",
+                             stdin="brief")
+        self.assertNotEqual(relay.returncode, 0)
+        self.assertEqual(caches(release), [])
+        self.assertEqual(caches(CHECKOUT / "bin"), [])
+        self.assertEqual(caches(self.scratch), [])
+
+
+class DevMode(SubprocessCase):
+    def test_snapshot_is_isolated_from_later_edits_and_excludes_git_and_ignored(self):
+        repo = self.fixture.repo
+        (repo / "untracked.md").write_text("untracked")
+        (repo / "ignored.txt").write_text("ignored")
+        (repo / "bin" / "__pycache__").mkdir(exist_ok=True)
+        (repo / "bin" / "__pycache__" / "x.pyc").write_bytes(b"")
+        role = repo / "roles" / "orchestrator.md"
+        original = role.read_text()
+        target = self.scratch / "snapshot"
+        try:
+            dev.stage_snapshot(repo, target)
+            role.write_text(original + "\nEDITED AFTER STAGING\n")
+            self.assertEqual((target / "roles" / "orchestrator.md").read_text(), original)
+        finally:
+            role.write_text(original)
+            (repo / "untracked.md").unlink()
+            (repo / "ignored.txt").unlink()
+            shutil.rmtree(repo / "bin" / "__pycache__")
+        self.assertTrue((target / "untracked.md").is_file())
+        self.assertFalse((target / "ignored.txt").exists())
+        self.assertFalse((target / ".git").exists())
+        self.assertEqual(caches(target), [])
+        self.assertFalse(os.access(target / "roles" / "orchestrator.md", os.W_OK))
+        with self.assertRaisesRegex(dev.DevError, "not a Syndicate checkout"):
+            dev.validate_checkout(self.scratch)
+
+    def test_dev_runs_snapshot_in_disposable_environment(self):
+        repo = self.fixture.repo
+        (repo / "README.md").write_text((repo / "README.md").read_text() + "\ndirty\n")
+        try:
+            result = self.run_cli("dev", "--checkout", str(repo), "--", "--version", "--json",
+                                  launcher=CHECKOUT / "bin" / "syndicate")
+            tasks = self.run_cli("dev", "--checkout", str(repo), "--", "tasks", "list", "--json",
+                                 launcher=CHECKOUT / "bin" / "syndicate")
+        finally:
+            git(repo, "checkout", "--", "README.md")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        info = json.loads(result.stdout)
+        self.assertEqual(info["mode"], "dev")
+        self.assertEqual(info["commit"], self.fixture.repo_commit)
+        self.assertTrue(info["dirty"])
+        self.assertEqual(info["checkout"], str(repo))
+        self.assertTrue(Path(info["root"]).name == "checkout" and "syndicate-dev-" in info["root"])
+        self.assertIn(f"branch feature, commit {self.fixture.repo_commit}, dirty", result.stderr)
+        self.assertFalse(Path(info["root"]).exists())  # removed after exit without --keep
+        self.assertEqual(tasks.returncode, 0, tasks.stderr)
+        self.assertEqual(json.loads(tasks.stdout), [])
+        # Nothing reached the caller's homes; only the temporary dev roots were used and removed.
+        for name in ("home", "config", "data", "cache", "codex", "claude", "tmux", "tmp"):
+            self.assertEqual(list((self.scratch / name).iterdir()), [], name)
+        self.assertEqual(caches(repo), [])
+
+    def test_dev_child_refuses_when_isolation_is_missing(self):
+        env = dict(self.env, **{identity.DEV_ENV: "1", identity.DEV_PRODUCTION_HOME_ENV: self.env["HOME"],
+                                identity.DEV_TMUX_SESSION_ENV: "syndicate-dev-t"})
+        result = self.run_cli("tasks", "list", env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("dev mode refuses to touch production state", result.stderr)
+        self.assertEqual(list((self.scratch / "home").iterdir()), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

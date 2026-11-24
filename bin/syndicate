@@ -7,8 +7,28 @@ User-wide settings in $XDG_CONFIG_HOME/syndicate/syndicate.conf (or
 ~/.config/syndicate/syndicate.conf) apply first; a project key replaces that
 one key. Nothing is written anywhere else in the project. See README.md and
 docs/configuration.md.
+
+RUNTIME FILES
+  Modules this launcher imports from its own bin/ directory. A release must
+  ship every one of them beside bin/syndicate (syndicate_identity.RUNTIME_MODULES
+  is the machine-readable list):
+    bin/syndicate_completion.py
+    bin/syndicate_dev.py
+    bin/syndicate_git.py
+    bin/syndicate_identity.py
+    bin/syndicate_live.py
+    bin/syndicate_portfolio.py
+    bin/syndicate_runtime.py
+    bin/syndicate_worktrees.py
+  Assets resolved from the release or checkout root: roles/, skills/, hooks/,
+  web/, portfolio/chief-of-staff.md, docs/ and README.md.
 """
 from __future__ import annotations
+
+import sys
+
+# Before any sibling import: a release or checkout never gains __pycache__.
+sys.dont_write_bytecode = True
 
 import argparse
 import errno
@@ -19,7 +39,6 @@ import re
 import shlex
 import shutil
 import subprocess
-import sys
 import time
 import tempfile
 import signal
@@ -31,27 +50,35 @@ from copy import copy
 from datetime import datetime, timezone
 from pathlib import Path
 
+# The real launcher path, resolved once: a release keeps using its own code and
+# assets even after the `current` symlink moves to another release.
 SCRIPT = Path(__file__).resolve()
 sys.path.insert(0, str(SCRIPT.parent))
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"  # inherited by every child, tmux window and relay
+import syndicate_identity as identity
 import syndicate_runtime as runtime
 import syndicate_portfolio as portfolio
 import syndicate_live as live
 import syndicate_git
 import syndicate_worktrees
 import syndicate_completion as completion
-HOME_DIR = SCRIPT.parent.parent
-GLOBAL_ROLES = HOME_DIR / "roles"
-GATE_SCRIPT = HOME_DIR / "hooks" / "require-review.sh"
-WEB_DIR = HOME_DIR / "web"
-HANDOFF_SKILL = HOME_DIR / "skills" / "syndicate-handoff" / "SKILL.md"
-CHIEF_ROLE = HOME_DIR / "portfolio" / "chief-of-staff.md"
-PROJECT_SKILL = HOME_DIR / "skills" / "syndicate-project" / "SKILL.md"
-CLOSEOUT_SKILL = HOME_DIR / 'skills' / 'syndicate-closeout' / 'SKILL.md'
-INBOX_SKILL = HOME_DIR / 'skills' / 'syndicate-inbox' / 'SKILL.md'
+import syndicate_dev
+# Release or checkout root of this launcher; never the cwd, PATH or `current`.
+HOME_DIR = identity.ROOT
+GLOBAL_ROLES = identity.resource("roles")
+GATE_SCRIPT = identity.resource("hooks", "require-review.sh")
+WEB_DIR = identity.resource("web")
+HANDOFF_SKILL = identity.resource("skills", "syndicate-handoff", "SKILL.md")
+CHIEF_ROLE = identity.resource("portfolio", "chief-of-staff.md")
+PROJECT_SKILL = identity.resource("skills", "syndicate-project", "SKILL.md")
+CLOSEOUT_SKILL = identity.resource('skills', 'syndicate-closeout', 'SKILL.md')
+INBOX_SKILL = identity.resource('skills', 'syndicate-inbox', 'SKILL.md')
 SCHEDULER_TOOLS = ['CronCreate', 'CronList', 'CronDelete']
 REGISTRY_PATH = Path.home() / ".syndicate" / "projects.json"
 # One shared session. Chief of Staff and each team are windows in it, not sessions of their own.
-TMUX_SESSION = 'the-syndicate'
+# A `syndicate dev` run uses its own namespaced session on its own tmux server.
+TMUX_SESSION = ((identity.dev_mode() and os.environ.get(identity.DEV_TMUX_SESSION_ENV))
+                or identity.PRODUCTION_TMUX_SESSION)
 CHIEF_TMUX_WINDOW = 'chief-of-staff'
 # Temporary window that shows several workers at once. It is not itself a worker.
 VIEW_WINDOW = 'syndicate-view'
@@ -539,15 +566,83 @@ def ensure_excluded(project: Path) -> str | None:
     return None
 
 
+GENERATED_RUN = re.compile(r"[0-9]{8}T[0-9]{6}-([0-9]+)-[0-9a-f]{8}")
+GENERATED_MIN_AGE = 86400  # an ownerless run directory is kept at least this long (delayed children)
+GENERATED_PRUNE_LIMIT = 32  # run directories removed per launch at most
+_generation: tuple[int, str] | None = None
+
+
+def generation_id() -> str:
+    """This launcher process's generated-settings directory name: time, owner PID, nonce."""
+    global _generation
+    if _generation is None or _generation[0] != os.getpid():
+        _generation = (os.getpid(), f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    return _generation[1]
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists but belongs to someone else
+    return True
+
+
+def prune_generated(root: Path, keep: Path) -> None:
+    """Remove a bounded number of old run directories whose owning launcher is gone.
+
+    Legacy flat files directly under .generated/ are left alone: an older
+    session may still read them."""
+    removed = 0
+    now = time.time()
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if removed >= GENERATED_PRUNE_LIMIT:
+            return
+        match = GENERATED_RUN.fullmatch(entry.name)
+        if not match or entry == keep or entry.is_symlink() or not entry.is_dir():
+            continue
+        try:
+            if now - entry.stat().st_mtime < GENERATED_MIN_AGE or _pid_alive(int(match.group(1))):
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed += 1
+
+
 def generated(project: Path) -> Path:
-    path = project / LOCAL / ".generated"
-    path.mkdir(parents=True, exist_ok=True)
+    """Per-run generated settings: .syndicate/.generated/<run>/.
+
+    A newer release launching in the same project writes its own directory, so
+    files an older live session (or its delayed children) still reads are never
+    replaced. Kept after exit; old ownerless directories are pruned later."""
+    root = project / LOCAL / ".generated"
+    path = root / generation_id()
+    if not path.is_dir():
+        path.mkdir(parents=True, exist_ok=True)
+        runtime.atomic_json(path / "owner.json", {"pid": os.getpid(), "created_at": time.time(),
+                                                  "release": identity.run_identity()})
+        prune_generated(root, keep=path)
     return path
+
+
+RELAY_SUBCOMMAND = "team run-role"
+
+
+def relay_allow_rule() -> str:
+    """Claude allow rule for relays. Byte-for-byte the start of every relay_command()."""
+    return f"Bash({identity.pinned_prefix()} {RELAY_SUBCOMMAND} *)"
 
 
 def relay_command(role: Role, project: Path, *, pin: bool = False) -> str:
     pinned = f" --runtime {role.cli}" if pin else ""
-    return (f"{shlex.quote(str(SCRIPT))} team run-role {role.name} --project {shlex.quote(str(project))}"
+    return (f"{identity.pinned_prefix()} {RELAY_SUBCOMMAND} {role.name} --project {shlex.quote(str(project))}"
             f"{pinned} -")
 
 
@@ -571,7 +666,7 @@ def orchestrator_body(team: Team) -> str:
     body = team.roles["orchestrator"].body + "\n\n" + split_frontmatter(PROJECT_SKILL.read_text())[1]
     if team.config["handoff"] == "on":
         body += "\n\n" + split_frontmatter(HANDOFF_SKILL.read_text())[1]
-    role_retry = shlex.join([sys.executable, str(SCRIPT), "team", "run-role"])
+    role_retry = identity.pinned_command("team", "run-role")
     body += (
         "\n\n## Specialist usage limits\n"
         "Syndicate retries relayed specialists automatically on account usage-limit failures. "
@@ -585,7 +680,7 @@ def orchestrator_body(team: Team) -> str:
         "work in the checkpoint before ending the session."
     )
     body += "\n\n" + split_frontmatter(CLOSEOUT_SKILL.read_text())[1]
-    return body + live_instructions(team.project)
+    return identity.pin_commands(body) + live_instructions(team.project)
 
 
 def claude_agent(role: Role) -> dict:
@@ -613,12 +708,11 @@ def build_claude(team: Team, headless: bool, rest: list[str]) -> list[str]:
             }
     settings: dict = {}
     if team.config["handoff"] == "on":
-        settings["statusLine"] = {"type": "command", "command":
-            shlex.join([sys.executable, str(SCRIPT), "_claude-usage"])}
+        settings["statusLine"] = {"type": "command", "command": identity.pinned_command("_claude-usage")}
     if team.gate:
         settings["hooks"] = {"Stop": [{"hooks": [{"type": "command", "command": shlex.quote(str(GATE_SCRIPT))}]}]}
     if relays:
-        settings["permissions"] = {"allow": [f"Bash({SCRIPT} team run-role *)"]}
+        settings["permissions"] = {"allow": [relay_allow_rule()]}
     argv = ["claude", "--agent", "orchestrator", "--agents", json.dumps(agents)]
     if settings:
         path = generated(team.project) / "claude-settings.json"
@@ -713,10 +807,24 @@ def registry_lock():
         yield
 
 
+def production_registered(project: Path) -> bool:
+    """In dev mode: whether the production registry (read only) lists this project."""
+    path = identity.production_home() / ".syndicate" / "projects.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    entries = data.get("projects", []) if isinstance(data, dict) else []
+    return any(isinstance(e, dict) and e.get("path") == str(project) for e in entries)
+
+
 def register_project(project: Path, generic: bool = False) -> None:
     """Record this project in the user-wide registry so dashboard/web can find it
     without being pointed at it explicitly."""
     path_str = str(project)
+    if identity.dev_mode() and production_registered(project):
+        raise SyndicateError(f"dev mode: {project} is a production project; use a separate target project "
+                             "so this run cannot write its .syndicate/ state")
     with registry_lock():
         projects = [p for p in load_registry() if p.get("path") != path_str]
         entry = {"path": path_str, "name": project.name, "last_seen": now_iso()}
@@ -1437,7 +1545,19 @@ def _tmux_env_flags():
     flags = []
     for key in ('XDG_CONFIG_HOME', 'SYNDICATE_RUNTIME', 'PATH', runtime.RUN_ENV):
         flags += ['-e', f'{key}={os.environ.get(key, "")}']
+    flags += ['-e', 'PYTHONDONTWRITEBYTECODE=1']
+    if identity.dev_mode():
+        # Belt and braces: a dev window keeps its disposable homes even on a reused server.
+        for key in DEV_TMUX_ENV:
+            if key in os.environ:
+                flags += ['-e', f'{key}={os.environ[key]}']
     return flags
+
+
+DEV_TMUX_ENV = ('HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'TMPDIR', 'TMUX_TMPDIR',
+                'CODEX_HOME', 'CLAUDE_CONFIG_DIR', identity.DEV_ENV, identity.DEV_CHECKOUT_ENV,
+                identity.DEV_COMMIT_ENV, identity.DEV_BRANCH_ENV, identity.DEV_DIRTY_ENV,
+                identity.DEV_PRODUCTION_HOME_ENV, identity.DEV_TMUX_SESSION_ENV)
 
 
 def _start_tmux_window(directory, name, command, socket=None, **run_kwargs):
@@ -1500,7 +1620,7 @@ def launch_tmux(argv, directory, name, headless=False, socket=None):
     if not shutil.which('tmux'):
         raise SyndicateError('tmux is required; install it or set tmux = off in the global config')
     _release_replaced_windows(name, socket)
-    command = shlex.join([sys.executable, str(SCRIPT), '_in-tmux', *argv])
+    command = identity.pinned_command('_in-tmux', *argv)
     target = f'{TMUX_SESSION}:{name}'
     if not headless:
         _start_tmux_window(directory, name, command, socket=socket)
@@ -1569,7 +1689,7 @@ def _view_lock(socket=None):
 
 
 def _view_hook(socket=None):
-    command = [sys.executable, str(SCRIPT), '_restore-view']
+    command = [*identity.pinned_argv(), '_restore-view']
     if socket:
         command += ['--socket', socket]
     return 'run-shell ' + shlex.quote(shlex.join(command))
@@ -2038,10 +2158,10 @@ def cmd_live(args):
 
 
 def live_instructions(project):
-    prefix = shlex.join([sys.executable, str(SCRIPT)])
+    prefix = identity.pinned_prefix()
     return ('\n\n## Live portfolio inbox\n'
             f'Syndicate executable prefix: {prefix}\nSource/workspace: {project}\n'
-            f'Inbox skill file: {INBOX_SKILL}\n' + split_frontmatter(INBOX_SKILL.read_text())[1])
+            f'Inbox skill file: {INBOX_SKILL}\n' + identity.pin_commands(split_frontmatter(INBOX_SKILL.read_text())[1]))
 
 
 def inbox_options(args, config=None):
@@ -2339,8 +2459,8 @@ def close_owned_task(project, task_id, *, session_id=None) -> bool:
 
 def chief_instructions(workspace):
     _, body = split_frontmatter(CHIEF_ROLE.read_text())
-    prefix = shlex.join([sys.executable, str(SCRIPT)])
-    return (body.strip() + f"\n\n## Launch context\nPortfolio workspace: {workspace}\n"
+    prefix = identity.pinned_prefix()
+    return (identity.pin_commands(body.strip()) + f"\n\n## Launch context\nPortfolio workspace: {workspace}\n"
             f"Portfolio store: {REGISTRY_PATH.parent / 'portfolio'}\n"
             f"Use this exact executable prefix for every Syndicate command: {prefix}\n"
             "This is a portfolio session, not a project orchestrator or specialist.\n" + live_instructions(workspace))
@@ -2352,8 +2472,7 @@ def build_chief_of_staff(provider, workspace, headless, task):
         tools = ['Read', 'Bash'] + ([] if headless else SCHEDULER_TOOLS)
         agent = dict(description="Chief of Staff for cross-project coordination", prompt=instructions,
                      tools=tools)
-        settings = {"statusLine": {"type": "command", "command":
-                    shlex.join([sys.executable, str(SCRIPT), "_claude-usage"])}}
+        settings = {"statusLine": {"type": "command", "command": identity.pinned_command("_claude-usage")}}
         argv = ["claude", "--agent", "chief-of-staff", "--agents", json.dumps({"chief-of-staff": agent}),
                 "--tools", ','.join(tools), "--settings", json.dumps(settings)]
         if headless:
@@ -4130,6 +4249,23 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p.set_defaults(fn=cmd_close_worker)
     p = cmds.add_parser('detach', help='detach from the syndicate session and restore side-by-side workers')
     p.set_defaults(fn=cmd_detach_workers)
+    p = cmds.add_parser('version', help='print the running release, mode, commit, interpreter and root '
+                        '(same as --version; writes nothing)')
+    p.add_argument('--json', action='store_true', help='print machine-readable JSON')
+    p = cmds.add_parser(
+        'dev', help='run an unmerged checkout from an isolated snapshot',
+        description='Validate a Syndicate checkout, report its branch, commit and dirty state, copy it '
+                    'into a temporary snapshot, and run the snapshot with Python -B in a disposable '
+                    'HOME, XDG, TMPDIR and tmux server, with a namespaced tmux session. Arguments after '
+                    '-- go to the snapshot launcher.',
+        epilog='Example:\n  syndicate dev --checkout ~/src/syndicate -- team task --project /tmp/scratch-repo "try it"',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--checkout', required=True, help='Syndicate checkout to run (its top-level directory)')
+    p.add_argument('--home', help='use this directory as the disposable HOME and keep it (default: temporary)')
+    p.add_argument('--keep', action='store_true', help='keep the snapshot and temporary directories after exit')
+    p.add_argument('--share-provider-config', action='store_true',
+                   help='use your CODEX_HOME and CLAUDE_CONFIG_DIR (default: disposable provider config)')
+    p.add_argument('args', nargs=argparse.REMAINDER, help='arguments for the snapshot launcher, after --')
     p = cmds.add_parser(
         "completion",
         help="print a bash or zsh completion script",
@@ -4148,10 +4284,52 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     return run, sub
 
 
+def cmd_version(argv: list[str]) -> int:
+    """Side-effect free: reads the release manifest, activation log or Git, writes nothing."""
+    if argv not in ([], ['--json']):
+        print('syndicate: usage: syndicate --version [--json]', file=sys.stderr)
+        return 2
+    info = identity.identity()
+    if argv:
+        print(json.dumps(info, indent=2, sort_keys=True))
+    else:
+        sys.stdout.write(identity.render_version(info))
+    return 0
+
+
+def cmd_dev(argv: list[str]) -> int:
+    """Run an unmerged checkout from an isolated snapshot (see bin/syndicate_dev.py)."""
+    head, rest = (argv[:argv.index('--')], argv[argv.index('--') + 1:]) if '--' in argv else (argv, None)
+    _, sub = build_parsers()
+    args = sub.parse_args(['dev', *head])
+    try:
+        return syndicate_dev.run(args.checkout, args.args if rest is None else rest, home_arg=args.home,
+                                 keep=args.keep, share_providers=args.share_provider_config)
+    except (syndicate_dev.DevError, OSError) as error:
+        print(f'syndicate dev: {error}', file=sys.stderr)
+        return 1
+
+
+def dev_guard() -> list[str]:
+    """In a `syndicate dev` run, reasons it could reach production state (empty when isolated)."""
+    if not identity.dev_mode():
+        return []
+    return identity.dev_violations(
+        [REGISTRY_PATH.parent, runtime.STATE, syndicate_worktrees.STATE_DIR], user_config_path(), TMUX_SESSION)
+
+
 def main(argv: list[str]) -> int:
     inside_tmux = bool(argv and argv[0] == '_in-tmux')
     if inside_tmux:
         argv = argv[1:]
+    if argv and argv[0] in ('--version', 'version'):
+        return cmd_version(argv[1:])
+    if argv and argv[0] == 'dev':
+        return cmd_dev(argv[1:])
+    problems = dev_guard()
+    if problems:
+        print('syndicate: dev mode refuses to touch production state: ' + '; '.join(problems), file=sys.stderr)
+        return 1
     if argv and argv[0] == '_restore-view':
         socket = None
         if len(argv) == 3 and argv[1] == '--socket':

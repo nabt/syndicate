@@ -308,8 +308,75 @@ Check `git status` first so you only remove files syndicate created.
   overridden keys.
 - `unknown role 'x'` in `syndicate.conf`: the role doesn't exist globally or under
   `.syndicate/roles/`. Check spelling with `syndicate config`.
-- Generated files are in `.syndicate/.generated/`: `claude-settings.json` and
-  `codex/*.toml`. They are rewritten on every run, so edit the sources instead.
+- Generated files are in `.syndicate/.generated/<run>/`: `claude-settings.json`,
+  `codex/*.toml` and `owner.json` (launcher PID and release). Each launch writes
+  its own directory, so a newer release never replaces files an older live
+  session still reads. Directories are kept after exit; a later launch removes
+  up to 32 that are over a day old and whose launcher has exited. Edit the
+  sources, not these files.
+
+## Release identity and pinned execution
+
+`syndicate --version` (or `syndicate version`, `--json` for machine output)
+prints the running mode, commit, interpreter and root, and writes nothing:
+
+- `release`: the root has a `RELEASE.json` manifest. Shows its commit and, when
+  `$XDG_DATA_HOME/syndicate/activations.jsonl` has a record for that commit,
+  the latest tag and activation time.
+- `checkout`: a Git checkout. Shows `HEAD`, the branch and whether the tree is dirty.
+- `dev`: a snapshot started by `syndicate dev` (below), with the source checkout's commit.
+
+A launch resolves the real path of `bin/syndicate` once, and every roles,
+skills, hooks, web and portfolio asset comes from that root, whatever the
+current directory, `PATH` or a later move of an installed `current` symlink.
+Everything Syndicate starts again (Chief launch context, team inbox and
+backoff commands, relays and their Claude allow rule, Codex relay agents, tmux
+windows, the limits monitor, the Claude status line and the channel MCP
+server) uses the same prefix: the absolute interpreter, `-B`, and that real
+launcher path. Bundled role and skill commands such as `syndicate tasks close`
+are rendered with that prefix when the prompt is assembled, so a Chief's teams
+and a team's specialists stay on the Chief's release until it restarts.
+`run.json` and the limits monitor's `monitor.json` record the release (`mode`,
+`commit`, `root`, `interpreter`); older records without it are still read.
+
+Python never writes bytecode for Syndicate: the launcher disables it before
+importing its modules, every Python child runs with `-B`, and children inherit
+`PYTHONDONTWRITEBYTECODE=1`.
+
+## Development runs
+
+`syndicate dev --checkout PATH [--home DIR] [--keep] [--share-provider-config] -- ARGS...`
+runs an unmerged checkout without touching your installed release or its state:
+
+1. Validates that PATH is the top of a Syndicate Git checkout and reports its
+   branch, commit and dirty state.
+2. Copies its tracked and untracked, not ignored, files (never `.git` or
+   bytecode) into a temporary, read-only snapshot. Later edits to the checkout
+   cannot change the running run.
+3. Runs `python3 -B <snapshot>/bin/syndicate ARGS...` from a disposable working
+   directory with a disposable `HOME` (or `--home DIR`), `XDG_*` directories,
+   `TMPDIR`, `TMUX_TMPDIR` (its own tmux server) and a namespaced tmux session
+   `syndicate-dev-<id>`. All Syndicate state (registry, portfolio, limits
+   monitor and its lock, worktree registry, user config) lives under `HOME`
+   and the XDG directories, so it lands in the disposable home; no separate
+   state override exists. Inherited `SYNDICATE_*` and `TMUX` variables are
+   dropped. `CODEX_HOME` and `CLAUDE_CONFIG_DIR` are disposable too, so
+   providers start logged out, unless you pass `--share-provider-config`.
+4. Removes the temporary directories at exit unless `--keep` is given, a
+   dev tmux session is still running, or the dev limits monitor does not stop.
+
+The snapshot refuses to run if its state, user config or tmux server would
+resolve to production (`~/.syndicate`, `~/.config/syndicate`,
+`~/.local/share/syndicate`, the `the-syndicate` session or the default tmux
+server), and refuses to register a project listed in the production registry.
+Use a separate target project, given by absolute path, for team runs:
+
+```sh
+syndicate dev --checkout ~/src/syndicate -- team task --project /path/to/scratch-repo "try the change"
+```
+
+For a quick local check without the snapshot, run the checkout directly with
+bytecode disabled: `python3 -B bin/syndicate --version`.
 
 ## Usage-aware handoffs
 

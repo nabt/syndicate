@@ -28,6 +28,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from stat import S_ISREG
 
+import syndicate_identity as identity
 import syndicate_worktrees
 
 STATE = Path.home() / ".syndicate" / "limits"
@@ -552,8 +553,7 @@ def claude_usage_probe_command(capture=None):
     so the turn is a few tokens. `capture`, when set, receives the status-line
     JSON (including the throwaway session path) before it is recorded.
     """
-    script = Path(__file__).resolve().parent / "syndicate"
-    command = [sys.executable, str(script), "_claude-usage", "--state", str(STATE)]
+    command = [*identity.pinned_argv(), "_claude-usage", "--state", str(STATE)]
     if capture is not None:
         command += ["--capture", str(capture)]
     settings = {"statusLine": {"type": "command", "command": shlex.join(command)}}
@@ -1071,12 +1071,18 @@ def monitor_tick():
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except (OSError, subprocess.TimeoutExpired):
                 pass
-    state.update(observations=observations, notified=notified, checked_at=time.time(), pid=os.getpid())
+    state.update(observations=observations, notified=notified, checked_at=time.time(), pid=os.getpid(),
+                 release=MONITOR_RELEASE or identity.run_identity())
     atomic_json(STATE / "monitor.json", state)
     return events
 
 
+MONITOR_RELEASE = None  # identity of the code this monitor process runs, read once
+
+
 def monitor_forever():
+    global MONITOR_RELEASE
+    MONITOR_RELEASE = identity.run_identity()
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (STATE / "monitor.lock").open("w") as lock:
         try:
@@ -1095,7 +1101,12 @@ def monitor_forever():
                 time.sleep(1)
 
 
-def start_monitor(script):
+def monitor_argv(script=None):
+    """The detached singleton monitor: pinned interpreter, -B, the real launcher."""
+    return [*identity.pinned_argv(script), "_limits-monitor"]
+
+
+def start_monitor(script=None):
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Lock is authoritative, unlike a possibly reused/stale PID.
     with (STATE / "monitor.lock").open("a") as lock:
@@ -1105,7 +1116,7 @@ def start_monitor(script):
             return
         fcntl.flock(lock, fcntl.LOCK_UN)
     (STATE / "stop").unlink(missing_ok=True)
-    subprocess.Popen([sys.executable, str(script), "_limits-monitor"],
+    subprocess.Popen(monitor_argv(script), env=identity.child_env(),
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
 
@@ -1254,7 +1265,9 @@ def stop_group(proc, known=None):
 def write_run_record(project, task, host, threshold, task_owner):
     run_id = time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     record = {"id": run_id, "task": task, "provider": host,
-              "reserve": threshold, "started_at": time.time()}
+              "reserve": threshold, "started_at": time.time(),
+              # Release identity of the launcher; older records lack it.
+              "release": identity.run_identity()}
     if task_owner:
         record["task_id"], record["session_id"] = task_owner
     atomic_json(project / ".syndicate" / "run.json", record)

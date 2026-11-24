@@ -311,8 +311,20 @@ role attribution regardless of the hook setting.
   (`name`, `description`, `tools`) is Claude Code-shaped and is translated for
   Codex at launch.
 
+## Version and development runs
+
+```sh
+syndicate --version   # mode (release, checkout or dev), commit, tag, interpreter, root; writes nothing
+syndicate dev --checkout ~/src/syndicate -- team task --project /path/to/scratch-repo "try it"
+```
+
+`syndicate dev` runs a snapshot of an unmerged checkout in a disposable home
+and its own tmux server, so it cannot touch your installed release or its
+state. See [Release identity and pinned execution](docs/configuration.md#release-identity-and-pinned-execution)
+and [Development runs](docs/configuration.md#development-runs).
+
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests
+python3 -B -m unittest discover -s tests
 ```
