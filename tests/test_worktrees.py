@@ -522,6 +522,7 @@ class LockedCleanup(WorktreeCase):
         self.git(self.tmp, "clone", str(self.remote), str(integrator))
         self.git(integrator, "config", "user.name", "Integrator")
         self.git(integrator, "config", "user.email", "integrator@example.com")
+        self.integrator = integrator
         self.git(integrator, "merge", "--no-ff", "--no-edit", f"origin/{self.branch}")
         self.git(integrator, "push", "origin", "main")
         merge = self.git(integrator, "rev-parse", "HEAD")
@@ -534,12 +535,12 @@ class LockedCleanup(WorktreeCase):
         """Run cleanup-pr; git commands starting with an entry of fail exit 1."""
         run = syndicate_git._run
 
-        def fake(path, command, expected=(0,)):
+        def fake(path, command, expected=(0,), label=None):
             if command[0] == "gh":
                 return subprocess.CompletedProcess(command, 0, json.dumps(self.pr), "")
             if any(command[2:2 + len(prefix)] == prefix for prefix in fail):
                 raise syndicate_git.CleanupError(f"git {command[2]} failed: simulated")
-            return run(path, command, expected)
+            return run(path, command, expected, label)
 
         argv = ["tasks", "cleanup-pr", "7", "-C", str(self.repo), "--branch", self.branch,
                 "--worktree", str(self.path)] + (["--task", task] if task else [])
@@ -590,6 +591,25 @@ class LockedCleanup(WorktreeCase):
         self.tasks[0]["state"] = "done"
         self.assertEqual(self.cleanup(), 0)
         self.assertFalse(self.path.exists())
+
+    def test_squash_merge_keeps_series_and_lock_rules(self):
+        # Replace the merge commit on main with a squash of the same PR.
+        self.git(self.integrator, "reset", "-q", "--hard", self.start)
+        self.git(self.integrator, "merge", "--squash", f"origin/{self.branch}")
+        self.git(self.integrator, "commit", "-m", "squashed PR")
+        self.git(self.integrator, "push", "--force", "origin", "main")
+        self.pr["mergeCommit"] = {"oid": self.git(self.integrator, "rev-parse", "HEAD")}
+        self.ensure(task="task-b")
+        self.tasks = [{"id": "task-b", "source_path": str(self.source), "state": "running"},
+                      {"id": TASK, "source_path": str(self.source), "state": "running"}]
+        with self.assertRaisesRegex(sy.SyndicateError, "series work/feature-1 is still active: task-b"):
+            self.cleanup()
+        self.assert_intact()
+        self.tasks[0]["state"] = "done"
+        self.assertEqual(self.cleanup(), 0)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.git(self.remote, "branch", "--list", self.branch), "")
+        self.assertIn("Verified squash/rebase merge", self.output())
 
     def test_series_spans_every_worktree_of_the_series(self):
         self.ensure(task="task-b", branch="work/feature-2", series="work/feature-1")
