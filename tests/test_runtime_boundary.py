@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -181,6 +182,37 @@ class Pinning(ProjectCase):
                 self.assertEqual(shlex.split(identity.pinned_command("team", "run-role", "a b")),
                                  ["/opt/py thon/bin/python3", "-B", str(launcher), "team", "run-role", "a b"])
                 self.assertEqual(sy.relay_allow_rule(), f"Bash({prefix} team run-role *)")
+
+    def test_paths_with_a_closing_parenthesis(self):
+        # A checkout or dev snapshot can live under a ')' path (the installer refuses
+        # one). Shell commands stay correctly quoted; the Claude relay allow rule,
+        # which cannot express ')', is omitted so relays ask for approval instead.
+        self.config("code-reviewer = codex\n")
+        with tempfile.TemporaryDirectory(prefix="paren) ") as tmp:
+            launcher = Path(tmp) / "bin (x)" / "syndicate"
+            launcher.parent.mkdir()
+            launcher.write_text("")
+            with patch.object(identity, "LAUNCHER", launcher), \
+                 patch.object(identity.sys, "executable", "/opt/py)thon/bin/python3"):
+                argv = [identity.interpreter(), "-B", str(launcher)]
+                self.assertIsNone(sy.relay_allow_rule())
+                team = sy.resolve_team(self.project)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    built = sy.build_claude(team, headless=False, rest=[])
+                self.assertIn("relays will ask for approval", err.getvalue())
+                settings = json.loads(Path(built[built.index("--settings") + 1]).read_text())
+                self.assertNotIn("permissions", settings)
+                self.assertEqual(shlex.split(settings["statusLine"]["command"]), [*argv, "_claude-usage"])
+                command = sy.relay_command(team.roles["code-reviewer"], self.project)
+                self.assertEqual(shlex.split(command)[:5], [*argv, "team", "run-role"])
+                agents = json.loads(built[built.index("--agents") + 1])
+                self.assertIn(f"{command} <<'SYNDICATE_BRIEF'\n", agents["code-reviewer"]["prompt"])
+                gate = Path(tmp) / "hooks (y)" / "require-review.sh"
+                with patch.object(sy, "GATE_SCRIPT", gate), contextlib.redirect_stderr(io.StringIO()):
+                    built = sy.build_claude(team, headless=False, rest=[])
+                    hook = json.loads(Path(built[built.index("--settings") + 1]).read_text())
+                self.assertEqual(shlex.split(hook["hooks"]["Stop"][0]["hooks"][0]["command"]), [str(gate)])
 
     def test_claude_relay_heredoc_and_allow_rule_are_byte_parity(self):
         self.config("code-reviewer = codex\n")
@@ -421,6 +453,58 @@ class GeneratedSettings(ProjectCase):
         self.assertFalse(stale.exists())
 
 
+class ReleaseInUseMarkers(ProjectCase):
+    def setUp(self):
+        super().setUp()
+        self.store = self.project / "store" / "syndicate"
+        self.release = self.store / "releases" / COMMIT
+        self.release.mkdir(parents=True)
+        self.addCleanup(sy._release_markers.clear)
+        fake = {"mode": "release", "commit": COMMIT}
+        for target in (patch.object(identity, "ROOT", self.release),
+                       patch.object(identity, "identity", return_value=fake),
+                       patch.object(sy.atexit, "register")):
+            target.start()
+            self.addCleanup(target.stop)
+
+    def test_launcher_and_cli_child_markers_follow_their_processes(self):
+        child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        sy.mark_release_in_use()
+        sy.mark_release_in_use()  # once per PID
+        sy.record_cli_owner(self.project, None, child.pid)
+        markers = self.store / "in-use" / COMMIT
+        self.assertEqual(sorted(p.name for p in markers.iterdir()), sorted([str(os.getpid()), str(child.pid)]))
+        self.assertEqual(json.loads((markers / str(child.pid)).read_text())["launcher_pid"], os.getpid())
+        self.assertEqual(sy.atexit.register.call_count, 1)
+        sy.clear_release_markers()  # the live child keeps its marker
+        self.assertEqual([p.name for p in markers.iterdir()], [str(child.pid)])
+        child.kill()
+        child.wait()
+        sy.clear_release_markers()
+        self.assertFalse((self.store / "in-use").exists())
+        self.assertEqual(sy._release_markers, [])
+
+    def test_no_markers_outside_an_installed_release(self):
+        with patch.object(identity, "identity", return_value={"mode": "checkout", "commit": COMMIT}):
+            sy.mark_release_in_use()
+        extracted = self.project / "extracted"
+        with patch.object(identity, "ROOT", extracted):
+            sy.mark_release_in_use()
+        self.assertFalse((self.store / "in-use").exists())
+        self.assertFalse((self.project / "in-use").exists())
+        self.assertEqual(sy._release_markers, [])
+
+    def test_unwritable_store_warns_and_does_not_stop_the_launch(self):
+        (self.store / "in-use").write_text("not a directory")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            sy.mark_release_in_use()
+        self.assertIn("could not write release in-use marker", err.getvalue())
+        self.assertEqual(sy._release_markers, [])
+
+
 class RunIdentity(ProjectCase):
     def test_run_record_carries_release_identity_and_older_records_still_read(self):
         runtime.write_run_record(self.project, "task", "claude", 10, None)
@@ -574,6 +658,65 @@ class Version(SubprocessCase):
         self.assertIn("tag: v0.1.1\n", text)
         self.assertEqual(tree(self.scratch), before)
         self.assertEqual(tree(self.fixture.release), before_release)
+
+    def test_non_git_tree_reports_checkout_with_unknown_commit(self):
+        plain = self.scratch / "plain tree"
+        copy_runtime(plain)
+        env = dict(self.env, GIT_CEILING_DIRECTORIES=str(self.scratch))
+        before = tree(self.scratch)
+        result = self.run_cli("--version", "--json", launcher=plain / "bin" / "syndicate", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        info = json.loads(result.stdout)
+        self.assertEqual((info["mode"], info["commit"], info["root"]), ("checkout", None, str(plain)))
+        for key in ("error", "install_root", "tag"):
+            self.assertNotIn(key, info)
+        self.assertEqual((info["branch"], info["dirty"]), (None, None))
+        text = self.run_cli("--version", launcher=plain / "bin" / "syndicate", env=env)
+        self.assertIn("syndicate unknown\nmode: checkout\n", text.stdout)
+        self.assertEqual(tree(self.scratch), before)
+        self.assertEqual(caches(plain), [])
+
+    def test_release_reports_install_root_current_and_manifest_mismatch(self):
+        info = json.loads(self.run_cli("--version", "--json").stdout)
+        self.assertEqual((info["install_root"], info["current"]), (str(self.fixture.data), True))
+        self.assertNotIn("error", info)
+        # An installed release that is not current, whose manifest names another commit.
+        store = self.scratch / "other store" / "syndicate"
+        release = store / "releases" / OTHER
+        copy_runtime(release)
+        release.chmod(0o700)
+        (release / "RELEASE.json").write_text(json.dumps(
+            {"format": 1, "commit": COMMIT, "files": {}, "python_min": "3.11"}))
+        result = self.run_cli("--version", "--json", launcher=release / "bin" / "syndicate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        info = json.loads(result.stdout)
+        self.assertEqual((info["mode"], info["install_root"], info["current"]), ("release", str(store), False))
+        self.assertIn("not its release directory", info["error"])
+        text = self.run_cli("--version", launcher=release / "bin" / "syndicate").stdout
+        self.assertIn(f"install root: {store} (not the current release)\n", text)
+        (release / "RELEASE.json").write_text(json.dumps({"commit": OTHER}))
+        info = json.loads(self.run_cli("--version", "--json", launcher=release / "bin" / "syndicate").stdout)
+        self.assertEqual(info["commit"], OTHER)
+        self.assertIn("malformed", info["error"])
+
+    def test_release_dashboard_marks_its_release_in_use_until_exit(self):
+        markers = self.fixture.data / "in-use"
+        env = dict(self.env, PYTHONUNBUFFERED="1")
+        proc = subprocess.Popen([sys.executable, "-B", str(self.fixture.shim), "web", "--no-monitor", "--port", "0"],
+                                cwd=self.foreign, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            line = proc.stdout.readline()
+            self.assertIn("http://127.0.0.1:", line, proc.stderr.read() if proc.poll() is not None else line)
+            self.assertEqual([p.name for p in (markers / COMMIT).iterdir()], [str(proc.pid)])
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            proc.stdout.close()
+            proc.stderr.close()
+        self.assertFalse(markers.exists())
 
     def test_release_version_tolerates_missing_activation_log(self):
         log = self.fixture.data / "activations.jsonl"

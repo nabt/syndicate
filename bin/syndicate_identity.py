@@ -164,6 +164,30 @@ def latest_activation(commit: str, root: Path = ROOT) -> dict | None:
     return found
 
 
+def manifest_problem(manifest: dict, installed_root: Path | None) -> str | None:
+    """Why RELEASE.json does not match the installer's contract
+    ({format: 1, commit, files, python_min}); None when it does. For an
+    installed release the commit must also be its releases/<commit> name."""
+    commit = manifest.get("commit")
+    if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
+        return "does not name a valid commit"
+    if (manifest.get("format") != 1 or not isinstance(manifest.get("files"), dict)
+            or not isinstance(manifest.get("python_min"), str)):
+        return "is malformed (expected format 1 with commit, files and python_min)"
+    if installed_root is not None and installed_root.name != commit:
+        return f"names commit {commit}, not its release directory {installed_root.name}"
+    return None
+
+
+def current_release(install_root: Path) -> Path | None:
+    """The release <install_root>/current points at, resolved; None if absent or broken."""
+    link = install_root / "current"
+    try:
+        return link.resolve(strict=True) if link.is_symlink() else None
+    except (OSError, RuntimeError):
+        return None
+
+
 def _git(root: Path, *args: str) -> str | None:
     # No optional locks: reading identity must never refresh or write the index.
     env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
@@ -192,9 +216,14 @@ def _identity(root: Path, running_mode: str) -> tuple:
         manifest = read_manifest(root) or {}
         commit = manifest.get("commit")
         info["commit"] = commit if isinstance(commit, str) and COMMIT.fullmatch(commit) else None
-        if info["commit"] is None:
-            info["error"] = f"{root / MANIFEST} does not name a valid commit"
-        else:
+        installed = root.parent.name == "releases"
+        if installed:
+            info["install_root"] = str(root.parent.parent)
+            info["current"] = current_release(root.parent.parent) == root
+        problem = manifest_problem(manifest, root if installed else None)
+        if problem:
+            info["error"] = f"{root / MANIFEST} {problem}"
+        if info["commit"] is not None:
             record = latest_activation(info["commit"], root)
             if record:
                 info["activation"] = {k: record.get(k) for k in
@@ -244,6 +273,9 @@ def render_version(info: dict) -> str:
         lines.append(f"activated: {activation['at']}")
     if info.get("checkout"):
         lines.append(f"checkout: {info['checkout']}")
+    if info.get("install_root"):
+        lines.append(f"install root: {info['install_root']}"
+                     f"{'' if info.get('current') else ' (not the current release)'}")
     if info.get("error"):
         lines.append(f"warning: {info['error']}")
     lines += [f"interpreter: {info['interpreter']}", f"root: {info['root']}"]

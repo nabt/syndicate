@@ -30,7 +30,7 @@ Configuration and state stay where they are today: `~/.config/syndicate/`
 | `$XDG_DATA_HOME/syndicate/activations.jsonl` | Append-only activation log. |
 | `$XDG_DATA_HOME/syndicate/entrypoints.jsonl`, `entrypoint-backups/` | What the stable entry point replaced, for recovery. |
 | `$XDG_DATA_HOME/syndicate/activation.lock` | Lock that serializes publish, activate, rollback and prune. |
-| `$XDG_DATA_HOME/syndicate/in-use/<commit>/<pid>` | Optional markers. A live PID keeps that release from being pruned. |
+| `$XDG_DATA_HOME/syndicate/in-use/<commit>/<pid>` | In-use markers. An installed release writes one for each launcher that starts a session, dashboard or monitor and for each supervised provider CLI, and removes it at exit. A live PID keeps that release from being pruned. |
 | `$XDG_CACHE_HOME/syndicate/source.git` | Bare release-source cache. It is the only Git input to a release and lives outside every project worktree. |
 | `~/.local/bin/syndicate` | Stable entry point (shim). |
 
@@ -221,9 +221,16 @@ syndicate-install prune
 - the previous known-good release (the default rollback target),
 - a release with a live `in-use/<commit>/<pid>` marker,
 - a release referenced in the command line of any running process (found
-  through `/proc`),
+  through `/proc`; a fallback for processes without a marker, such as older
+  releases or short commands, and unavailable where there is no `/proc`),
 - a release registered as the Codex Stop hook in `$CODEX_HOME/hooks.json`
   (`--codex-home` overrides the location).
+
+Markers are the primary liveness signal. The launcher of a Chief, team,
+specialist relay, `syndicate web` dashboard or limits monitor writes one for
+its own PID and one for the provider CLI it supervises; markers left by a
+crashed process name a dead PID, are ignored, and are removed by `prune`. A
+reused PID can keep a release longer than needed, never shorter.
 
 Keep a release while any Chief, team, dashboard, monitor, hook or explicit
 resume path still uses it. If a session is idle with no process on that

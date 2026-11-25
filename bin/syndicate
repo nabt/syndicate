@@ -31,6 +31,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import argparse
+import atexit
 import errno
 import http.server
 import json
@@ -657,7 +658,69 @@ def generated(project: Path) -> Path:
                                                   "release": identity.run_identity(), "child_pids": []})
         prune_generated(root, keep=path)
     _generated_dirs.add(path)
+    mark_release_in_use()
     return path
+
+
+# In-use markers this process wrote (see mark_release_in_use).
+_release_markers: list[Path] = []
+
+
+def mark_release_in_use(pid: int | None = None) -> None:
+    """Release mode only: write <data>/syndicate/in-use/<commit>/<pid>.
+
+    `syndicate-install prune` keeps a release while a marker's PID is alive.
+    Markers name the launcher and its supervised CLI child explicitly, so a
+    session stays protected where scanning /proc command lines cannot see it
+    (no /proc, as on macOS, or a CLI whose argv names no release path). The
+    installer still scans /proc as a fallback for processes without markers.
+    Best effort: a failure warns and never stops the launch. Markers are removed
+    at exit once their process is gone; one left by a crash names a dead PID,
+    which prune ignores and removes."""
+    info = identity.identity()
+    commit = info.get("commit")
+    if info.get("mode") != "release" or not commit or identity.ROOT.parent.name != "releases":
+        return
+    pid = os.getpid() if pid is None else pid
+    directory = identity.data_root(identity.ROOT) / "in-use" / commit
+    marker = directory / str(pid)
+    if marker in _release_markers:
+        return
+    record = json.dumps({"pid": pid, "launcher_pid": os.getpid(), "created_at": time.time()}) + "\n"
+    for _ in range(2):  # a concurrent cleanup may remove the empty directory between mkdir and write
+        try:
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            marker.write_text(record)
+            break
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            print(f"syndicate: could not write release in-use marker {marker}: {error}", file=sys.stderr)
+            return
+    else:
+        return
+    if not _release_markers:
+        atexit.register(clear_release_markers)
+    _release_markers.append(marker)
+
+
+def clear_release_markers() -> None:
+    """Remove this process's markers whose process is gone (always its own), then
+    their directories if empty. A forked child exiting leaves its parent's marker."""
+    for marker in list(_release_markers):
+        pid = int(marker.name)
+        if pid != os.getpid() and _pid_alive(pid):
+            continue
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            continue
+        _release_markers.remove(marker)
+        for directory in (marker.parent, marker.parent.parent):
+            try:
+                directory.rmdir()
+            except OSError:
+                break
 
 
 def record_generated_child(pid: int) -> None:
@@ -678,9 +741,17 @@ def record_generated_child(pid: int) -> None:
 RELAY_SUBCOMMAND = "team run-role"
 
 
-def relay_allow_rule() -> str:
-    """Claude allow rule for relays. Byte-for-byte the start of every relay_command()."""
-    return f"Bash({identity.pinned_prefix()} {RELAY_SUBCOMMAND} *)"
+def relay_allow_rule() -> str | None:
+    """Claude allow rule for relays. Byte-for-byte the start of every relay_command().
+
+    None when the pinned prefix contains ')': Claude's Bash(...) rule would end
+    at it and grant the wrong command. Relays then ask for normal approval.
+    (syndicate-install refuses such install roots and interpreters; a checkout
+    or dev snapshot can still live under one.)"""
+    prefix = identity.pinned_prefix()
+    if ")" in prefix:
+        return None
+    return f"Bash({prefix} {RELAY_SUBCOMMAND} *)"
 
 
 def relay_command(role: Role, project: Path, *, pin: bool = False) -> str:
@@ -755,7 +826,12 @@ def build_claude(team: Team, headless: bool, rest: list[str]) -> list[str]:
     if team.gate:
         settings["hooks"] = {"Stop": [{"hooks": [{"type": "command", "command": shlex.quote(str(GATE_SCRIPT))}]}]}
     if relays:
-        settings["permissions"] = {"allow": [relay_allow_rule()]}
+        rule = relay_allow_rule()
+        if rule:
+            settings["permissions"] = {"allow": [rule]}
+        else:
+            print(f"syndicate: warning: {identity.pinned_prefix()} contains ')', which a Claude Bash() "
+                  "permission rule cannot express; relays will ask for approval", file=sys.stderr)
     argv = ["claude", "--agent", "orchestrator", "--agents", json.dumps(agents)]
     if settings:
         path = generated(team.project) / "claude-settings.json"
@@ -2597,6 +2673,7 @@ def cmd_chief_of_staff(args):
             if not checkpoint.exists():
                 checkpoint.write_text("Chief of Staff session. Read fresh portfolio records; no prior coordination checkpoint is available.\n")
             try:
+                mark_release_in_use()
                 runtime.start_monitor(SCRIPT)
                 print(f"syndicate: Chief of Staff on {provider}; monitoring at {args.reserve:g}% reserve.", file=sys.stderr)
                 # Keep ownership if the supervisor crashes but its CLI survives.
@@ -3018,6 +3095,7 @@ def cmd_web(args: argparse.Namespace) -> int:
     # --no-monitor: never start the shared limits monitor from this dashboard,
     # e.g. while a release transition has stopped it (docs/user-install.md).
     server.autostart_monitor = not getattr(args, "no_monitor", False)
+    mark_release_in_use()
     if server.autostart_monitor:
         runtime.start_monitor(SCRIPT)
     print(f"syndicate web dashboard: http://127.0.0.1:{server.server_address[1]}/  (ctrl-c to stop)")
@@ -3139,6 +3217,7 @@ def record_cli_owner(project, session, pid) -> None:
     coordination session. Either copy is enough to stop a released lock from
     being read as proof that the session ended."""
     record_generated_child(pid)
+    mark_release_in_use(pid)
     owner = owner_identity(pid)
     stored = False
     if session:
@@ -4467,6 +4546,7 @@ def main(argv: list[str]) -> int:
             print("Syndicate: Claude usage unknown")
             return 0
     if argv == ["_limits-monitor"]:
+        mark_release_in_use()
         return runtime.monitor_forever()
     if argv and argv[0] == "__complete":
         return completion.complete_main(argv[1:], completion_source())

@@ -246,7 +246,12 @@ on another installed CLI using the [latest usage readings](handoff.md).
 Things to know:
 
 - **Claude host, Codex role.** The generated settings allow the relay's exact
-  command (`Bash(<syndicate> team run-role *)`) so it doesn't prompt every time.
+  command (`Bash(<syndicate> team run-role *)`, where `<syndicate>` is the
+  pinned prefix described under [Release identity](#release-identity-and-pinned-execution))
+  so it doesn't prompt every time. The rule changes with the release, so
+  approvals saved for an older prefix prompt once more. A `)` in the
+  interpreter or launcher path cannot be expressed in the rule; Syndicate then
+  omits it, warns, and relays ask for normal approval.
 - **Codex host, Claude role.** Codex's sandbox blocks network by default, so the
   relayed `claude` couldn't reach its API. When a Claude-backed role exists under
   a Codex host, syndicate launches Codex with
@@ -311,9 +316,11 @@ Check `git status` first so you only remove files syndicate created.
 - Generated files are in `.syndicate/.generated/<run>/`: `claude-settings.json`,
   `codex/*.toml` and `owner.json` (launcher PID and release). Each launch writes
   its own directory, so a newer release never replaces files an older live
-  session still reads. Directories are kept after exit; a later launch removes
-  up to 32 that are over a day old and whose launcher has exited. Edit the
-  sources, not these files.
+  session still reads. `owner.json` also lists the supervised CLI child
+  (`child_pids`). Directories are kept after exit; a later launch removes up to
+  32 that are over a day old and whose launcher and recorded CLI children have
+  all exited. Nothing is pruned while another process holds the project's
+  session lock. Edit the sources, not these files.
 
 ## Release identity and pinned execution
 
@@ -321,9 +328,15 @@ Check `git status` first so you only remove files syndicate created.
 prints the running mode, commit, interpreter and root, and writes nothing:
 
 - `release`: the root has a `RELEASE.json` manifest. Shows its commit and, when
-  `$XDG_DATA_HOME/syndicate/activations.jsonl` has a record for that commit,
-  the latest tag and activation time.
-- `checkout`: a Git checkout. Shows `HEAD`, the branch and whether the tree is dirty.
+  the install root's `activations.jsonl` has a record for that commit, the
+  latest tag and activation time. For an installed release
+  (`<install root>/releases/<commit>`, see [Per-user installation](user-install.md))
+  it also shows the install root and whether `current` points at this release.
+  A manifest that is malformed or names a commit other than its directory is
+  reported as a warning.
+- `checkout`: a Git checkout. Shows `HEAD`, the branch and whether the tree is
+  dirty. A tree without Git (for example an extracted archive) reports an
+  unknown commit.
 - `dev`: a snapshot started by `syndicate dev` (below), with the source checkout's commit.
 
 A launch resolves the real path of `bin/syndicate` once, and every roles,
@@ -338,6 +351,10 @@ are rendered with that prefix when the prompt is assembled, so a Chief's teams
 and a team's specialists stay on the Chief's release until it restarts.
 `run.json` and the limits monitor's `monitor.json` record the release (`mode`,
 `commit`, `root`, `interpreter`); older records without it are still read.
+An installed release also writes `in-use/<commit>/<pid>` markers under its
+install root for each launcher that starts a session, dashboard or monitor and
+for the provider CLI it supervises, so `syndicate-install prune` keeps that
+release while they run (see [Prune and retention](user-install.md#prune-and-retention)).
 
 Python never writes bytecode for Syndicate: the launcher disables it before
 importing its modules, every Python child runs with `-B`, and children inherit
@@ -402,6 +419,9 @@ and session-output log. `--reserve` overrides `handoff-reserve` for one run.
 Account observations and a single background reset monitor live under
 `~/.syndicate/limits/`. See [Usage-aware handoffs](handoff.md) for the lifecycle,
 telemetry limitations, notification behavior, and monitor shutdown command.
+Chief and team launches, `syndicate limits` and `syndicate web` start the
+monitor when it is not running; `syndicate web --no-monitor` never does, which
+keeps a dashboard up while the monitor is stopped for a release change.
 
 Project Codex launches add `~/.syndicate/portfolio` as a writable directory so
 orchestrators can record shared decisions, briefs, and request receipts while

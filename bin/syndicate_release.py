@@ -856,7 +856,13 @@ def pid_alive(pid: int) -> bool:
 
 
 def releases_in_use(paths: Paths) -> dict[str, str]:
-    """{commit: reason} for releases a live process, marker or hook still uses."""
+    """{commit: reason} for releases a live process or marker still uses.
+
+    Markers (in-use/<commit>/<pid>) are the primary signal: the launcher writes
+    one for itself and for its supervised CLI child in release mode. Scanning
+    /proc command lines is the fallback for processes without a marker (older
+    releases, short commands, a marker that could not be written); it finds
+    nothing where /proc is absent."""
     used: dict[str, str] = {}
     if paths.in_use.is_dir():
         for marker in paths.in_use.glob("*/*"):
@@ -891,8 +897,26 @@ def hook_releases(paths: Paths, codex_home: Path | None) -> set[str]:
     return found
 
 
+def remove_stale_markers(paths: Paths) -> None:
+    """Remove in-use markers whose PID is gone, then empty marker directories."""
+    if not paths.in_use.is_dir() or paths.in_use.is_symlink():
+        return
+    for directory in paths.in_use.iterdir():
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        for marker in directory.iterdir():
+            if marker.name.isdigit() and not marker.is_dir() and not pid_alive(int(marker.name)):
+                marker.unlink(missing_ok=True)
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
 def prune(paths: Paths, dry_run: bool = False, codex_home: Path | None = None) -> dict:
     with activation_lock(paths):
+        if not dry_run:
+            remove_stale_markers(paths)
         current = current_commit(paths)
         previous = next(iter([c for c in known_good(paths, current) if paths.release(c).is_dir()]), None)
         used = releases_in_use(paths)

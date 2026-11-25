@@ -450,6 +450,26 @@ class Activation(InstallCase):
         self.installer("rollback")
         self.assertEqual(self.current(), b)
 
+    def test_prune_ignores_and_removes_markers_of_gone_processes(self):
+        a, b, c = FIXTURE["a"], FIXTURE["b"], FIXTURE["c"]
+        for tag in ("v1.0.0", "v1.1.0", "v1.2.0"):
+            self.install(tag)
+        dead = subprocess.Popen([sys.executable, "-B", "-c", ""])
+        dead.wait()
+        stale = self.root / "in-use" / a / str(dead.pid)
+        stale.parent.mkdir(parents=True)
+        stale.write_text("{}")
+        live = self.root / "in-use" / b / str(os.getpid())
+        live.parent.mkdir(parents=True)
+        live.write_text("{}")
+        result = json.loads(self.installer("prune", "--dry-run", "--json").stdout)
+        self.assertEqual(result["removed"], [a])
+        self.assertTrue(stale.exists())  # a dry run changes nothing
+        result = json.loads(self.installer("prune", "--json").stdout)
+        self.assertEqual(result["removed"], [a])
+        self.assertFalse(stale.parent.exists())
+        self.assertTrue(live.exists())
+
     def test_exception_during_staging_keeps_previous_release(self):
         self.install("v1.0.0")
         quiet = mock.patch.object(rel, "log")
