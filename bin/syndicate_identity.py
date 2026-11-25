@@ -289,3 +289,98 @@ def dev_violations(state_dirs: list[Path], config_file: Path, tmux_session: str)
     if socket and (not tmux_dir or not _same_or_inside(Path(socket), Path(tmux_dir))):
         problems.append(f"TMUX points at a tmux server outside {tmux_dir or 'TMUX_TMPDIR'}")
     return problems
+
+
+class DevTargetError(Exception):
+    """A dev run was pointed at production state, or the target could not be proven safe."""
+
+
+def _git_common_dir(directory: Path) -> Path | None:
+    """Absolute Git common dir of directory's repository; None outside a repository.
+
+    Raises DevTargetError when Git cannot be run, so the caller fails closed."""
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_CEILING_DIRECTORIES")}
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        result = subprocess.run(["git", "--no-optional-locks", "-C", str(directory), "rev-parse", "--git-common-dir"],
+                                capture_output=True, text=True, env=env, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise DevTargetError(f"cannot run git to check {directory}: {error}") from None
+    if result.returncode:
+        return None
+    value = result.stdout.strip()
+    if not value:
+        raise DevTargetError(f"git reported no common dir for {directory}")
+    return (directory / value).resolve() if not os.path.isabs(value) else Path(value).resolve()
+
+
+def _existing_dir(path: Path) -> Path:
+    """path itself when it is a directory, else its nearest existing ancestor directory."""
+    while not path.is_dir():
+        if path.parent == path:
+            break
+        path = path.parent
+    return path
+
+
+def production_projects() -> list[Path]:
+    """Paths (projects and generic task groups) in the production registry, read only.
+
+    A missing registry lists nothing; an unreadable or malformed one raises, so
+    a dev run cannot proceed without proving its target is not registered."""
+    path = production_home() / ".syndicate" / "projects.json"
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise DevTargetError(f"cannot read the production registry {path}: {error}") from None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise DevTargetError(f"the production registry {path} is not valid JSON") from None
+    entries = data.get("projects", []) if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        raise DevTargetError(f"the production registry {path} has an unexpected shape")
+    paths = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        for key in ("path", "group_path"):
+            value = entry.get(key)
+            if isinstance(value, str) and os.path.isabs(value):
+                paths.append(Path(value))
+    return paths
+
+
+def dev_target_violation(target: str | os.PathLike) -> str | None:
+    """Why a dev run must not use target as a project, source, repo or worktree; None when safe.
+
+    Refuses a target that is, or is inside, production Syndicate state or a
+    production-registered project (or generic task group), or whose Git
+    repository shares its common dir with a registered project (a linked task
+    worktree, or a subdirectory of one). Any doubt is a refusal."""
+    try:
+        path = Path(os.path.abspath(Path(target).expanduser())).resolve()
+    except (OSError, RuntimeError, ValueError) as error:
+        return f"cannot resolve {target}: {error}"
+    homes = {production_home(), Path(pwd.getpwuid(os.getuid()).pw_dir)}
+    for home in homes:
+        for root in (home / ".syndicate", home / ".config" / "syndicate", home / ".local" / "share" / "syndicate"):
+            if _same_or_inside(path, root):
+                return f"{path} is production Syndicate state ({root})"
+    try:
+        registered = production_projects()
+        for project in registered:
+            if _same_or_inside(path, project):
+                return f"{path} is the production project {project} or inside it"
+        common = _git_common_dir(_existing_dir(path))
+        if common is not None:
+            for project in registered:
+                if project.is_dir() and _git_common_dir(project) == common:
+                    return (f"{path} shares the Git repository {common} of the production project {project} "
+                            "(a linked worktree or subdirectory of it)")
+    except DevTargetError as error:
+        return str(error)
+    return None

@@ -43,7 +43,9 @@ agent with `syndicate chief-of-staff -x claude` or `-x codex`.
 ## Setup (once per machine)
 
 Requires Python 3.11 or newer (`python3`), the `claude` and/or `codex` CLI, and `jq` (for the review
-gate). Put the launcher on your `PATH`:
+gate). To install immutable, versioned releases from approved tags with upgrade
+and rollback, see [Per-user installation](docs/user-install.md). For a
+checkout-based setup, put the launcher on your `PATH`:
 
 ```sh
 ln -s "$PWD/bin/syndicate" ~/.local/bin/syndicate
@@ -198,6 +200,7 @@ syndicate dashboard --once --color always     # force ANSI colors
 
 # Browser: starts a local server and prints the URL (http://127.0.0.1:8765/ by default)
 syndicate web
+syndicate web --no-monitor                    # never start the background limits monitor
 ```
 
 The console dashboard shows a table of projects and status counts. Add

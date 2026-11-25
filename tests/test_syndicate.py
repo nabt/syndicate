@@ -521,12 +521,20 @@ class LaunchCommands(ProjectCase):
                          [str(sy.REGISTRY_PATH.parent / "portfolio")])
 
     def test_codex_removes_stale_agent_files(self):
+        # One launcher can build Codex agents more than once in its run directory
+        # (each handoff iteration of cmd_run): TOMLs not written by the latest
+        # build go; another run's directory is never touched.
         self.config("orchestrator = codex\n")
         gen = sy.generated(self.project) / "codex"
         gen.mkdir(parents=True)
         (gen / "gone.toml").write_text("x")
+        other = self.project / ".syndicate" / ".generated" / "20200101T000000-1-00000000" / "codex"
+        other.mkdir(parents=True)
+        (other / "gone.toml").write_text("another run")
         sy.build_codex(sy.resolve_team(self.project), False, [])
         self.assertFalse((gen / "gone.toml").exists())
+        self.assertTrue((gen / "code-reviewer.toml").is_file())
+        self.assertEqual((other / "gone.toml").read_text(), "another run")
 
     def test_toml_strings_survive_quotes_and_newlines(self):
         import tomllib

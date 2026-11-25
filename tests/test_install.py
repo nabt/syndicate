@@ -368,6 +368,23 @@ class Verification(InstallCase):
                 self.assertIsNone(self.current())
                 self.assertEqual(self.release_entries(), [])
 
+    def test_paths_with_a_closing_parenthesis_are_refused(self):
+        bad_root = self.tmp / "store (old)" / "syndicate"
+        result = self.install("v1.0.0", "--install-root", str(bad_root), ok=False)
+        self.assertIn("contains ')'", result.stderr)
+        self.assertFalse(bad_root.exists())
+        python = self.tmp / "py)thon"
+        python.symlink_to(os.path.abspath(sys.executable))
+        result = self.install("v1.0.0", "--python", str(python), ok=False)
+        self.assertIn("interpreter", result.stderr)
+        self.assertIn("contains ')'", result.stderr)
+        self.assertEqual((self.current(), self.release_entries()), (None, []))
+        self.install("v1.0.0")
+        self.install("v1.1.0")
+        result = self.installer("rollback", "--python", str(python), ok=False)
+        self.assertIn("contains ')'", result.stderr)
+        self.assertEqual(self.current(), FIXTURE["b"])
+
     def test_rollback_rejects_an_interpreter_that_is_no_longer_usable(self):
         python = self.tmp / "fakebin" / "python-link"
         python.symlink_to(os.path.abspath(sys.executable))
@@ -621,35 +638,56 @@ class Boot(InstallCase):
         self.assertIn(str(self.release), result.stdout)
 
     def test_dashboard_serves_from_release(self):
-        # Hold the monitor singleton lock so 'web' treats the monitor as running
-        # and never spawns a background _limits-monitor in this disposable home.
+        # --no-monitor: the dashboard never spawns a background _limits-monitor
+        # in this disposable home, at launch or when limits are fetched.
         state = self.tmp / "home" / ".syndicate" / "limits"
-        state.mkdir(parents=True)
-        with open(state / "monitor.lock", "a") as monitor:
-            fcntl.flock(monitor, fcntl.LOCK_EX)
-            env = dict(self.env, PYTHONUNBUFFERED="1")
-            proc = subprocess.Popen([str(self.shim), "web", "--port", "0"], cwd=self.tmp / "elsewhere", env=env,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            try:
-                line = proc.stdout.readline()
-                self.assertIn("http://127.0.0.1:", line, proc.stderr.read() if proc.poll() is not None else line)
-                port = int(line.split("http://127.0.0.1:", 1)[1].split("/", 1)[0])
-                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
-                connection.request("GET", "/")
-                response = connection.getresponse()
-                self.assertEqual(response.status, 200)
-                self.assertEqual(response.read(), (self.release / "web" / "dashboard.html").read_bytes())
-                connection.request("GET", "/api/status")
-                response = connection.getresponse()
-                self.assertEqual(response.status, 200)
-                self.assertIsInstance(json.loads(response.read()), list)
-                connection.close()
-            finally:
-                proc.terminate()
-                proc.wait(timeout=30)
-                proc.stdout.close()
-                proc.stderr.close()
+        env = dict(self.env, PYTHONUNBUFFERED="1")
+        proc = subprocess.Popen([str(self.shim), "web", "--port", "0", "--no-monitor"], cwd=self.tmp / "elsewhere",
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            line = proc.stdout.readline()
+            self.assertIn("http://127.0.0.1:", line, proc.stderr.read() if proc.poll() is not None else line)
+            port = int(line.split("http://127.0.0.1:", 1)[1].split("/", 1)[0])
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), (self.release / "web" / "dashboard.html").read_bytes())
+            connection.request("GET", "/api/status")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertIsInstance(json.loads(response.read()), list)
+            connection.request("GET", "/api/limits")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertIn("summary", json.loads(response.read()))
+            connection.close()
+        finally:
+            proc.terminate()
+            proc.wait(timeout=30)
+            proc.stdout.close()
+            proc.stderr.close()
+        self.assertFalse((state / "monitor.lock").exists(), "web --no-monitor started the limits monitor")
+        self.assertFalse((state / "monitor.json").exists())
         self.assertEqual(list(self.release.rglob("__pycache__")), [])
+
+class NonDefaultInstallRoot(InstallCase):
+    def test_version_finds_activation_log_under_a_non_default_install_root(self):
+        root, bin_dir = self.tmp / "custom store" / "syn", self.tmp / "custom bin"
+        self.installer("install", "--tag", "v1.0.1", "--upstream", str(FIXTURE["upstream"]),
+                       "--install-root", str(root), "--bin-dir", str(bin_dir))
+        release = Path(os.path.realpath(root / "releases" / FIXTURE["a"]))
+        # XDG_DATA_HOME names another store whose log says something else.
+        other = self.tmp / "data home" / "syndicate" / "activations.jsonl"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text(json.dumps({"commit": FIXTURE["a"], "tag": "v0.0.9", "at": "2000-01-01T00:00:00Z"}) + "\n")
+        result = subprocess.run([str(bin_dir / "syndicate"), "--version", "--json"], cwd=self.tmp / "elsewhere",
+                                env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        info = json.loads(result.stdout)
+        self.assertEqual((info["mode"], info["commit"], info["root"]), ("release", FIXTURE["a"], str(release)))
+        self.assertEqual(info["tag"], "v1.0.1")
+        self.assertEqual(info["activation"]["at"], rel.read_jsonl(root / "activations.jsonl")[-1]["at"])
 
 
 FAKE_CODEX = r'''
@@ -746,6 +784,13 @@ class ActiveSessionAcrossActivation(InstallCase):
                 time.sleep(0.05)
             self.install("v1.1.0")
             self.assertEqual(self.current(), b)
+            # B generates its own per-run settings in the same project while A is live
+            # (the project lock stops a second team, so B's code path runs directly).
+            started = next(json.loads(line) for line in log_path.read_text().splitlines()
+                           if json.loads(line)["kind"] == "orchestrator")
+            run_a = Path(next(iter(started["configs"]))).parent.parent
+            before_a = {str(p): p.read_bytes() for p in run_a.rglob("*") if p.is_file()}
+            generated_b = self.generate_with(Path(os.path.realpath(self.root / "releases" / b)), project)
             go.touch()
             out, err = session.communicate(timeout=300)
         finally:
@@ -777,9 +822,41 @@ class ActiveSessionAcrossActivation(InstallCase):
         self.assertEqual(done["configs_after"], orchestrator["configs"])
         for text in orchestrator["configs"].values():
             self.assertNotIn(MARKER.format("B"), text)
+        # B's generation used its own run directory and left A's files byte-identical.
+        run_b = Path(generated_b["dir"])
+        self.assertEqual(run_b.parent, run_a.parent)
+        self.assertNotEqual(run_b, run_a)
+        self.assertEqual({str(p): p.read_bytes() for p in run_a.rglob("*") if p.is_file()}, before_a)
+        self.assertTrue((run_a / "owner.json").is_file())
+        b_toml = (run_b / "codex" / "backend-engineer.toml").read_text()
+        self.assertIn(MARKER.format("B"), b_toml)
+        self.assertIn(MARKER.format("A"), (run_a / "codex" / "backend-engineer.toml").read_text())
+        b_settings = json.loads((run_b / "claude-settings.json").read_text())
+        self.assertIn(generated_b["release"], json.dumps(b_settings))
+        self.assertEqual(json.loads((run_b / "owner.json").read_text())["release"]["commit"], b)
         # New invocations through the shim run B.
         self.assertEqual(self.shim_run("--help").returncode, 0)
         self.assertEqual(list(release_a.rglob("__pycache__")), [])
+
+    def generate_with(self, release: Path, project: Path) -> dict:
+        """Build Codex and Claude settings for project with release's own code, in a new process."""
+        code = ("import importlib.machinery, importlib.util, json, sys\n"
+                "from pathlib import Path\n"
+                "loader = importlib.machinery.SourceFileLoader('syndicate', sys.argv[1])\n"
+                "spec = importlib.util.spec_from_loader('syndicate', loader)\n"
+                "sy = importlib.util.module_from_spec(spec); loader.exec_module(sy)\n"
+                "project = Path(sys.argv[2])\n"
+                "team = sy.resolve_team(project)\n"
+                "sy.build_codex(team, True, ['b task'])\n"
+                "sy.build_claude(team, True, ['b task'])\n"
+                "print(json.dumps({'dir': str(sy.generated(project)), 'release': str(sy.identity.ROOT)}))\n")
+        result = subprocess.run([os.path.abspath(sys.executable), "-B", "-c", code, str(release / "bin" / "syndicate"),
+                                 str(project)], cwd=self.tmp / "elsewhere", env=self.env, capture_output=True,
+                                text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["release"], str(release))
+        return data
 
 
 class CodexHookMigration(InstallCase):

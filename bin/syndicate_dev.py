@@ -5,7 +5,9 @@ or bytecode) into a temporary snapshot, so editing the checkout cannot change
 a run already in progress. The snapshot's launcher runs with Python -B in an
 environment with a disposable HOME, XDG directories, TMPDIR and tmux server,
 a namespaced tmux session, and disposable provider config homes unless
---share-provider-config is given. All Syndicate state (registry, portfolio,
+--share-provider-config is given. <devroot>/bin leads PATH with a `syndicate`
+that runs the snapshot, so a bare `syndicate` in the run never reaches the
+installed release. All Syndicate state (registry, portfolio,
 limits monitor and its lock, worktree registry, user config) derives from HOME
 and the XDG directories, so it lands in the disposable home. The launched code
 refuses to start if any of it would resolve to production state.
@@ -82,6 +84,19 @@ def stage_snapshot(checkout: Path, destination: Path) -> list[str]:
     return names
 
 
+def write_wrapper(devroot: Path, launcher: Path) -> Path:
+    """<devroot>/bin/syndicate: exec the snapshot's pinned prefix, so a bare
+    `syndicate` inside the dev run (PATH puts this first) never reaches the
+    production release or checkout."""
+    target = devroot / "bin" / "syndicate"
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target.write_text("#!/bin/sh\n# syndicate dev: run the staged snapshot, never the installed release.\n"
+                      "PYTHONDONTWRITEBYTECODE=1\nexport PYTHONDONTWRITEBYTECODE\n"
+                      f"exec {identity.pinned_prefix(launcher)} \"$@\"\n")
+    target.chmod(0o555)
+    return target
+
+
 def dev_environment(base: dict, home: Path, devroot: Path, state: dict, checkout: Path,
                     session: str, share_providers: bool) -> dict:
     production = Path(base.get("HOME") or identity.production_home())
@@ -95,6 +110,7 @@ def dev_environment(base: dict, home: Path, devroot: Path, state: dict, checkout
         XDG_STATE_HOME=str(home / ".local" / "state"),
         TMPDIR=str(devroot / "tmp"),
         TMUX_TMPDIR=str(devroot / "tmux"),
+        PATH=os.pathsep.join([str(devroot / "bin"), *([base["PATH"]] if base.get("PATH") else [])]),
         PYTHONDONTWRITEBYTECODE="1",
         **{identity.DEV_ENV: "1",
            identity.DEV_CHECKOUT_ENV: str(checkout),
@@ -158,6 +174,7 @@ def run(checkout_arg: str, args: list[str], *, home_arg: str | None = None, keep
         if home in (production.resolve(), Path.home().resolve()):
             raise DevError(f"--home {home} is the production home; choose a disposable directory")
         stage_snapshot(checkout, devroot / "checkout")
+        write_wrapper(devroot, devroot / "checkout" / "bin" / "syndicate")
         for path in (home, devroot / "tmp", devroot / "tmux", home / "work"):
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
         session = f"syndicate-dev-{uuid.uuid4().hex[:8]}"

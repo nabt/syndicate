@@ -27,6 +27,27 @@ dev = sy.syndicate_dev
 CHECKOUT = Path(sy.SCRIPT).parent.parent
 COMMIT = "a" * 40
 OTHER = "b" * 40
+# The suite also runs from an extracted release tree, which has no .git.
+CHECKOUT_IS_GIT = identity._git(CHECKOUT, "rev-parse", "--show-toplevel") == str(CHECKOUT)
+NOT_GIT_REASON = f"{CHECKOUT} is not a Git checkout (an extracted release tree); checkout-mode identity needs Git"
+
+
+def copy_runtime(destination: Path) -> None:
+    """Copy this checkout's runtime files: dev.stage_snapshot from Git, else a plain tree copy.
+
+    Either way files are read-only, directories writable, and no .git, bytecode,
+    project state or release manifest is copied."""
+    if CHECKOUT_IS_GIT:
+        dev.stage_snapshot(CHECKOUT, destination)
+        return
+    shutil.copytree(CHECKOUT, destination, symlinks=True,
+                    ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc", "*.pyo", ".syndicate",
+                                                  "RELEASE.json"))
+    for path in [destination, *destination.rglob("*")]:
+        if path.is_symlink():
+            continue
+        mode = path.stat().st_mode
+        path.chmod(mode | 0o700 if path.is_dir() else mode & ~0o222)
 
 
 def disposable_env(base: Path, **extra) -> dict:
@@ -76,7 +97,7 @@ class Fixture:
         self.base = Path(self.tmp.name).resolve()
         data = self.base / "data home" / "syndicate"
         self.release = data / "releases" / COMMIT
-        dev.stage_snapshot(CHECKOUT, self.release)
+        copy_runtime(self.release)
         (self.release / "RELEASE.json").write_text(json.dumps(
             {"format": 1, "commit": COMMIT, "files": {}, "python_min": "3.11"}))
         (data / "current").symlink_to(Path("releases") / COMMIT)
@@ -93,7 +114,7 @@ class Fixture:
         self.data = data
         # A Syndicate checkout with history, for dev mode.
         self.repo = self.base / "dev checkout"
-        dev.stage_snapshot(CHECKOUT, self.repo)
+        copy_runtime(self.repo)
         for path in self.repo.rglob("*"):
             if path.is_file() and not path.is_symlink():
                 path.chmod(path.stat().st_mode | 0o200)
@@ -223,10 +244,30 @@ class Pinning(ProjectCase):
         hook = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
         self.assertEqual(shlex.split(hook), [str(identity.ROOT / "hooks" / "require-review.sh")])
         with patch.object(Path, "home", return_value=self.project / "home"), \
+             patch.dict(os.environ, {"CODEX_HOME": str(self.project / "codex home")}), \
              contextlib.redirect_stdout(io.StringIO()):
             sy.cmd_setup_codex_gate(sy.argparse.Namespace(remove=False))
-        hooks = json.loads((self.project / "home" / ".codex" / "hooks.json").read_text())
+        hooks = json.loads((self.project / "codex home" / "hooks.json").read_text())
         self.assertEqual(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], hook)
+        self.assertFalse((self.project / "home" / ".codex").exists())
+
+    def test_setup_codex_gate_honors_codex_home_like_the_installer(self):
+        home, custom = self.project / "home", self.project / "custom codex"
+        out = io.StringIO()
+        with patch.object(Path, "home", return_value=home), contextlib.redirect_stdout(out):
+            with patch.dict(os.environ, {"CODEX_HOME": str(custom)}):
+                sy.cmd_setup_codex_gate(sy.argparse.Namespace(remove=False))
+                self.assertEqual(sy.codex_home(), custom)
+            with patch.dict(os.environ, {}):
+                os.environ.pop("CODEX_HOME", None)
+                self.assertEqual(sy.codex_home(), home / ".codex")
+                sy.cmd_setup_codex_gate(sy.argparse.Namespace(remove=False))
+            with patch.dict(os.environ, {"CODEX_HOME": str(custom)}):
+                sy.cmd_setup_codex_gate(sy.argparse.Namespace(remove=True))
+        self.assertIn(str(custom / "hooks.json"), out.getvalue())
+        self.assertNotIn("Stop", json.loads((custom / "hooks.json").read_text())["hooks"])
+        default = json.loads((home / ".codex" / "hooks.json").read_text())
+        self.assertEqual(len(default["hooks"]["Stop"]), 1)
 
     def test_monitor_spawn_argv_and_environment(self):
         with patch.object(runtime.subprocess, "Popen") as popen:
@@ -325,6 +366,61 @@ class GeneratedSettings(ProjectCase):
         self.assertTrue(current.is_dir())
 
 
+    def old_run(self, name: str, owner: dict | None = None) -> Path:
+        path = self.project / ".syndicate" / ".generated" / name
+        path.mkdir(parents=True)
+        if owner is not None:
+            (path / "owner.json").write_text(json.dumps(owner))
+        old = time.time() - sy.GENERATED_MIN_AGE - 60
+        os.utime(path, (old, old))
+        return path
+
+    def dead_pid(self) -> int:
+        dead = subprocess.Popen([sys.executable, "-B", "-c", ""])
+        dead.wait()
+        return dead.pid
+
+    def test_cli_child_recorded_in_owner_keeps_directory_live(self):
+        child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        current = sy.generated(self.project)
+        sy.record_cli_owner(self.project, None, child.pid)
+        owner = json.loads((current / "owner.json").read_text())
+        self.assertEqual((owner["pid"], owner["child_pids"]), (os.getpid(), [child.pid]))
+        sy.record_cli_owner(self.project, None, child.pid)  # idempotent
+        self.assertEqual(json.loads((current / "owner.json").read_text())["child_pids"], [child.pid])
+        gone = self.dead_pid()
+        live_child = self.old_run(f"20200101T000000-{gone}-00000001", {"pid": gone, "child_pids": [child.pid]})
+        all_gone = self.old_run(f"20200101T000000-{gone}-00000002", {"pid": gone, "child_pids": [gone]})
+        sy.prune_generated(self.project / ".syndicate" / ".generated", keep=current)
+        self.assertTrue(live_child.is_dir())
+        self.assertFalse(all_gone.exists())
+        child.kill()
+        child.wait()
+        sy.prune_generated(self.project / ".syndicate" / ".generated", keep=current)
+        self.assertFalse(live_child.exists())
+        self.assertTrue(current.is_dir())
+
+    def test_prune_skips_while_another_process_holds_the_session_lock(self):
+        import fcntl
+        gone = self.dead_pid()
+        stale = self.old_run(f"20200101T000000-{gone}-00000003", {"pid": gone})
+        root = self.project / ".syndicate" / ".generated"
+        with open(sy.project_lock_path(self.project), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with patch.object(sy, "_generation", None):
+                fresh = sy.generated(self.project)  # a second launch while the lock is held
+            self.assertTrue(stale.is_dir())
+            # The lock holder itself (a supervisor pruning its own project) still prunes.
+            with patch.object(sy, "_held_session_locks", {str(self.project)}):
+                sy.prune_generated(root, keep=fresh)
+            self.assertFalse(stale.exists())
+        stale = self.old_run(f"20200101T000000-{gone}-00000004", {"pid": gone})
+        sy.prune_generated(root, keep=fresh)
+        self.assertFalse(stale.exists())
+
+
 class RunIdentity(ProjectCase):
     def test_run_record_carries_release_identity_and_older_records_still_read(self):
         runtime.write_run_record(self.project, "task", "claude", 10, None)
@@ -377,6 +473,50 @@ class DevGuard(ProjectCase):
             sy.register_project(self.project / "elsewhere")
         self.assertEqual(sy.dev_guard(), [])  # outside dev mode nothing is checked
 
+    def test_dev_target_check_covers_worktrees_subdirectories_and_state(self):
+        prod = self.project / "prod home"
+        registered = self.project / "registered repo"
+        registered.mkdir()
+        git(registered, "init", "-q", "-b", "main")
+        git(registered, "commit", "-q", "--allow-empty", "-m", "init")
+        (registered / "sub" / "dir").mkdir(parents=True)
+        linked = self.project / "linked task worktree"
+        git(registered, "worktree", "add", "-q", "-b", "work/t", str(linked))
+        (linked / "deep").mkdir()
+        other = self.project / "other repo"
+        other.mkdir()
+        git(other, "init", "-q")
+        plain = self.project / "plain dir"
+        plain.mkdir()
+        registry = prod / ".syndicate" / "projects.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text(json.dumps({"projects": [{"path": str(registered), "name": "registered"}]}))
+        with patch.dict(os.environ, {identity.DEV_PRODUCTION_HOME_ENV: str(prod)}):
+            for target in (registered, registered / "sub" / "dir", registered / "sub" / "missing",
+                           linked, linked / "deep", prod / ".syndicate" / "worktrees" / "x",
+                           prod / ".config" / "syndicate"):
+                self.assertIsNotNone(identity.dev_target_violation(target), target)
+            self.assertIn("shares the Git repository", identity.dev_target_violation(linked / "deep"))
+            for target in (other, plain, self.project / "not yet created"):
+                self.assertIsNone(identity.dev_target_violation(target), target)
+            # Fail closed: an unreadable registry, or Git that cannot run.
+            registry.write_text("{not json")
+            self.assertIn("not valid JSON", identity.dev_target_violation(other))
+            registry.write_text(json.dumps({"projects": []}))
+            with patch.object(identity.subprocess, "run", side_effect=OSError("no git")):
+                self.assertIn("cannot run git", identity.dev_target_violation(other))
+            # The launcher's resolution helpers route through the same check.
+            registry.write_text(json.dumps({"projects": [{"path": str(registered)}]}))
+            with patch.dict(os.environ, {identity.DEV_ENV: "1"}):
+                for call in (lambda: sy.execution_project(str(linked)), lambda: sy.resolve_project(str(linked / "deep")),
+                             lambda: sy.register_workspace(registered / "sub"),
+                             lambda: sy.dev_check_args(sy.argparse.Namespace(dir=str(linked), repo=None)),
+                             lambda: sy.dev_check_args(sy.argparse.Namespace(worktree=str(linked)))):
+                    with self.assertRaisesRegex(sy.SyndicateError, "dev mode refuses"):
+                        call()
+                self.assertEqual(sy.execution_project(str(other)), other)
+            self.assertEqual(sy.execution_project(str(linked)), linked)  # outside dev mode: unchanged
+
     def test_dev_environment_is_isolated_and_namespaced(self):
         base = {"HOME": "/home/real", "TMUX": "/tmp/tmux-1/default,1,0", "TMUX_PANE": "%1",
                 "SYNDICATE_RUNTIME": "codex", "SYNDICATE_RUN_ID": "x", "PATH": "/usr/bin",
@@ -396,12 +536,14 @@ class DevGuard(ProjectCase):
         self.assertEqual(env[identity.DEV_TMUX_SESSION_ENV], "syndicate-dev-1")
         self.assertEqual(env[identity.DEV_PRODUCTION_HOME_ENV], "/home/real")
         self.assertEqual((env[identity.DEV_COMMIT_ENV], env[identity.DEV_DIRTY_ENV]), (COMMIT, "1"))
+        self.assertEqual(env["PATH"].split(os.pathsep), [str(root / "bin"), "/usr/bin"])
         shared = dev.dev_environment(base, home, root, state, self.project, "s", True)
         self.assertEqual(shared["CODEX_HOME"], "/home/real/.codex")
         self.assertEqual(shared["CLAUDE_CONFIG_DIR"], "/home/real/.claude")
 
 
 class Version(SubprocessCase):
+    @unittest.skipUnless(CHECKOUT_IS_GIT, NOT_GIT_REASON)
     def test_checkout_version_is_side_effect_free(self):
         before_home = tree(self.scratch)
         before_git = git(CHECKOUT, "status", "--porcelain", "--ignored")
@@ -549,6 +691,80 @@ class DevMode(SubprocessCase):
         for name in ("home", "config", "data", "cache", "codex", "claude", "tmux", "tmp"):
             self.assertEqual(list((self.scratch / name).iterdir()), [], name)
         self.assertEqual(caches(repo), [])
+
+    def test_bare_syndicate_in_a_dev_run_reaches_the_snapshot(self):
+        devroot = self.scratch / "devroot"
+        production_bin = self.scratch / "production bin"
+        production_bin.mkdir()
+        fake = production_bin / "syndicate"
+        fake.write_text("#!/bin/sh\necho PRODUCTION RELEASE\n")
+        fake.chmod(0o755)
+        snapshot = self.scratch / "snap shot"
+        copy_runtime(snapshot)
+        wrapper = dev.write_wrapper(devroot, snapshot / "bin" / "syndicate")
+        self.assertEqual(wrapper, devroot / "bin" / "syndicate")
+        self.assertTrue(os.access(wrapper, os.X_OK))
+        base = dict(self.env, PATH=os.pathsep.join([str(production_bin), self.env.get("PATH", "")]))
+        env = dev.dev_environment(base, self.scratch / "home", devroot, {"commit": COMMIT}, self.fixture.repo,
+                                  "syndicate-dev-w", False)
+        result = subprocess.run(["syndicate", "--version", "--json"], env=env, cwd=self.foreign,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        info = json.loads(result.stdout)
+        self.assertEqual((info["mode"], info["root"]), ("dev", str(snapshot)))
+        self.assertEqual(shutil.which("syndicate", path=env["PATH"]), str(wrapper))
+        self.assertEqual(caches(snapshot), [])
+
+    def test_dev_option_without_separator_explains_the_separator(self):
+        result = self.run_cli("dev", "--checkout", str(self.fixture.repo), "--version",
+                              launcher=CHECKOUT / "bin" / "syndicate")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("go after --", result.stderr)
+        self.assertIn(f"-- --version", result.stderr)
+
+    def dev_env(self, production: Path) -> dict:
+        return dict(self.env, **{identity.DEV_ENV: "1", identity.DEV_PRODUCTION_HOME_ENV: str(production),
+                                 identity.DEV_TMUX_SESSION_ENV: "syndicate-dev-g"})
+
+    def test_dev_commands_refuse_production_projects_worktrees_and_subdirectories(self):
+        production = self.scratch / "production home"
+        registered = self.scratch / "registered repo"
+        registered.mkdir()
+        git(registered, "init", "-q", "-b", "main")
+        git(registered, "commit", "-q", "--allow-empty", "-m", "init")
+        (registered / "sub").mkdir()
+        linked = self.scratch / "linked worktree"
+        git(registered, "worktree", "add", "-q", "-b", "work/t", str(linked))
+        registry = production / ".syndicate" / "projects.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text(json.dumps({"projects": [{"path": str(registered), "name": "registered"}]}))
+        env = self.dev_env(production)
+        attempts = {
+            "tasks worktree -C": ("tasks", "worktree", "t1", "-C", str(linked), "--branch", "work/x"),
+            "tasks worktree --repo": ("tasks", "worktree", "t1", "--repo", str(registered / "sub"), "--branch", "work/x"),
+            "tasks cleanup-pr --worktree": ("tasks", "cleanup-pr", "1", "-C", str(self.foreign), "--branch", "work/t",
+                                            "--worktree", str(linked)),
+            "team run-role --project": ("team", "run-role", "backend-engineer", "--project", str(registered / "sub"), "-"),
+            "team task --project": ("team", "task", "--project", str(linked), "go"),
+            "requests send -C": ("requests", "send", "m", "--key", "k", "-C", str(linked)),
+            "decisions request -C": ("decisions", "request", "q", "--key", "k", "-C", str(registered)),
+            "messages send -C": ("messages", "send", "m", "--key", "k", "--session", "s", "-C", str(linked)),
+            "live status -C": ("live", "status", "-C", str(registered / "sub")),
+            "team init": ("team", "init", "--project", str(linked)),
+        }
+        for name, argv in attempts.items():
+            result = self.run_cli(*argv, env=env, stdin="brief")
+            self.assertEqual(result.returncode, 1, (name, result.stdout, result.stderr))
+            self.assertIn("dev mode refuses this target", result.stderr, name)
+        # The default -C . is checked too: a dev command run from inside the linked worktree.
+        result = self.run_cli("requests", "send", "m", "--key", "k", env=env, cwd=linked / ".")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("dev mode refuses this target", result.stderr)
+        for path in (registered, linked):
+            self.assertFalse((path / ".syndicate").exists(), path)
+        self.assertEqual(json.loads(registry.read_text())["projects"][0]["path"], str(registered))
+        ok = self.run_cli("tasks", "list", "--json", env=env)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
 
     def test_dev_child_refuses_when_isolation_is_missing(self):
         env = dict(self.env, **{identity.DEV_ENV: "1", identity.DEV_PRODUCTION_HOME_ENV: self.env["HOME"],

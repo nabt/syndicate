@@ -281,7 +281,7 @@ Codex only runs hooks from a reviewed `hooks.json`, and it can't take them
 inline. So the Codex gate is a single **global** hook rather than a project file:
 
 ```sh
-syndicate setup-codex-gate    # merges one Stop entry into ~/.codex/hooks.json
+syndicate setup-codex-gate    # merges one Stop entry into $CODEX_HOME/hooks.json (default ~/.codex)
 ```
 
 Then open `codex` once and accept the hook review prompt. The hook only acts
@@ -362,14 +362,28 @@ runs an unmerged checkout without touching your installed release or its state:
    state override exists. Inherited `SYNDICATE_*` and `TMUX` variables are
    dropped. `CODEX_HOME` and `CLAUDE_CONFIG_DIR` are disposable too, so
    providers start logged out, unless you pass `--share-provider-config`.
-4. Removes the temporary directories at exit unless `--keep` is given, a
+4. Puts `<devroot>/bin` first on `PATH`. Its `syndicate` runs the snapshot's
+   pinned prefix (interpreter, `-B`, snapshot launcher), so a bare `syndicate`
+   inside the dev run, its tmux windows or its agents never reaches the
+   installed release.
+5. Removes the temporary directories at exit unless `--keep` is given, a
    dev tmux session is still running, or the dev limits monitor does not stop.
+
+Arguments for the snapshot launcher go after `--`; `syndicate dev --checkout
+PATH --version` is an error that says so (use `-- --version`).
 
 The snapshot refuses to run if its state, user config or tmux server would
 resolve to production (`~/.syndicate`, `~/.config/syndicate`,
 `~/.local/share/syndicate`, the `the-syndicate` session or the default tmux
-server), and refuses to register a project listed in the production registry.
-Use a separate target project, given by absolute path, for team runs:
+server). Every project, source, repository, worktree and handoff argument
+(`--project`, `-C`/`--dir` including its `.` default, `--repo`, `--source`,
+`--worktree`, `--handoff`) is checked before the command runs. A dev run
+refuses a target that is, or is inside, a project or generic task group in the
+production registry, that shares a Git repository with one (a linked task
+worktree or any subdirectory of it, matched by `git rev-parse
+--git-common-dir`), or that is under production Syndicate state. If the
+production registry cannot be read or Git cannot run, the run refuses rather
+than guess. Use a separate target project, given by absolute path, for team runs:
 
 ```sh
 syndicate dev --checkout ~/src/syndicate -- team task --project /path/to/scratch-repo "try the change"

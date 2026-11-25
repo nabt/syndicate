@@ -770,9 +770,23 @@ def activate(paths: Paths, commit: str, interpreter: str, record: dict, *, shim:
     return entry
 
 
+def check_rule_paths(paths: Paths, interpreter: str) -> None:
+    """Refuse paths that cannot appear in Claude's relay allow rule.
+
+    Sessions grant relays with `Bash(<interpreter> -B <release>/bin/syndicate team run-role *)`;
+    a ')' in either path would end that rule early, so relays would be denied or
+    the rule would match the wrong command."""
+    for label, value in (("install root", str(paths.root)), ("install root", os.path.realpath(paths.root)),
+                         ("interpreter", interpreter)):
+        if ")" in value:
+            raise ReleaseError(f"{label} {value} contains ')', which Claude's Bash() permission rule for "
+                               "Syndicate relays cannot express; choose a path without ')'")
+
+
 def install(paths: Paths, tag: str, upstream: str | None = None, interpreter: str | None = None,
             shim: bool = True) -> dict:
     interpreter = preflight_interpreter(interpreter or os.path.abspath(sys.executable))
+    check_rule_paths(paths, interpreter)
     approved = resolve_approved_tag(paths, tag, upstream)
     log(f"approved {tag} -> {approved['commit']} (on upstream {MAIN_BRANCH} {approved['upstream_main'][:12]})")
     stage, manifest, digest = stage_release(paths, approved, interpreter)
@@ -824,6 +838,7 @@ def rollback(paths: Paths, to: str | None = None, interpreter: str | None = None
         manifest = verify_release(paths.release(target), target)
         prior = last_record(paths, target)
         chosen = preflight_interpreter(interpreter or prior.get("interpreter") or "")
+        check_rule_paths(paths, chosen)
         return activate(paths, target, chosen, {
             "tag": prior.get("tag"), "source_ref": prior.get("source_ref"), "upstream": prior.get("upstream"),
             "archive_digest": prior.get("archive_digest"), "manifest_sha256": manifest["manifest_sha256"],

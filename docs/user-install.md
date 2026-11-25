@@ -303,10 +303,13 @@ cutover needs the requester's separate approval.
 - Let the Chief and teams finish or checkpoint under their current owners.
   Wait for any worker that relies on the global Codex hook or approval to
   finish before switching it.
-- Stop or quiesce every old-release dashboard. `syndicate web` and the
-  `/api/limits` endpoint can auto-start the shared monitor. Pause other
-  autostart paths too: Chief and team launches and direct `limits`
-  invocations.
+- Stop or quiesce every old-release dashboard. `syndicate web` and its
+  `/api/limits` endpoint auto-start the shared monitor. A dashboard you must
+  keep running through the transition has to be restarted with
+  `syndicate web --no-monitor`, which never starts the monitor, before you run
+  `limits --stop`; otherwise it can restart the old-release monitor at once.
+  Pause other autostart paths too: Chief and team launches and direct
+  `limits` invocations.
 - Stop the monitor with `syndicate limits --stop`, then wait until
   `~/.syndicate/limits/monitor.lock` is free. The stop command can return
   before the monitor exits.
@@ -322,11 +325,34 @@ cutover needs the requester's separate approval.
 
 - Run `syndicate --version` and check the commit and release directory.
 - Restart the monitor and only the dashboards you intend to run, from the
-  selected release. Check the monitor lock owner and its release, the served
+  selected release (a plain `syndicate web` starts the monitor; restart any
+  `--no-monitor` dashboard without the flag, or start the monitor with
+  `syndicate limits`). Check the monitor lock owner and its release, the served
   dashboard and its data endpoints, and the hook's effective target.
 - Start the Chief and teams only after the services they need and their
   approvals are verified. Check paused consumers and sessions still pinned to
   the old release separately.
+
+### What changes for users at the first cutover
+
+- **Provider approvals re-prompt once.** Relay and session commands now start
+  with the pinned prefix `<interpreter> -B <release>/bin/syndicate`, for
+  example `Bash(/usr/bin/python3 -B /home/me/.local/share/syndicate/releases/<commit>/bin/syndicate team run-role *)`.
+  Saved Claude or Codex approvals keyed on the old
+  `.../bin/syndicate team run-role` prefix no longer match, so each provider
+  asks once more; the prefix changes again with each release directory.
+  Generated session settings carry the new rule automatically.
+- **No `)` in paths.** Claude's `Bash(...)` rule cannot contain `)`, so the
+  install root, the release path and the interpreter path must not contain
+  one. `syndicate-install install` and `rollback` refuse such paths.
+- **Reserved subcommands.** `dev`, `version` and `--version` are Syndicate
+  subcommands. `syndicate version` used to start the Chief of Staff with the
+  task "version"; to give the Chief such a task now, use
+  `syndicate chief-of-staff version`.
+- **Bytecode stays off in children.** Every Syndicate entry path sets
+  `PYTHONDONTWRITEBYTECODE=1`, and provider CLIs (Claude, Codex) and the
+  commands they run inherit it. Python tools run inside a session do not
+  write `__pycache__` unless they set it themselves.
 
 ### 4. Partial failure
 

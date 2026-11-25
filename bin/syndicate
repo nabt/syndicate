@@ -590,11 +590,36 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def prune_generated(root: Path, keep: Path) -> None:
-    """Remove a bounded number of old run directories whose owning launcher is gone.
+# Projects whose session.lock this process holds. Our own lock says nothing
+# about another live session, so pruning only defers to someone else's.
+_held_session_locks: set[str] = set()
+# Run directories this process created, so a supervised CLI child can be
+# recorded as an additional owner (record_cli_owner).
+_generated_dirs: set[Path] = set()
 
+
+def _generated_owner_pids(entry: Path, launcher_pid: int) -> list[int]:
+    """The launcher PID from the directory name plus every PID owner.json records."""
+    pids = [launcher_pid]
+    owner = runtime.read_json(entry / "owner.json")
+    if isinstance(owner, dict):
+        for value in [owner.get("pid"), *(owner.get("child_pids") if isinstance(owner.get("child_pids"), list) else [])]:
+            if type(value) is int and value > 0:
+                pids.append(value)
+    return pids
+
+
+def prune_generated(root: Path, keep: Path) -> None:
+    """Remove a bounded number of old run directories whose owners are all gone.
+
+    A directory is live while its launcher or any recorded CLI child runs.
+    Nothing is pruned while another process holds the project's session.lock,
+    or while its state cannot be read.
     Legacy flat files directly under .generated/ are left alone: an older
     session may still read them."""
+    project = root.parent.parent
+    if str(project) not in _held_session_locks and session_lock_state(project) in ("held", "unknown"):
+        return
     removed = 0
     now = time.time()
     try:
@@ -608,9 +633,11 @@ def prune_generated(root: Path, keep: Path) -> None:
         if not match or entry == keep or entry.is_symlink() or not entry.is_dir():
             continue
         try:
-            if now - entry.stat().st_mtime < GENERATED_MIN_AGE or _pid_alive(int(match.group(1))):
+            if now - entry.stat().st_mtime < GENERATED_MIN_AGE:
                 continue
         except OSError:
+            continue
+        if any(_pid_alive(pid) for pid in _generated_owner_pids(entry, int(match.group(1)))):
             continue
         shutil.rmtree(entry, ignore_errors=True)
         removed += 1
@@ -627,9 +654,25 @@ def generated(project: Path) -> Path:
     if not path.is_dir():
         path.mkdir(parents=True, exist_ok=True)
         runtime.atomic_json(path / "owner.json", {"pid": os.getpid(), "created_at": time.time(),
-                                                  "release": identity.run_identity()})
+                                                  "release": identity.run_identity(), "child_pids": []})
         prune_generated(root, keep=path)
+    _generated_dirs.add(path)
     return path
+
+
+def record_generated_child(pid: int) -> None:
+    """Add a provider CLI child to the owner.json of every run directory this process made."""
+    for path in sorted(_generated_dirs):
+        owner = runtime.read_json(path / "owner.json")
+        if not isinstance(owner, dict) or not path.is_dir():
+            continue
+        children = owner.get("child_pids") if isinstance(owner.get("child_pids"), list) else []
+        if pid not in children:
+            owner["child_pids"] = [*children, pid]
+            try:
+                runtime.atomic_json(path / "owner.json", owner)
+            except OSError as error:
+                print(f"syndicate: could not record CLI child in {path / 'owner.json'}: {error}", file=sys.stderr)
 
 
 RELAY_SUBCOMMAND = "team run-role"
@@ -749,6 +792,8 @@ def build_codex(team: Team, headless: bool, rest: list[str]) -> list[str]:
             "-c", f"agents.{name}.description={jstr(role.description)}",
             "-c", f"agents.{name}.config_file={jstr(str(f))}",
         ]
+    # Only this run's directory: one launcher can rebuild here (each handoff
+    # iteration of cmd_run), and agents the latest build did not write go.
     for old in gen.glob("*.toml"):
         if old.name not in keep:
             old.unlink()
@@ -807,24 +852,21 @@ def registry_lock():
         yield
 
 
-def production_registered(project: Path) -> bool:
-    """In dev mode: whether the production registry (read only) lists this project."""
-    path = identity.production_home() / ".syndicate" / "projects.json"
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return False
-    entries = data.get("projects", []) if isinstance(data, dict) else []
-    return any(isinstance(e, dict) and e.get("path") == str(project) for e in entries)
+def dev_check_target(path) -> None:
+    """In dev mode, refuse any project, source, repo or worktree path that could
+    reach production state (see identity.dev_target_violation). No-op otherwise."""
+    if not identity.dev_mode():
+        return
+    problem = identity.dev_target_violation(path)
+    if problem:
+        raise SyndicateError(f"dev mode refuses this target: {problem}; use a separate disposable project")
 
 
 def register_project(project: Path, generic: bool = False) -> None:
     """Record this project in the user-wide registry so dashboard/web can find it
     without being pointed at it explicitly."""
     path_str = str(project)
-    if identity.dev_mode() and production_registered(project):
-        raise SyndicateError(f"dev mode: {project} is a production project; use a separate target project "
-                             "so this run cannot write its .syndicate/ state")
+    dev_check_target(project)
     with registry_lock():
         projects = [p for p in load_registry() if p.get("path") != path_str]
         entry = {"path": path_str, "name": project.name, "last_seen": now_iso()}
@@ -841,13 +883,16 @@ def resolve_project(value: str) -> Path:
     if len(matches) > 1:
         raise SyndicateError("ambiguous project name; use its full repo path")
     candidate = Path(matches[0]["path"] if matches else value).expanduser().resolve()
+    dev_check_target(candidate)
     root = git(candidate, "rev-parse", "--show-toplevel")
     if not root:
         raise SyndicateError(f"not a Git repository: {value}")
+    dev_check_target(root)
     return Path(root).resolve()
 
 
 def register_workspace(directory: Path) -> Path:
+    dev_check_target(directory)
     root = git(directory, "rev-parse", "--show-toplevel")
     workspace = Path(root).resolve() if root else directory.resolve()
     register_project(workspace, generic=not root)
@@ -1382,8 +1427,11 @@ def execution_project(value):
         return directory
     candidate = Path(value).expanduser()
     if candidate.is_dir():
+        dev_check_target(candidate)
         root = git(candidate.resolve(), 'rev-parse', '--show-toplevel')
-        return Path(root).resolve() if root else candidate.resolve()
+        result = Path(root).resolve() if root else candidate.resolve()
+        dev_check_target(result)
+        return result
     return resolve_project(value)
 
 
@@ -2917,7 +2965,8 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         if self.path in ("/", "/index.html"):
             self._serve_file(WEB_DIR / "dashboard.html", "text/html; charset=utf-8")
         elif self.path == "/api/limits":
-            runtime.start_monitor(SCRIPT)
+            if getattr(self.server, "autostart_monitor", True):
+                runtime.start_monitor(SCRIPT)
             body = json.dumps({"summary": runtime.describe_limits(),
                                "monitor": runtime.read_json(runtime.STATE / "monitor.json")}).encode()
             self.send_response(200)
@@ -2966,7 +3015,11 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
 
 def cmd_web(args: argparse.Namespace) -> int:
     server = http.server.HTTPServer(("127.0.0.1", args.port), _DashboardHandler)
-    runtime.start_monitor(SCRIPT)
+    # --no-monitor: never start the shared limits monitor from this dashboard,
+    # e.g. while a release transition has stopped it (docs/user-install.md).
+    server.autostart_monitor = not getattr(args, "no_monitor", False)
+    if server.autostart_monitor:
+        runtime.start_monitor(SCRIPT)
     print(f"syndicate web dashboard: http://127.0.0.1:{server.server_address[1]}/  (ctrl-c to stop)")
     try:
         server.serve_forever()
@@ -3018,6 +3071,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # launcher (or its supervisor) holds it. The supervised CLI child is
         # recorded as an additional owner instead (cli_owner).
         args.session_lock_fd = lock_fd
+        _held_session_locks.add(str(project))
         owner = {**owner_identity(os.getpid()), "lock_owned": True,
                  "lock_inode": [lock_info.st_dev, lock_info.st_ino], "cli_owner": None}
         sessions = [session for session in coordination_store().snapshot()["sessions"]
@@ -3076,6 +3130,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             if result is not None:
                 return result
     finally:
+        _held_session_locks.discard(str(project))
         os.close(lock_fd)
 
 
@@ -3083,6 +3138,7 @@ def record_cli_owner(project, session, pid) -> None:
     """Record the supervised CLI child on the status, its current task, and the
     coordination session. Either copy is enough to stop a released lock from
     being read as proof that the session ended."""
+    record_generated_child(pid)
     owner = owner_identity(pid)
     stored = False
     if session:
@@ -3720,8 +3776,14 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def codex_home() -> Path:
+    """Codex's config home: $CODEX_HOME, else ~/.codex (as Codex and syndicate-install resolve it)."""
+    value = os.environ.get("CODEX_HOME", "").strip()
+    return Path(value).expanduser() if value else Path.home() / ".codex"
+
+
 def cmd_setup_codex_gate(args: argparse.Namespace) -> int:
-    path = Path.home() / ".codex" / "hooks.json"
+    path = codex_home() / "hooks.json"
     data = json.loads(path.read_text()) if path.is_file() else {}
     command = shlex.quote(str(GATE_SCRIPT))
     stop = [e for e in data.get("hooks", {}).get("Stop", [])
@@ -4202,7 +4264,7 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p.add_argument("brief", help="the task, or - to read it from stdin")
     p.add_argument("--project", dest="dir", default=".")
     p.set_defaults(fn=cmd_run_role)
-    p = cmds.add_parser("setup-codex-gate", help="install the review-gate hook into ~/.codex/hooks.json (once)")
+    p = cmds.add_parser("setup-codex-gate", help="install the review-gate hook into $CODEX_HOME/hooks.json (default ~/.codex; once)")
     p.add_argument("--remove", action="store_true")
     p.set_defaults(fn=cmd_setup_codex_gate)
     p = cmds.add_parser("dashboard", help="live console view of every registered project's status")
@@ -4216,6 +4278,9 @@ def build_parsers() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     p.set_defaults(fn=cmd_dashboard)
     p = cmds.add_parser("web", help="local browser dashboard (http://127.0.0.1:<port>/)")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--no-monitor", action="store_true",
+                   help="do not start the background limits monitor (it is otherwise started on launch "
+                        "and whenever limits are fetched)")
     p.set_defaults(fn=cmd_web)
     p = cmds.add_parser("limits", help="show account limits and reset notifications; starts the background monitor")
     p.add_argument("--watch", action="store_true", help="keep displaying limits and reset notices")
@@ -4301,7 +4366,12 @@ def cmd_dev(argv: list[str]) -> int:
     """Run an unmerged checkout from an isolated snapshot (see bin/syndicate_dev.py)."""
     head, rest = (argv[:argv.index('--')], argv[argv.index('--') + 1:]) if '--' in argv else (argv, None)
     _, sub = build_parsers()
-    args = sub.parse_args(['dev', *head])
+    args, unknown = sub.parse_known_args(['dev', *head])
+    if unknown:
+        shown = ' '.join(shlex.quote(a) for a in unknown)
+        print(f"syndicate dev: unrecognized option {shown}; arguments for the snapshot launcher go after --, "
+              f"for example: syndicate dev --checkout {shlex.quote(args.checkout)} -- {shown}", file=sys.stderr)
+        return 2
     try:
         return syndicate_dev.run(args.checkout, args.args if rest is None else rest, home_arg=args.home,
                                  keep=args.keep, share_providers=args.share_provider_config)
@@ -4316,6 +4386,29 @@ def dev_guard() -> list[str]:
         return []
     return identity.dev_violations(
         [REGISTRY_PATH.parent, runtime.STATE, syndicate_worktrees.STATE_DIR], user_config_path(), TMUX_SESSION)
+
+
+# Every argument that names a project, launch source, repository, worktree or handoff.
+DEV_TARGET_ARGS = ('project', 'dir', 'repo', 'source', 'worktree', 'handoff_path')
+
+
+def dev_check_args(args: argparse.Namespace) -> None:
+    """In dev mode, check every path-like argument (defaults such as -C . included)
+    before any handler resolves it. Registry names are checked as the paths they
+    name in the dev registry. Raises SyndicateError; no-op outside dev mode."""
+    if not identity.dev_mode():
+        return
+    for name in DEV_TARGET_ARGS:
+        value = getattr(args, name, None)
+        if not isinstance(value, str) or not value or value == 'generic':
+            continue
+        if not os.path.lexists(Path(value).expanduser()) and os.sep not in value:
+            for entry in load_registry():
+                if isinstance(entry, dict) and entry.get('name') == value:
+                    for key in ('path', 'group_path'):
+                        if isinstance(entry.get(key), str):
+                            dev_check_target(entry[key])
+        dev_check_target(value)
 
 
 def main(argv: list[str]) -> int:
@@ -4385,6 +4478,7 @@ def main(argv: list[str]) -> int:
             sub.parse_args(argv)
         else:
             args = sub.parse_args(['chief-of-staff', *argv])
+        dev_check_args(args)
         if args.fn in (cmd_task, cmd_run_role, cmd_chief_of_staff) and not getattr(args, 'dry_run', False) and not inside_tmux and not (args.fn == cmd_run_role and os.environ.get('TMUX')) and tmux_enabled():
             if args.fn == cmd_chief_of_staff:
                 # Detect a direct or tmux owner before starting another CLI.
