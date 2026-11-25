@@ -14,7 +14,14 @@ Configuration and state stay where they are today: `~/.config/syndicate/`
 ## Prerequisites
 
 - Python 3.11 or newer, standard library only. The installer records one
-  absolute interpreter per activation and checks that it runs.
+  absolute interpreter per activation and checks it before recording it: it
+  must run and report 3.11+, neither it (after resolving symlinks) nor its
+  directory may be writable by another account, and neither the path you
+  give nor its resolved location may be inside a Git work tree. A virtual
+  environment is refused as the default interpreter (the one running the
+  installer), because its contents can change after installation; name a
+  stable interpreter with `--python`, or name the virtual environment's
+  interpreter explicitly with `--python` to accept it.
 - Git, used by the installer to fetch and archive releases.
 - A POSIX `sh`, used by the stable entry point.
 - Depending on which features you use: the `claude` and/or `codex` CLIs,
@@ -24,18 +31,20 @@ Configuration and state stay where they are today: `~/.config/syndicate/`
 
 | Path | Contents |
 | --- | --- |
-| `$XDG_DATA_HOME/syndicate/releases/<commit>/` | One immutable release per full commit ID: `bin/`, `roles/`, `skills/`, `hooks/`, `web/`, `docs/`, `resources/`, `portfolio/chief-of-staff.md`, `README.md` and `RELEASE.json`. Files and directories are read-only. |
+| `$XDG_DATA_HOME/syndicate/releases/<commit>/` | One immutable release per full commit ID: `bin/`, `roles/`, `skills/`, `hooks/`, `web/`, `docs/`, `resources/`, `portfolio/chief-of-staff.md`, `README.md` and `RELEASE.json`. Files and directories are read-only. The install root and `releases/` are mode 0755; activation is refused if another account can write either. |
 | `$XDG_DATA_HOME/syndicate/current` | Symlink to `releases/<commit>`, replaced atomically on activation. |
 | `$XDG_DATA_HOME/syndicate/interpreters/<commit>` | The absolute interpreter the shim uses for that release. |
 | `$XDG_DATA_HOME/syndicate/activations.jsonl` | Append-only activation log. |
-| `$XDG_DATA_HOME/syndicate/entrypoints.jsonl`, `entrypoint-backups/` | What the stable entry point replaced, for recovery. |
+| `$XDG_DATA_HOME/syndicate/entrypoints.jsonl`, `entrypoint-backups/` | What the stable entry point replaced, for recovery. The backup directory is mode 0700. |
 | `$XDG_DATA_HOME/syndicate/activation.lock` | Lock that serializes publish, activate, rollback and prune. |
 | `$XDG_DATA_HOME/syndicate/in-use/<commit>/<pid>` | In-use markers. An installed release writes one for each launcher that starts a session, dashboard or monitor and for each supervised provider CLI, and removes it at exit. A live PID keeps that release from being pruned. |
 | `$XDG_CACHE_HOME/syndicate/source.git` | Bare release-source cache. It is the only Git input to a release and lives outside every project worktree. |
 | `~/.local/bin/syndicate` | Stable entry point (shim). |
 
 `$XDG_DATA_HOME` defaults to `~/.local/share` and `$XDG_CACHE_HOME` to
-`~/.cache`. Every command accepts `--install-root DIR` (the `syndicate`
+`~/.cache`. The installer resolves the install root to its real path once, so
+a symlinked `HOME` or `XDG_DATA_HOME` names the same releases as the shim and
+the running launcher, which also use real paths. Every command accepts `--install-root DIR` (the `syndicate`
 directory itself), `--bin-dir DIR` and `--source-cache DIR` overrides.
 Rehearsals and tests use these overrides, or a disposable `HOME` and XDG
 variables. The runtime looks for `activations.jsonl` under the default
@@ -69,10 +78,24 @@ the `git archive` tar), `manifest_sha256`, `release_dir`, `interpreter`,
 
 `~/.local/bin/syndicate` is a small `sh` script. It resolves `current` once
 with `cd -P`, reads `interpreters/<commit>`, and runs
-`exec <interpreter> -B <release>/bin/syndicate "$@"` with
+`exec <interpreter> -I -B <release>/bin/syndicate "$@"` with
 `PYTHONDONTWRITEBYTECODE=1`. Activations after that point do not affect a
 running invocation. The script embeds only the install root, so it stays the
 same across upgrades.
+
+`-I` (isolated mode) keeps `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, the
+user site directory and the current directory out of Syndicate's imports, so
+a project file such as `shlex.py` can never run inside Syndicate. Every
+Python process Syndicate starts itself (relays, tmux windows, the limits
+monitor, the Claude status line and the live channel server) uses the same
+`<interpreter> -I -B` prefix. Provider CLIs (Claude, Codex) and the tools they
+run keep your environment, including `PYTHONPATH`, because your project's own
+tooling may need it; any Syndicate command they run uses the isolated prefix.
+
+`syndicate-install install-shim` rewrites the entry point. If the existing
+managed shim belongs to a different install root, it refuses unless you pass
+`--force`; the replaced shim is then backed up and recorded like any other
+entry point, with its `previous_root`.
 
 When the installer first writes the shim, it records whatever was at that
 path in `entrypoints.jsonl`. A symlink's target is recorded. A regular file
@@ -98,16 +121,27 @@ approved when all of these hold:
 4. `git merge-base --is-ancestor <commit> <fetched upstream main>` succeeds.
    The commit must be on upstream `main` as fetched by this same invocation.
 
-The release is built with `git archive` of that commit from the cache. Each
-archived file is compared with its committed blob, so `export-subst` and
-`export-ignore` attributes cannot change the result. A dirty or unmerged
+Fetches run with `fetch.fsckObjects=true`, so malformed objects are
+rejected. The release is built with `git archive --literal-pathspecs` of that
+commit from the cache, while the cache lock is still held, so a concurrent
+install cannot make the approved objects unreachable mid-build. Paths with
+an empty, `.`, `..` or `.git` component, and paths that are not UTF-8, are
+refused. Each archived file is compared with its committed blob, so
+`export-subst` and `export-ignore` attributes cannot change the result. A dirty or unmerged
 working tree is never an input. To run an unmerged checkout, use
 `syndicate dev --checkout PATH`, which is separate from installed releases.
 
 The trusted upstream is set once with `--upstream URL|PATH` and remembered in
 the cache. For this project that is `https://github.com/nabt/syndicate.git`.
-Passing a different `--upstream` later changes it explicitly and prints a
-notice.
+To switch to a different upstream later, pass the new `--upstream` together
+with `--change-upstream`; the activation log records `upstream_changed_from`.
+A local upstream (a path or `file://` URL) must be a bare repository without
+linked worktrees: in a working checkout, agents can move `main` and the tags.
+
+A tag name is expected to keep naming one commit. If an earlier activation
+recorded the tag at a different commit (the tag was moved upstream), the
+install is refused unless you pass `--allow-retag`; the log then records
+`retagged_from`.
 
 ## Bootstrapping the first release
 
@@ -128,7 +162,7 @@ installer and the release-aware runtime have to be merged to `main` first.
 
    ```sh
    scratch=$(mktemp -d)
-   python3 -B bin/syndicate-install install --tag v1.0.0 \
+   python3 -I -B bin/syndicate-install install --tag v1.0.0 \
      --upstream https://github.com/nabt/syndicate.git \
      --install-root "$scratch/syndicate" --bin-dir "$scratch/bin" \
      --source-cache "$scratch/source.git" --python /usr/bin/python3
@@ -144,15 +178,19 @@ running it, which might be a versioned path that a package upgrade removes.
 ## Install and upgrade
 
 ```sh
-python3 -B bin/syndicate-install install --tag vX.Y.Z --upstream https://github.com/nabt/syndicate.git
+python3 -I -B bin/syndicate-install install --tag vX.Y.Z --upstream https://github.com/nabt/syndicate.git
 # later, from any copy of the installer (checkout or installed release):
-python3 -B ~/.local/share/syndicate/current/bin/syndicate-install upgrade --tag vX.Y.Z
+python3 -I -B ~/.local/share/syndicate/current/bin/syndicate-install upgrade --tag vX.Y.Z
 ```
+
+Run the installer with `-I` so `PYTHONPATH` and the current directory cannot
+inject modules into it.
 
 `install` and `upgrade` are the same operation:
 
-1. Preflight the interpreter: it must be an absolute path to an executable
-   that reports Python 3.11 or newer.
+1. Preflight the interpreter, as described under Prerequisites, and check
+   that no other account can write the install root or the entry point
+   directory.
 2. Fetch and approve the tag, as described above.
 3. Stage the release in `releases/.staging-<pid>-*`, a sibling of its final
    location. The installer extracts the archive, writes `RELEASE.json` and
@@ -163,8 +201,9 @@ python3 -B ~/.local/share/syndicate/current/bin/syndicate-install upgrade --tag 
    in `RUNTIME_MODULES`. Relative Markdown links must resolve inside the
    release. Anchors are not checked.
 4. Make the stage read-only and smoke-test it from an unrelated directory
-   with a disposable `HOME`, XDG, Codex and Claude directories, and no
-   tmux. The smoke test runs `syndicate --help`, `syndicate --version` (when
+   with `HOME`, XDG, Codex, Claude, temporary and tmux directories pointed
+   at disposable locations and Syndicate, Python, Git and provider variables
+   removed. This redirects well-behaved code; it is not a sandbox. The smoke test runs `syndicate --help`, `syndicate --version` (when
    the release supports it, which also checks the commit), and
    `chief-of-staff --dry-run -x codex`. Afterwards the stage is re-verified
    against its manifest.
@@ -173,13 +212,21 @@ python3 -B ~/.local/share/syndicate/current/bin/syndicate-install upgrade --tag 
    installer then reuses it and records the new tag. A differing or damaged
    existing release is refused. Write `interpreters/<commit>`, replace
    `current` atomically, append to the activation log, and install or
-   refresh the shim. Pass `--no-shim` to skip the shim.
+   refresh the shim. Pass `--no-shim` to skip the shim. Extracted files, the
+   staged directories and `releases/` are fsynced before `current` moves, and
+   every atomic file replacement fsyncs its directory.
 
 If anything fails before the switch, the previous release stays active and
 the stage is removed. If the installer is killed during staging, a
 `.staging-*` directory is left behind. `prune` removes it once its PID has
 exited. Concurrent installers serialize on the lock, and `current` always
 points at a complete, verified release.
+
+When a step fails, the installer names what had already completed, for
+example `activated <commit>; shim not installed: ...` followed by
+`completed before the failure: switched current to <commit>; logged the
+activation`. Unexpected filesystem errors are reported the same way rather
+than as a traceback.
 
 ## Status, list and verify
 
@@ -200,8 +247,12 @@ syndicate-install rollback --to <commit>   # a specific previously activated rel
 ```
 
 Rollback works offline. It verifies the target against its manifest,
-preflights the interpreter recorded for it (override with `--python`),
-switches `current` under the lock, and logs `"action": "rollback"`. Only
+checks that the manifest's sha256 equals the `manifest_sha256` recorded when
+that release was last activated (a release rewritten consistently after
+installation is refused), preflights the interpreter recorded for it
+(override with `--python`), switches `current` under the lock, and logs
+`"action": "rollback"`. Without `--to`, a candidate that fails either check
+is skipped with a message and the next retained release is tried. Only
 previously activated releases are eligible. Rolling back changes the
 executable only. Portfolio data, decisions, messages and requests written in
 the meantime are kept. Stored formats must stay compatible across the
@@ -220,11 +271,25 @@ syndicate-install prune
 - the current release,
 - the previous known-good release (the default rollback target),
 - a release with a live `in-use/<commit>/<pid>` marker,
-- a release referenced in the command line of any running process (found
-  through `/proc`; a fallback for processes without a marker, such as older
-  releases or short commands, and unavailable where there is no `/proc`),
+- a release named (`releases/<commit>`, anywhere in an argument, under any
+  spelling of the install root) in the command line of any running process,
+  or in a `SYNDICATE_*` environment value of one. The launcher passes
+  `SYNDICATE_RELEASE_ROOT` to the provider CLI, so the CLI and everything it
+  starts keep the release. This `/proc` scan is the fallback for processes
+  without a marker, such as older releases or a CLI the launcher exec'd into,
 - a release registered as the Codex Stop hook in `$CODEX_HOME/hooks.json`
   (`--codex-home` overrides the location).
+
+Where there is no `/proc` and no live marker exists, `prune` cannot tell
+whether a session still uses a release, so it refuses unless you pass
+`--force` (`--dry-run` still reports, with a warning).
+
+Only directories named by a full commit ID are candidates; anything else in
+`releases/` is reported as ignored and left alone. Each removal first
+renames the release to `releases/.trash-<pid>-<commit>` under the lock and
+then deletes it, so an interrupted prune never leaves a half-deleted release
+under its commit name; the next `prune` removes leftover `.trash-*`
+directories.
 
 Markers are the primary liveness signal. The launcher of a Chief, team,
 specialist relay, `syndicate web` dashboard or limits monitor writes one for
@@ -241,7 +306,8 @@ create an `in-use` marker or skip pruning.
 
 The optional Codex review gate is registered as an absolute path in
 `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`). Migration is an
-explicit operator step and never runs automatically:
+explicit operator step and never runs automatically. It runs under the
+activation lock, so `prune` cannot remove its target meanwhile:
 
 ```sh
 syndicate-install migrate-codex-hook --dry-run    # show what would change
@@ -261,8 +327,14 @@ The migration:
   hook cannot be verified, the file is left unchanged.
 - Never adds a hook when none is registered. Use `syndicate setup-codex-gate`
   for that. It collapses duplicates, so the release command appears once.
+- Refuses a target release whose manifest differs from the one recorded at
+  its activation, and a `hooks.json` that is not UTF-8 or has duplicate
+  object keys (other readers might resolve those differently).
+- Resolves a symlinked `hooks.json` (for example into a dotfiles
+  repository) and edits the real file, so the symlink stays in place.
 - Copies the original file to `hooks.json.syndicate-backup-<time>-<pid>`
-  before writing atomically with the same mode.
+  next to the real file, created new with mode 0600, before writing
+  atomically with the original mode.
 - Does not approve the hook. Open `codex` and approve the changed hook
   through its normal hook review prompt.
 
@@ -291,9 +363,9 @@ cutover needs the requester's separate approval.
   checkout-backed fallback before changing the entry point.
   1. Export a snapshot of a verified commit to a preserved directory outside
      the editable checkout, for example
-     `git -C <checkout> archive <commit> | tar -x -C ~/.local/share/syndicate-fallback/<commit>`.
+     `mkdir -p ~/.local/share/syndicate-fallback/<commit> && git -C <checkout> archive <commit> | tar -x -C ~/.local/share/syndicate-fallback/<commit>`.
      Make it read-only.
-  2. Record the exact fallback prefix (`/usr/bin/python3 -B
+  2. Record the exact fallback prefix (`/usr/bin/python3 -I -B
      ~/.local/share/syndicate-fallback/<commit>/bin/syndicate`), its assets
      (`roles/`, `skills/`, `hooks/require-review.sh`, `web/`) and its hook
      target.
@@ -343,8 +415,8 @@ cutover needs the requester's separate approval.
 ### What changes for users at the first cutover
 
 - **Provider approvals re-prompt once.** Relay and session commands now start
-  with the pinned prefix `<interpreter> -B <release>/bin/syndicate`, for
-  example `Bash(/usr/bin/python3 -B /home/me/.local/share/syndicate/releases/<commit>/bin/syndicate team run-role *)`.
+  with the pinned prefix `<interpreter> -I -B <release>/bin/syndicate`, for
+  example `Bash(/usr/bin/python3 -I -B /home/me/.local/share/syndicate/releases/<commit>/bin/syndicate team run-role *)`.
   Saved Claude or Codex approvals keyed on the old
   `.../bin/syndicate team run-role` prefix no longer match, so each provider
   asks once more; the prefix changes again with each release directory.

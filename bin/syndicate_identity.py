@@ -70,13 +70,28 @@ def resource(*parts: str) -> Path:
     return ROOT.joinpath(*parts)
 
 
+# Isolated mode: PYTHONPATH, PYTHONHOME, PYTHONSTARTUP, the user site and the
+# script's or current directory never reach Syndicate's imports, so a project
+# file such as shlex.py cannot run inside Syndicate. Each entry script puts its
+# own bin/ directory on sys.path itself. -B: no bytecode written.
+PYTHON_FLAGS = ("-I", "-B")
+# Interpreter-steering variables removed from Python children's environments
+# (belt and braces: those children also run with -I).
+PYTHON_STEERING_ENV = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "PYTHONINSPECT",
+                       "PYTHONEXECUTABLE", "PYTHONPLATLIBDIR", "PYTHONSAFEPATH", "PYTHONWARNINGS",
+                       "PYTHONBREAKPOINT", "PYTHONDEBUG", "PYTHONVERBOSE", "PYTHONCASEOK")
+# Passed to the provider CLI of an installed release, so its descendants are
+# attributable to that release (syndicate-install prune scans for it).
+RELEASE_ENV = "SYNDICATE_RELEASE_ROOT"
+
+
 def python_argv(script: str | os.PathLike) -> list[str]:
-    """Run a bundled Python file with the pinned interpreter and bytecode disabled."""
-    return [interpreter(), "-B", str(script)]
+    """Run a bundled Python file with the pinned interpreter, isolated and bytecode disabled."""
+    return [interpreter(), *PYTHON_FLAGS, str(script)]
 
 
 def pinned_argv(script: str | os.PathLike | None = None) -> list[str]:
-    """The one invocation prefix for re-entering Syndicate: interpreter, -B, real launcher path."""
+    """The one invocation prefix for re-entering Syndicate: interpreter, -I -B, real launcher path."""
     launcher = Path(script).resolve() if script is not None else LAUNCHER
     return python_argv(launcher)
 
@@ -92,9 +107,19 @@ def pinned_command(*args: str) -> str:
 
 
 def child_env(env: dict | None = None) -> dict:
-    """Environment for a Python child: bytecode writes disabled."""
-    result = dict(os.environ if env is None else env)
+    """Environment for a Syndicate Python child: bytecode writes disabled, interpreter steering removed."""
+    result = {k: v for k, v in (os.environ if env is None else env).items() if k not in PYTHON_STEERING_ENV}
     result["PYTHONDONTWRITEBYTECODE"] = "1"
+    return result
+
+
+def session_env(env: dict) -> dict:
+    """Environment for a provider CLI: in an installed release, also names that release
+    (RELEASE_ENV) so the CLI's descendants keep it from being pruned. Other variables,
+    including the user's PYTHONPATH for project tools, pass through unchanged."""
+    result = dict(env)
+    if mode() == "release" and ROOT.parent.name == "releases":
+        result[RELEASE_ENV] = str(ROOT)
     return result
 
 

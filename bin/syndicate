@@ -2586,7 +2586,7 @@ def chief_instructions(workspace):
     prefix = identity.pinned_prefix()
     return (identity.pin_commands(body.strip()) + f"\n\n## Launch context\nPortfolio workspace: {workspace}\n"
             f"Portfolio store: {REGISTRY_PATH.parent / 'portfolio'}\n"
-            f"Use this exact executable prefix for every Syndicate command: {prefix}\n"
+            f"Syndicate executable prefix: {prefix}\nUse this exact prefix for every Syndicate command.\n"
             "This is a portfolio session, not a project orchestrator or specialist.\n" + live_instructions(workspace))
 
 
@@ -3098,7 +3098,7 @@ def cmd_web(args: argparse.Namespace) -> int:
     mark_release_in_use()
     if server.autostart_monitor:
         runtime.start_monitor(SCRIPT)
-    print(f"syndicate web dashboard: http://127.0.0.1:{server.server_address[1]}/  (ctrl-c to stop)")
+    print(f"syndicate web dashboard: http://127.0.0.1:{server.server_address[1]}/  (ctrl-c to stop)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -3320,7 +3320,7 @@ def _launch_session(args: argparse.Namespace) -> int | None:
         if exec_cli:
             run_id = runtime.write_run_record(project, task, team.host, None, task_owner)
             os.chdir(project)
-            os.execvpe(argv[0], argv, {**os.environ, runtime.RUN_ENV: run_id})
+            os.execvpe(argv[0], argv, identity.session_env({**os.environ, runtime.RUN_ENV: run_id}))
         runtime.start_monitor(SCRIPT)
         # The host is enforced for the whole run. Each specialist runner
         # enforces its own usage reserve so it can retry without stopping the host.

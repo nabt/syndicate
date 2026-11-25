@@ -370,7 +370,7 @@ runs an unmerged checkout without touching your installed release or its state:
 2. Copies its tracked and untracked, not ignored, files (never `.git` or
    bytecode) into a temporary, read-only snapshot. Later edits to the checkout
    cannot change the running run.
-3. Runs `python3 -B <snapshot>/bin/syndicate ARGS...` from a disposable working
+3. Runs `python3 -I -B <snapshot>/bin/syndicate ARGS...` from a disposable working
    directory with a disposable `HOME` (or `--home DIR`), `XDG_*` directories,
    `TMPDIR`, `TMUX_TMPDIR` (its own tmux server) and a namespaced tmux session
    `syndicate-dev-<id>`. All Syndicate state (registry, portfolio, limits

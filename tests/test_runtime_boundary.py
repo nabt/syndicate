@@ -161,12 +161,12 @@ class SubprocessCase(unittest.TestCase):
 
 class Pinning(ProjectCase):
     def prefix(self):
-        return shlex.join([identity.interpreter(), "-B", str(sy.SCRIPT)])
+        return shlex.join([identity.interpreter(), "-I", "-B", str(sy.SCRIPT)])
 
-    def test_pinned_argv_is_absolute_interpreter_dash_b_real_launcher(self):
+    def test_pinned_argv_is_absolute_interpreter_isolated_dash_b_real_launcher(self):
         argv = identity.pinned_argv()
         self.assertTrue(os.path.isabs(argv[0]))
-        self.assertEqual(argv[1:], ["-B", str(Path(sy.SCRIPT).resolve())])
+        self.assertEqual(argv[1:], ["-I", "-B", str(Path(sy.SCRIPT).resolve())])
         self.assertEqual(shlex.split(identity.pinned_prefix()), argv)
         self.assertEqual(identity.LAUNCHER, sy.SCRIPT)
 
@@ -178,9 +178,9 @@ class Pinning(ProjectCase):
             with patch.object(identity, "LAUNCHER", launcher), \
                  patch.object(identity.sys, "executable", "/opt/py thon/bin/python3"):
                 prefix = identity.pinned_prefix()
-                self.assertEqual(shlex.split(prefix), ["/opt/py thon/bin/python3", "-B", str(launcher)])
+                self.assertEqual(shlex.split(prefix), ["/opt/py thon/bin/python3", "-I", "-B", str(launcher)])
                 self.assertEqual(shlex.split(identity.pinned_command("team", "run-role", "a b")),
-                                 ["/opt/py thon/bin/python3", "-B", str(launcher), "team", "run-role", "a b"])
+                                 ["/opt/py thon/bin/python3", "-I", "-B", str(launcher), "team", "run-role", "a b"])
                 self.assertEqual(sy.relay_allow_rule(), f"Bash({prefix} team run-role *)")
 
     def test_paths_with_a_closing_parenthesis(self):
@@ -194,7 +194,7 @@ class Pinning(ProjectCase):
             launcher.write_text("")
             with patch.object(identity, "LAUNCHER", launcher), \
                  patch.object(identity.sys, "executable", "/opt/py)thon/bin/python3"):
-                argv = [identity.interpreter(), "-B", str(launcher)]
+                argv = [identity.interpreter(), "-I", "-B", str(launcher)]
                 self.assertIsNone(sy.relay_allow_rule())
                 team = sy.resolve_team(self.project)
                 err = io.StringIO()
@@ -205,7 +205,7 @@ class Pinning(ProjectCase):
                 self.assertNotIn("permissions", settings)
                 self.assertEqual(shlex.split(settings["statusLine"]["command"]), [*argv, "_claude-usage"])
                 command = sy.relay_command(team.roles["code-reviewer"], self.project)
-                self.assertEqual(shlex.split(command)[:5], [*argv, "team", "run-role"])
+                self.assertEqual(shlex.split(command)[:len(argv) + 2], [*argv, "team", "run-role"])
                 agents = json.loads(built[built.index("--agents") + 1])
                 self.assertIn(f"{command} <<'SYNDICATE_BRIEF'\n", agents["code-reviewer"]["prompt"])
                 gate = Path(tmp) / "hooks (y)" / "require-review.sh"
@@ -228,7 +228,7 @@ class Pinning(ProjectCase):
         self.assertEqual(granted, self.prefix() + " team run-role ")
         heredoc = f"{command} <<'SYNDICATE_BRIEF'\n"
         self.assertIn(heredoc, agents["code-reviewer"]["prompt"])
-        self.assertEqual(shlex.split(command)[:3], identity.pinned_argv())
+        self.assertEqual(shlex.split(command)[:len(identity.pinned_argv())], identity.pinned_argv())
 
     def test_codex_relay_tomls_use_pinned_prefix_in_per_run_directory(self):
         self.config("orchestrator = codex\ndefault = codex\ncode-reviewer = claude\n")
@@ -257,7 +257,8 @@ class Pinning(ProjectCase):
         chief = sy.chief_instructions(self.project)
         self.assertIn(f"`{self.prefix()} briefing --json`", chief)
         self.assertIn("printed `syndicate show` command", chief)
-        self.assertIn(f"Use this exact executable prefix for every Syndicate command: {self.prefix()}\n", chief)
+        self.assertIn(f"Syndicate executable prefix: {self.prefix()}\nUse this exact prefix for every Syndicate command.\n",
+                      chief)
         self.assertIn(".syndicate/status.json", body)  # paths are not commands
 
     def test_status_line_and_usage_probe_use_pinned_prefix(self):
@@ -268,7 +269,7 @@ class Pinning(ProjectCase):
         chief_settings = json.loads(chief[chief.index("--settings") + 1])
         self.assertEqual(chief_settings["statusLine"]["command"], f"{self.prefix()} _claude-usage")
         probe = json.loads(runtime.claude_usage_probe_command()[-1])["statusLine"]["command"]
-        self.assertEqual(shlex.split(probe)[:4], [*identity.pinned_argv(), "_claude-usage"])
+        self.assertEqual(shlex.split(probe)[:len(identity.pinned_argv()) + 1], [*identity.pinned_argv(), "_claude-usage"])
 
     def test_review_gate_hook_resolves_from_release_root(self):
         argv = sy.build_claude(sy.resolve_team(self.project), False, [])
@@ -312,7 +313,7 @@ class Pinning(ProjectCase):
     def test_channel_mcp_argv(self):
         server = live.channel_server(self.project / "live.json")
         self.assertEqual(server["command"], identity.interpreter())
-        self.assertEqual(server["args"], ["-B", str((Path(sy.SCRIPT).parent / "syndicate_live.py").resolve()),
+        self.assertEqual(server["args"], ["-I", "-B", str((Path(sy.SCRIPT).parent / "syndicate_live.py").resolve()),
                                           "channel", str(self.project / "live.json")])
         self.assertNotIn("env", server)
 
@@ -736,7 +737,7 @@ class Version(SubprocessCase):
                 "sy = importlib.util.module_from_spec(spec); loader.exec_module(sy)\n"
                 "print(json.dumps(dict(roles=str(sy.GLOBAL_ROLES), web=str(sy.WEB_DIR), chief=str(sy.CHIEF_ROLE),"
                 " gate=str(sy.GATE_SCRIPT), prefix=sy.identity.pinned_prefix(), rule=sy.relay_allow_rule(),"
-                " live=sy.live.channel_server('/x')['args'][1])))\n")
+                " live=sy.live.channel_server('/x')['args'][2])))\n")
         result = subprocess.run([sys.executable, "-B", "-c", code, str(self.fixture.shim)], cwd=self.foreign,
                                 env=self.env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -748,7 +749,7 @@ class Version(SubprocessCase):
         self.assertEqual(paths["gate"], str(release / "hooks" / "require-review.sh"))
         self.assertEqual(paths["live"], str(release / "bin" / "syndicate_live.py"))
         self.assertEqual(shlex.split(paths["prefix"]),
-                         [os.path.abspath(sys.executable), "-B", str(release / "bin" / "syndicate")])
+                         [os.path.abspath(sys.executable), "-I", "-B", str(release / "bin" / "syndicate")])
         self.assertIn(" ", paths["prefix"])
         self.assertEqual(paths["rule"], f"Bash({paths['prefix']} team run-role *)")
 

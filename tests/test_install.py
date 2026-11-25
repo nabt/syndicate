@@ -232,8 +232,12 @@ class StagingAndInventory(InstallCase):
         launcher.write_bytes(original + b"\n# uncommitted edit\n")
         rogue.write_text("---\nname: rogue\n---\nUntracked role\n")
         run_git(src, "add", "roles/rogue.md")  # staged but not committed
-        # Even with the dirty checkout itself as upstream, only committed objects are used.
-        self.installer("install", "--tag", "v1.2.0", "--upstream", str(src))
+        # A dirty checkout is never an upstream (agents in it could move main and tags)...
+        result = self.installer("install", "--tag", "v1.2.0", "--upstream", str(src), ok=False)
+        self.assertIn("not a bare repository", result.stderr)
+        self.assertEqual(self.release_entries(), [])
+        # ...and from the bare upstream only committed objects are used.
+        self.install("v1.2.0")
         release = self.root / "releases" / FIXTURE["c"]
         self.assertEqual((release / "bin" / "syndicate").read_bytes(), original)
         self.assertFalse((release / "roles" / "rogue.md").exists())
@@ -811,6 +815,21 @@ class ActiveSessionAcrossActivation(InstallCase):
             run_a = Path(next(iter(started["configs"]))).parent.parent
             before_a = {str(p): p.read_bytes() for p in run_a.rglob("*") if p.is_file()}
             generated_b = self.generate_with(Path(os.path.realpath(self.root / "releases" / b)), project)
+            # A second upgrade: A is now neither current nor previous, only live.
+            self.install("v1.2.0")
+            self.assertEqual(self.current(), FIXTURE["c"])
+            kept = json.loads(self.installer("prune", "--dry-run", "--json").stdout)["kept"]
+            self.assertIn(a, kept)
+            # Without markers, /proc still finds the session: the CLI the launcher
+            # exec'd into names the release only inside longer arguments and in
+            # its SYNDICATE_RELEASE_ROOT environment.
+            hidden = self.root / "in-use hidden"
+            (self.root / "in-use").rename(hidden)
+            try:
+                kept = json.loads(self.installer("prune", "--dry-run", "--json").stdout)["kept"]
+            finally:
+                hidden.rename(self.root / "in-use")
+            self.assertTrue(kept.get(a, "").startswith("process "), kept)
             go.touch()
             out, err = session.communicate(timeout=300)
         finally:
@@ -972,6 +991,368 @@ class CodexHookMigration(InstallCase):
         result = json.loads(self.migrate().stdout)
         self.assertFalse(result["changed"])
         self.assertEqual(self.hooks.read_bytes(), original)
+
+
+class LivenessAndPrune(InstallCase):
+    def test_symlinked_install_root_matches_markers_processes_hooks_and_prune(self):
+        a, b, c = FIXTURE["a"], FIXTURE["b"], FIXTURE["c"]
+        real = self.tmp / "real data"
+        real.mkdir()
+        link = self.tmp / "data link"
+        link.symlink_to(real)
+        self.env["XDG_DATA_HOME"] = str(link)
+        for tag in ("v1.0.0", "v1.1.0", "v1.2.0"):
+            self.install(tag)
+        paths = rel.Paths.from_env(environ=self.env)
+        self.assertEqual(paths.root, real / "syndicate")
+        linked_release = link / "syndicate" / "releases" / a
+        # The shim embeds the canonical root.
+        self.assertIn(f"root={rel.shlex.quote(str(real / 'syndicate'))}", self.shim.read_text())
+        # A hook registered through the symlinked spelling is still release A's.
+        hook = linked_release / "hooks" / "require-review.sh"
+        self.assertEqual(rel.release_of(paths, rel.shlex.quote(str(hook))), a)
+        self.assertEqual(rel.hook_provenance(paths, hook), f"release {a} manifest")
+        codex = self.tmp / "codex"
+        (codex / "hooks.json").write_text(json.dumps(
+            {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": rel.shlex.quote(str(hook))}]}]}}))
+        result = json.loads(self.installer("migrate-codex-hook", "--codex-home", str(codex), "--json").stdout)
+        self.assertEqual(result["changes"][0]["provenance"], f"release {a} manifest")
+        self.assertIn(c, json.loads((codex / "hooks.json").read_text())["hooks"]["Stop"][0]["hooks"][0]["command"])
+        # A process naming A through the symlinked root, inside a longer argument.
+        holder = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(120)",
+                                   f"--launcher={linked_release}/bin/syndicate"])
+        self.addCleanup(lambda: (holder.kill(), holder.wait()))
+        self.assertIn(a, rel.releases_in_use(paths))
+        self.assertIn(a, json.loads(self.installer("prune", "--dry-run", "--json").stdout)["kept"])
+        holder.kill()
+        holder.wait()
+        # A marker under the canonical root (where the launcher writes it) keeps A.
+        marker = real / "syndicate" / "in-use" / a / str(os.getpid())
+        marker.parent.mkdir(parents=True)
+        marker.touch()
+        self.assertEqual(rel.releases_in_use(paths).get(a), f"in-use marker pid {os.getpid()}")
+        marker.unlink()
+        result = json.loads(self.installer("prune", "--json").stdout)
+        self.assertEqual(result["removed"], [a])
+        self.assertEqual(sorted(p.name for p in (real / "syndicate" / "releases").iterdir()), sorted([b, c]))
+
+    def test_without_proc_or_markers_prune_needs_force(self):
+        a = FIXTURE["a"]
+        for tag in ("v1.0.0", "v1.1.0", "v1.2.0"):
+            self.install(tag)
+        quiet = mock.patch.object(rel, "log")
+        quiet.start()
+        self.addCleanup(quiet.stop)
+        with mock.patch.object(rel, "PROC", self.tmp / "no proc"):
+            preview = rel.prune(self.paths, dry_run=True)
+            self.assertTrue(preview["liveness_unverified"])
+            self.assertEqual(preview["removed"], [a])
+            with self.assertRaisesRegex(rel.ReleaseError, "without --force"):
+                rel.prune(self.paths)
+            self.assertIn(a, self.release_entries())
+            marker = self.root / "in-use" / a / str(os.getpid())
+            marker.parent.mkdir(parents=True)
+            marker.touch()
+            result = rel.prune(self.paths)
+            self.assertEqual((result["removed"], result["liveness_unverified"]), ([], False))
+            marker.unlink()
+            marker.parent.rmdir()
+            self.assertEqual(rel.prune(self.paths, force=True)["removed"], [a])
+
+    def test_prune_reports_foreign_entries_and_finishes_interrupted_removals(self):
+        a, b, c = FIXTURE["a"], FIXTURE["b"], FIXTURE["c"]
+        for tag in ("v1.0.0", "v1.1.0", "v1.2.0"):
+            self.install(tag)
+        (self.paths.releases / "notes.txt").write_text("not a release")
+        (self.paths.releases / "scratch").mkdir()
+        # An earlier prune was killed after renaming a release to its trash name.
+        trash = self.paths.releases / f".trash-999999-{a}"
+        shutil.copytree(self.paths.releases / a, trash)
+        rel.set_read_only(trash)
+        preview = json.loads(self.installer("prune", "--dry-run", "--json").stdout)
+        self.assertEqual(preview["ignored"], ["notes.txt", "scratch"])
+        self.assertEqual(preview["stale_trash"], [trash.name])
+        self.assertTrue(trash.exists())
+        real_rename = os.rename
+        renamed = []
+
+        def watch_rename(src, dst):
+            renamed.append((Path(src).name, Path(dst).name))
+            return real_rename(src, dst)
+
+        quiet = mock.patch.object(rel, "log")
+        quiet.start()
+        self.addCleanup(quiet.stop)
+        with mock.patch.object(rel.os, "rename", side_effect=watch_rename):
+            result = rel.prune(self.paths)
+        self.assertEqual(result["removed"], [a])
+        self.assertEqual(renamed, [(a, f".trash-{os.getpid()}-{a}")])
+        self.assertEqual(sorted(p.name for p in self.paths.releases.iterdir()), sorted([b, c, "notes.txt", "scratch"]))
+
+    def test_rollback_skips_damaged_candidates_and_refuses_a_rewritten_manifest(self):
+        a, b, c = FIXTURE["a"], FIXTURE["b"], FIXTURE["c"]
+        for tag in ("v1.0.0", "v1.1.0", "v1.2.0"):
+            self.install(tag)
+        # B (the newest candidate) is damaged: rollback skips it and selects A.
+        role = self.paths.releases / b / "roles" / "orchestrator.md"
+        os.chmod(role.parent, 0o755)
+        os.chmod(role, 0o644)
+        role.write_text("damaged\n")
+        result = self.installer("rollback")
+        self.assertIn(f"skipping rollback candidate {b}", result.stderr)
+        self.assertEqual(self.current(), a)
+        # C is rewritten consistently (file and manifest digest both changed): it
+        # verifies against itself but not against the activation log.
+        release = self.paths.releases / c
+        os.chmod(release, 0o755)
+        os.chmod(release / "roles", 0o755)
+        target = release / "roles" / "orchestrator.md"
+        os.chmod(target, 0o644)
+        target.write_text("rewritten\n")
+        manifest = json.loads((release / "RELEASE.json").read_text())
+        manifest["files"]["roles/orchestrator.md"] = hashlib.sha256(b"rewritten\n").hexdigest()
+        os.chmod(release / "RELEASE.json", 0o644)
+        (release / "RELEASE.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        self.assertEqual(rel.verify_release(release)["commit"], c)
+        result = self.installer("rollback", "--to", c, ok=False)
+        self.assertIn("differs from the manifest recorded", result.stderr)
+        result = self.installer("migrate-codex-hook", "--codex-home", str(self.tmp / "codex"), "--target", c, ok=False)
+        self.assertIn("differs from the manifest recorded", result.stderr)
+        self.assertEqual(self.current(), a)
+
+
+class SourceTrust(InstallCase):
+    def upstream_copy(self, name="upstream copy.git"):
+        copy = self.tmp / name
+        shutil.copytree(FIXTURE["upstream"], copy)
+        return copy
+
+    def test_moved_tag_needs_allow_retag(self):
+        upstream = self.upstream_copy()
+        self.installer("install", "--tag", "v1.0.0", "--upstream", str(upstream))
+        run_git(upstream, "tag", "-f", "v1.0.0", FIXTURE["b"])
+        result = self.installer("install", "--tag", "v1.0.0", ok=False)
+        self.assertIn("--allow-retag", result.stderr)
+        self.assertEqual(self.current(), FIXTURE["a"])
+        self.installer("install", "--tag", "v1.0.0", "--allow-retag")
+        self.assertEqual(self.current(), FIXTURE["b"])
+        self.assertEqual(self.records()[-1]["retagged_from"], [FIXTURE["a"]])
+
+    def test_changing_or_untrusted_upstreams_are_refused(self):
+        self.install("v1.0.0")
+        other = self.upstream_copy()
+        result = self.installer("install", "--tag", "v1.1.0", "--upstream", str(other), ok=False)
+        self.assertIn("--change-upstream", result.stderr)
+        self.installer("install", "--tag", "v1.1.0", "--upstream", str(other), "--change-upstream")
+        self.assertEqual(self.records()[-1]["upstream_changed_from"], str(FIXTURE["upstream"]))
+        self.assertEqual(self.records()[-1]["upstream"], str(other))
+        # A working checkout, or a bare repository with linked worktrees, can have
+        # its main and tags moved by agents working in it.
+        result = self.installer("install", "--tag", "v1.2.0", "--upstream", str(FIXTURE["src"]),
+                                "--change-upstream", ok=False)
+        self.assertIn("not a bare repository", result.stderr)
+        run_git(other, "worktree", "add", "-q", str(self.tmp / "linked"), "main")
+        result = self.installer("install", "--tag", "v1.2.0", ok=False)
+        self.assertIn("linked worktrees", result.stderr)
+        self.assertEqual(self.current(), FIXTURE["b"])
+
+    def test_tree_entries_refuse_unsafe_or_non_utf8_paths(self):
+        def listing(name: bytes):
+            blob = "0" * 40
+            out = b"100644 blob " + blob.encode() + b"\tbin/syndicate\0100644 blob " + blob.encode() + b"\t" + name + b"\0"
+            return subprocess.CompletedProcess([], 0, stdout=out, stderr=b"")
+
+        for name, message in ((b"roles/../x.md", "unsafe path"), (b"roles/./x.md", "unsafe path"),
+                              (b"roles//x.md", "unsafe path"), (b"docs/.git/config", "unsafe path"),
+                              (b"docs/.GIT/config", "unsafe path"), (b"roles/\xff.md", "not a UTF-8 path")):
+            with self.subTest(name=name), mock.patch.object(rel, "git", return_value=listing(name)):
+                with self.assertRaisesRegex(rel.ReleaseError, message):
+                    rel.tree_entries(self.paths.cache, FIXTURE["a"])
+
+
+class InterpreterTrust(InstallCase):
+    def test_virtualenv_default_is_refused_but_explicit_choice_is_allowed(self):
+        venv = self.tmp / "venv"
+        subprocess.run([sys.executable, "-B", "-m", "venv", "--without-pip", str(venv)], check=True,
+                       env=self.env, capture_output=True, timeout=120)
+        python = venv / "bin" / "python"
+        result = subprocess.run([str(python), "-B", str(INSTALLER), "install", "--tag", "v1.0.0", "--upstream",
+                                 str(FIXTURE["upstream"])], cwd=self.tmp / "elsewhere", env=self.env,
+                                capture_output=True, text=True, timeout=300)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("virtual environment", result.stderr)
+        self.assertIsNone(self.current())
+        with self.assertRaisesRegex(rel.ReleaseError, "virtual environment"):
+            rel.preflight_interpreter(str(python), explicit=False)
+        self.assertEqual(rel.preflight_interpreter(str(python), explicit=True), str(python))
+
+    def test_writable_or_worktree_interpreters_are_refused(self):
+        shared = self.tmp / "shared bin"
+        shared.mkdir()
+        wrapper = shared / "python3"
+        wrapper.write_text(f"#!/bin/sh\nexec '{os.path.abspath(sys.executable)}' \"$@\"\n")
+        wrapper.chmod(0o755)
+        self.assertEqual(rel.preflight_interpreter(str(wrapper)), str(wrapper))
+        wrapper.chmod(0o757)
+        with self.assertRaisesRegex(rel.ReleaseError, "world-writable"):
+            rel.preflight_interpreter(str(wrapper))
+        wrapper.chmod(0o755)
+        shared.chmod(0o777)
+        self.addCleanup(shared.chmod, 0o755)
+        with self.assertRaisesRegex(rel.ReleaseError, "world-writable"):
+            rel.preflight_interpreter(str(wrapper))
+        shared.chmod(0o755)
+        project = self.tmp / "project"
+        (project / ".venv" / "bin").mkdir(parents=True)
+        (project / ".git").mkdir()
+        inside = project / ".venv" / "bin" / "python3"
+        inside.symlink_to(wrapper)
+        with self.assertRaisesRegex(rel.ReleaseError, "Git work tree"):
+            rel.preflight_interpreter(str(inside))
+        result = self.install("v1.0.0", "--python", str(inside), ok=False)
+        self.assertIn("Git work tree", result.stderr)
+
+
+class EnvironmentIsolation(InstallCase):
+    def test_project_modules_on_pythonpath_never_run_inside_syndicate(self):
+        self.install("v1.0.0")
+        release = Path(os.path.realpath(self.root / "releases" / FIXTURE["a"]))
+        project = self.tmp / "hostile project"
+        project.mkdir()
+        hit = self.tmp / "imported"
+        for module in ("shlex", "json", "syndicate_identity", "sitecustomize", "usercustomize"):
+            (project / f"{module}.py").write_text(
+                f"import pathlib\npathlib.Path({str(hit)!r}).write_text({module!r})\nraise SystemExit(99)\n")
+        env = dict(self.env, PYTHONPATH=str(project) + os.pathsep + ".", PYTHONSTARTUP=str(project / "shlex.py"),
+                   PYTHONUSERBASE=str(project))
+        for argv in (["--version"], ["chief-of-staff", "--dry-run", "-x", "codex"]):
+            result = self.shim_run(*argv, cwd=project, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        # The pinned prefix a session hands its agents is isolated too.
+        launch = json.loads(self.shim_run("chief-of-staff", "--dry-run", "-x", "codex", cwd=project, env=env).stdout)
+        instructions = json.loads(next(a for a in launch["argv"] if a.startswith("developer_instructions="))
+                                  .split("=", 1)[1])
+        prefix = rel.shlex.split(instructions.split("Syndicate executable prefix: ", 1)[1].split("\n", 1)[0])
+        self.assertEqual(prefix[1:], ["-I", "-B", str(release / "bin" / "syndicate")])
+        result = subprocess.run([*prefix, "--version"], cwd=project, env=env, capture_output=True, text=True,
+                                timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The channel MCP server finds its sibling modules under -I.
+        endpoint = self.tmp / "live.json"
+        endpoint.write_text(json.dumps({"active": False}))
+        channel = subprocess.run([*prefix[:3], str(release / "bin" / "syndicate_live.py"), "channel", str(endpoint)],
+                                 input="", cwd=project, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(channel.returncode, 0, channel.stderr)
+        self.assertFalse(hit.exists(), hit.read_text() if hit.exists() else "")
+        self.assertIn('exec "$interpreter" -I -B "$release/bin/syndicate" "$@"', self.shim.read_text())
+
+
+class Durability(InstallCase):
+    def test_permissions_partial_failures_and_shim_ownership(self):
+        self.install("v1.0.0")
+        self.assertEqual(stat.S_IMODE(os.stat(self.root).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(self.root / "releases").st_mode), 0o755)
+        # A shim directory anyone can write is refused before anything changes.
+        self.shim.parent.chmod(0o777)
+        result = self.install("v1.1.0", ok=False)
+        self.assertIn("world-writable", result.stderr)
+        self.assertEqual(self.current(), FIXTURE["a"])
+        self.shim.parent.chmod(0o755)
+        # The entry point cannot be written: activation is reported with what failed.
+        self.shim.unlink()
+        self.shim.mkdir()
+        result = self.install("v1.1.0", ok=False)
+        self.assertIn(f"activated {FIXTURE['b']}; shim not installed", result.stderr)
+        self.assertIn("completed before the failure", result.stderr)
+        self.assertIn("switched current", result.stderr)
+        self.assertEqual(self.current(), FIXTURE["b"])
+        self.shim.rmdir()
+        self.installer("install-shim")
+        # Another install root's managed shim is replaced only with --force, and recorded.
+        other_root = self.tmp / "other store" / "syndicate"
+        result = self.installer("install-shim", "--install-root", str(other_root), ok=False)
+        self.assertIn("--force", result.stderr)
+        self.assertIn(f"root={rel.shlex.quote(str(self.paths.root))}", self.shim.read_text())
+        self.installer("install-shim", "--install-root", str(other_root), "--force")
+        self.assertIn(f"root={rel.shlex.quote(str(other_root))}", self.shim.read_text())
+        (record,) = rel.read_jsonl(other_root / "entrypoints.jsonl")
+        self.assertEqual((record["kind"], record["previous_root"], record["forced"]),
+                         ("file", str(self.paths.root), True))
+        self.assertEqual(stat.S_IMODE(os.stat(other_root / "entrypoint-backups").st_mode), 0o700)
+        # restore-entrypoint from the other root's log puts the first shim back.
+        self.installer("restore-entrypoint", "--install-root", str(other_root))
+        self.assertIn(f"root={rel.shlex.quote(str(self.paths.root))}", self.shim.read_text())
+
+    def test_restore_entrypoint_reports_damaged_records_and_backups(self):
+        self.shim.parent.mkdir(parents=True)
+        self.shim.write_text("#!/bin/sh\necho custom\n")
+        self.install("v1.0.0")
+        (record,) = rel.read_jsonl(self.paths.entrypoints)
+        Path(record["backup"]).unlink()
+        result = self.installer("restore-entrypoint", ok=False)
+        self.assertIn("cannot be read", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        with open(self.paths.entrypoints, "ab") as handle:
+            handle.write(b'{"path": "\xff"}\n')
+        result = self.installer("restore-entrypoint", ok=False)
+        self.assertIn("line 2 is not a JSON object", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertTrue(rel.is_managed_shim(self.shim))
+
+
+class HookFileSafety(InstallCase):
+    def setUp(self):
+        super().setUp()
+        self.install("v1.0.0")
+        self.codex = self.tmp / "codex"
+        self.checkout_hook = rel.shlex.quote(str(FIXTURE["src"] / "hooks" / "require-review.sh"))
+
+    def test_symlinked_hooks_json_stays_a_symlink_and_backup_is_private(self):
+        dotfiles = self.tmp / "dotfiles"
+        dotfiles.mkdir()
+        real = dotfiles / "codex-hooks.json"
+        real.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command",
+                                                                  "command": self.checkout_hook}]}]}}))
+        real.chmod(0o644)
+        (self.codex / "hooks.json").symlink_to(real)
+        result = json.loads(self.installer("migrate-codex-hook", "--codex-home", str(self.codex), "--json").stdout)
+        self.assertTrue((self.codex / "hooks.json").is_symlink())
+        self.assertIn(FIXTURE["a"], json.loads(real.read_text())["hooks"]["Stop"][0]["hooks"][0]["command"])
+        self.assertEqual(stat.S_IMODE(os.stat(real).st_mode), 0o644)
+        backup = Path(result["backup"])
+        self.assertEqual(backup.parent, dotfiles)
+        self.assertEqual(stat.S_IMODE(os.stat(backup).st_mode), 0o600)
+
+    def test_duplicate_keys_are_refused_without_changes(self):
+        hooks = self.codex / "hooks.json"
+        hooks.write_text('{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": %s}]}]},'
+                         ' "hooks": {}}' % json.dumps(self.checkout_hook))
+        original = hooks.read_bytes()
+        result = self.installer("migrate-codex-hook", "--codex-home", str(self.codex), ok=False)
+        self.assertIn("duplicate key 'hooks'", result.stderr)
+        self.assertEqual(hooks.read_bytes(), original)
+        self.assertEqual(list(self.codex.glob("hooks.json.syndicate-backup-*")), [])
+
+    def test_migration_waits_for_the_activation_lock(self):
+        hooks = self.codex / "hooks.json"
+        hooks.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command",
+                                                                   "command": self.checkout_hook}]}]}}))
+        err = self.tmp / "migrate.err"
+        with open(self.paths.lock, "a") as held, open(err, "w") as stderr:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            proc = subprocess.Popen([sys.executable, "-B", str(INSTALLER), "migrate-codex-hook", "--codex-home",
+                                     str(self.codex)], cwd=self.tmp / "elsewhere", env=self.env,
+                                    stdout=subprocess.DEVNULL, stderr=stderr)
+            self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
+            deadline = time.time() + 60
+            while "waiting for activation lock" not in err.read_text():
+                self.assertIsNone(proc.poll(), err.read_text())
+                self.assertLess(time.time(), deadline)
+                time.sleep(0.05)
+            self.assertNotIn(FIXTURE["a"], hooks.read_text())
+            fcntl.flock(held, fcntl.LOCK_UN)
+        self.assertEqual(proc.wait(timeout=60), 0, err.read_text())
+        self.assertIn(FIXTURE["a"], hooks.read_text())
 
 
 if __name__ == "__main__":

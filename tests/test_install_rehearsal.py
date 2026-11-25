@@ -909,7 +909,7 @@ class RequestRebinding(RehearsalCase):
         self.assertNotEqual(new_session, old_session)
         self.assertEqual(launch["run"]["release"]["commit"], a)
         prefix = shlex.split(launch["prefix"])
-        self.assertEqual(prefix[1:], ["-B", str(self.release_dir(a) / "bin" / "syndicate")])
+        self.assertEqual(prefix[1:], ["-I", "-B", str(self.release_dir(a) / "bin" / "syndicate")])
         live = {s["id"]: s for s in self.synj("sessions", "--all", "--json")}
         self.assertTrue(live[new_session]["live"])
         self.assertEqual((live[new_session]["source_path"], live[new_session]["task_id"]), (str(p1), task))
@@ -1064,7 +1064,7 @@ class MonitorTransition(RehearsalCase):
             return None
         owners = self.wait_for(running, f"monitor of release {commit}", timeout=60)
         (pid, args), = owners.items()
-        self.assertEqual(args[1:], ["-B", launcher, "_limits-monitor"])
+        self.assertEqual(args[1:], ["-I", "-B", launcher, "_limits-monitor"])
         state = read_json(self.limits / "monitor.json")
         self.assertEqual(state["pid"], pid)
         self.assertEqual(state["release"]["root"], str(self.release_dir(commit)))
@@ -1409,11 +1409,10 @@ class FirstCutoverFallback(RehearsalCase):
         chief_launch = chief.ready()
         workspace = self.home / ".syndicate" / "portfolio" / "workspace"
         self.assertEqual(chief_launch["project"], str(workspace))
-        pinned = re.search(r"Use this exact executable prefix for every Syndicate command: (.+)",
-                           chief_launch["instructions"])
+        pinned = re.search(r"Syndicate executable prefix: (.+)", chief_launch["instructions"])
         self.assertIsNotNone(pinned, chief_launch["instructions"][-2000:])
         chief_prefix = shlex.split(pinned.group(1))
-        self.assertEqual(chief_prefix[1:], ["-B", str(snapshot / "bin" / "syndicate")])
+        self.assertEqual(chief_prefix[1:], ["-I", "-B", str(snapshot / "bin" / "syndicate")])
         self.assertNotIn(str(editable), chief_launch["instructions"])
         self.assertEqual(json.loads(chief.run(chief_prefix + ["--version", "--json"])["out"])["root"], str(snapshot))
         briefing = json.loads(chief.run(chief_prefix + ["briefing", "--json"])["out"])

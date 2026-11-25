@@ -49,7 +49,7 @@ class TeamTasks(ProjectCase):
                                       self.project.name, '-c', str(self.project)])
         self.assertNotIn('new-window', [call.args[0][1] for call in run.call_args_list])
         argv = shlex.split(command[-1])
-        self.assertEqual(argv[:6], [sy.identity.interpreter(), '-B', str(sy.SCRIPT), '_in-tmux', 'team', 'task'])
+        self.assertEqual(argv[:7], [sy.identity.interpreter(), '-I', '-B', str(sy.SCRIPT), '_in-tmux', 'team', 'task'])
         self.assertEqual(argv[-1], 'Build $(touch /tmp/unsafe); a new feature')
 
     def test_live_team_is_reused(self):

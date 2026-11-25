@@ -16,6 +16,11 @@ import uuid
 from contextlib import contextmanager
 
 sys.dont_write_bytecode = True  # also when started directly as the channel MCP server
+# Started as the channel MCP server with -I, the script directory is not on
+# sys.path; add this module's own bin/ directory (never the cwd).
+_BIN = os.path.dirname(os.path.realpath(__file__))
+if _BIN not in sys.path:
+    sys.path.insert(0, _BIN)
 
 import syndicate_identity as identity
 import syndicate_runtime as runtime

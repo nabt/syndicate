@@ -1331,7 +1331,7 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
         argv = delivery.prepare(argv)
     # Delegated specialists copy the run id into their leases; the supervisor
     # honours only leases of its own run. An inherited id is never passed on.
-    env = {key: value for key, value in os.environ.items() if key != RUN_ENV}
+    env = identity.session_env({key: value for key, value in os.environ.items() if key != RUN_ENV})
     if not chief:
         env[RUN_ENV] = run_id
     old_terminal = termios.tcgetattr(sys.stdin) if interactive else None

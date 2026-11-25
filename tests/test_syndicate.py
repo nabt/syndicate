@@ -457,7 +457,7 @@ class LaunchCommands(ProjectCase):
         self.assertIn("SYNDICATE_BRIEF", reviewer["prompt"])
         self.assertIn("Read", agents["backend-engineer"]["tools"])
         settings = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
-        prefix = sy.shlex.join([sy.identity.interpreter(), "-B", str(sy.SCRIPT)])
+        prefix = sy.shlex.join([sy.identity.interpreter(), "-I", "-B", str(sy.SCRIPT)])
         self.assertEqual(settings["permissions"]["allow"], [f"Bash({prefix} team run-role *)"])
         self.assertIn(f"{prefix} team run-role code-reviewer --project", reviewer["prompt"])
 

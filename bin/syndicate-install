@@ -4,7 +4,7 @@
 Run it with bytecode disabled, from a checkout (first install) or from an
 installed release (later upgrades and rollbacks):
 
-    python3 -B bin/syndicate-install install --tag vX.Y.Z --upstream URL
+    python3 -I -B bin/syndicate-install install --tag vX.Y.Z --upstream URL
 
 See docs/user-install.md.
 """
