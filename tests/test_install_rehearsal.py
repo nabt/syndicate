@@ -26,6 +26,7 @@ import json
 import os
 import pty
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -89,6 +90,15 @@ def copy_worktree(dest: Path, env) -> None:
 
 def setUpModule():
     base = Path(tempfile.mkdtemp(prefix="syndicate-rehearsal-fixture-"))
+    FIXTURE.update(base=base)
+    try:
+        build_fixture(base)
+    except BaseException:
+        tearDownModule()  # unittest skips tearDownModule when setUpModule fails
+        raise
+
+
+def build_fixture(base: Path):
     (base / "home").mkdir()
     env = clean_env(HOME=str(base / "home"), TMPDIR=os.environ.get("TMPDIR", tempfile.gettempdir()))
     FIXTURE.update(base=base, env=env)
@@ -287,7 +297,7 @@ def record_inventory(home: Path, projects) -> dict:
     return inventory
 
 
-def legacy_context_inventory(checkout: Path, roots, tmux_sockets=()) -> dict:
+def legacy_context_inventory(checkout: Path, roots, tmux_sockets=(), env=None) -> dict:
     """Every reference to an old checkout path: {category: sorted locations}.
 
     Searches regular files (text, up to 4 MiB) and symlinks under each root,
@@ -348,7 +358,7 @@ def legacy_context_inventory(checkout: Path, roots, tmux_sockets=()) -> dict:
     for sock in tmux_sockets:
         listing = subprocess.run(["tmux", "-S", str(sock), "list-panes", "-a", "-F",
                                   "#{session_name}:#{window_name} #{pane_start_command}"],
-                                 capture_output=True, text=True)
+                                 capture_output=True, text=True, env=env, timeout=30)
         for line in listing.stdout.splitlines():
             if pattern.search(line.encode()):
                 add("tmux", f"{sock} {line.split(' ', 1)[0]}")
@@ -493,7 +503,7 @@ class RehearsalCase(unittest.TestCase):
 
     def _cleanup(self):
         for sock in self.tmp.joinpath("tmux").glob("*"):
-            subprocess.run(["tmux", "-S", str(sock), "kill-server"], capture_output=True)
+            subprocess.run(["tmux", "-S", str(sock), "kill-server"], capture_output=True, env=self.env, timeout=30)
         for attempt in range(50):
             pids = self.scoped_pids()
             if not pids:
@@ -574,6 +584,18 @@ class RehearsalCase(unittest.TestCase):
         self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
         return team
 
+    def launch_chief(self, *args, prefix=None):
+        """Start `chief-of-staff ARGS` with a controllable stand-in Codex Chief."""
+        ctl = Path(tempfile.mkdtemp(prefix="chief-", dir=self.tmp / "ctl"))
+        output = ctl.with_suffix(".out")
+        argv = list(prefix or [str(self.shim)]) + ["chief-of-staff", *args]
+        with open(output, "wb") as handle:
+            proc = subprocess.Popen(argv, cwd=self.tmp / "elsewhere", env=dict(self.env, FAKE_CODEX_CTL=str(ctl)),
+                                    stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
+        return TeamRun(self, proc, ctl, output)
+
     def codex_records(self, kind=None):
         if not self.codex_log.exists():
             return []
@@ -600,6 +622,33 @@ class RehearsalCase(unittest.TestCase):
         (handoff / "checkpoint.md").write_text(f"Checkpoint for {task_id}: request incorporation pending.\n")
         (handoff / "handoff.md").write_text(f"# Handoff\n\nResume task {task_id}; see checkpoint.md.\n")
         return handoff
+
+    # -- dashboard -----------------------------------------------------------
+    def start_web(self, port=0, no_monitor=False):
+        env = dict(self.env, PYTHONUNBUFFERED="1")
+        argv = [str(self.shim), "web", "--port", str(port)] + (["--no-monitor"] if no_monitor else [])
+        proc = subprocess.Popen(argv, cwd=self.tmp / "elsewhere", env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(proc.stderr.close)
+        # Bounded wait for the banner (the pipe is empty before the first read).
+        ready, _, _ = select.select([proc.stdout], [], [], 60)
+        line = proc.stdout.readline() if ready else ""
+        if "http://127.0.0.1:" not in line:
+            proc.poll() is None and proc.kill()
+            proc.wait(timeout=30)
+            self.fail(f"web did not start: {line}{proc.stderr.read()}")
+        return proc, int(line.split("http://127.0.0.1:", 1)[1].split("/", 1)[0])
+
+    def get(self, port, path):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
 
     # -- monitor -------------------------------------------------------------
     def monitor_lock_state(self):
@@ -999,28 +1048,6 @@ class RestartAndRollback(RehearsalCase):
 
 @unittest.skipUnless(LINUX, "identifies the monitor lock owner through /proc")
 class MonitorTransition(RehearsalCase):
-    def start_web(self, port=0):
-        env = dict(self.env, PYTHONUNBUFFERED="1")
-        proc = subprocess.Popen([str(self.shim), "web", "--port", str(port)], cwd=self.tmp / "elsewhere", env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
-        self.addCleanup(proc.stdout.close)
-        self.addCleanup(proc.stderr.close)
-        line = proc.stdout.readline()
-        if "http://127.0.0.1:" not in line:
-            proc.wait(timeout=30)
-            self.fail(f"web did not start: {line}{proc.stderr.read()}")
-        return proc, int(line.split("http://127.0.0.1:", 1)[1].split("/", 1)[0])
-
-    def get(self, port, path):
-        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
-        try:
-            connection.request("GET", path)
-            response = connection.getresponse()
-            return response.status, response.read()
-        finally:
-            connection.close()
-
     def monitor_release(self):
         return (read_json(self.limits / "monitor.json", {}) or {}).get("release", {})
 
@@ -1048,42 +1075,54 @@ class MonitorTransition(RehearsalCase):
         a, b = FIXTURE["a"], FIXTURE["b"]
         self.install("v1.0.0")
 
-        # An old-release dashboard auto-starts the shared monitor.
+        # Dashboard-triggered autostart: nothing else starts a monitor here, so
+        # the one that appears comes from the old-release dashboard's launch.
+        self.assertEqual((self.monitor_processes(), self.monitor_lock_state()), ({}, "free"))
         web_a, port_a = self.start_web()
         monitor_a = self.wait_monitor(a)
         status, body = self.get(port_a, "/api/limits")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["monitor"]["release"]["commit"], a)
 
-        # Hazard: stopping the monitor while that dashboard still serves lets it restart A.
+        # Hazard: stopping the monitor while that dashboard still serves lets
+        # its next data request auto-start A again.
         self.stop_monitor()
         self.assertEqual(self.get(port_a, "/api/limits")[0], 200)
         restarted = self.wait_monitor(a, exclude={monitor_a})
         self.assertNotEqual(restarted, monitor_a)
 
-        # Runbook: quiesce the old dashboard first, then stop and wait for the lock.
+        # Runbook: quiesce the old dashboard (or disable its autostart) first,
+        # then stop the monitor and wait for verified lock release.
         web_a.terminate()
         web_a.wait(timeout=30)
         self.stop_monitor()
         self.assertEqual(self.monitor_processes(), {})
 
-        # Workaround while `web` has no option to skip autostart: a dashboard
-        # started while the monitor lock is held does not start a monitor.
-        with open(self.limits / "monitor.lock", "a") as held:
-            fcntl.flock(held, fcntl.LOCK_EX)
-            web_quiet, _ = self.start_web()
-            time.sleep(1)
-            self.assertEqual(self.monitor_processes(), {})
-            web_quiet.terminate()
-            web_quiet.wait(timeout=30)
+        # An old-release dashboard with autostart disabled (--no-monitor) may
+        # keep serving through the transition: neither its launch nor its data
+        # requests start a monitor while the singleton is stopped.
+        web_quiet, port_quiet = self.start_web(no_monitor=True)
+        for _ in range(3):
+            status, body = self.get(port_quiet, "/api/limits")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["monitor"].get("pid"), restarted)  # last record of the stopped one
+        time.sleep(1.5)
+        self.assertEqual((self.monitor_processes(), self.monitor_lock_state()), ({}, "free"))
 
         # Activate B and restart the monitor from it.
         self.install("v1.1.0")
-        self.assertEqual(self.monitor_processes(), {})
+        self.assertEqual(self.get(port_quiet, "/api/limits")[0], 200)
+        self.assertEqual((self.monitor_processes(), self.monitor_lock_state()), ({}, "free"))
         self.assertIn("codex:", self.syn("limits").stdout)
         monitor_b = self.wait_monitor(b, exclude={monitor_a, restarted})
         observation = read_json(self.limits / "codex.json")
         self.assertEqual(observation["source"], "codex-app-server")
+        # The paused A dashboard now reports B's monitor and still starts nothing.
+        status, body = self.get(port_quiet, "/api/limits")
+        self.assertEqual(json.loads(body)["monitor"]["release"]["commit"], b)
+        self.assertEqual(set(self.monitor_processes()), {monitor_b})
+        web_quiet.terminate()
+        web_quiet.wait(timeout=30)
 
         # The intended dashboard comes from B and reuses B's monitor.
         web_b, port_b = self.start_web()
@@ -1223,6 +1262,25 @@ class HookRecovery(RehearsalCase):
         self.assertEqual(kept["removed"], [])
         self.assertEqual(self.version()["commit"], a)
         self.assertEqual(operator_backup.read_bytes(), json.dumps(original, indent=2).encode() + b"\n")
+        # Restart and verify only the intended prior services before resuming.
+        self.assert_prior_dashboard(self.release_dir(a), a)
+
+    def assert_prior_dashboard(self, root, commit=None):
+        """The restarted dashboard serves `root`'s page and its data endpoint; its monitor follows."""
+        web, port = self.start_web()
+        status, page = self.get(port, "/")
+        self.assertEqual((status, page), (200, (root / "web" / "dashboard.html").read_bytes()))
+        status, body = self.get(port, "/api/limits")
+        self.assertEqual(status, 200)
+        self.assertIn("codex:", json.loads(body)["summary"])
+        if commit:
+            self.wait_for(lambda: (read_json(self.limits / "monitor.json", {}) or {}).get("release", {})
+                          .get("commit") == commit, f"monitor of release {commit}", timeout=60)
+        else:
+            self.wait_for(lambda: self.monitor_lock_state() == "held", "monitor autostart", timeout=60)
+        web.terminate()
+        web.wait(timeout=30)
+        self.stop_monitor()
 
     def test_failed_first_cutover_restores_entrypoint_and_only_the_recorded_hook(self):
         checkout = self.legacy_checkout()
@@ -1249,6 +1307,8 @@ class HookRecovery(RehearsalCase):
         self.assert_gate_runs(recorded)
         self.assertIn("usage: syndicate", self.syn("--help").stdout)
         self.assertNotIn(str(self.root), self.syn("chief-of-staff", "--dry-run", "-x", "codex").stdout)
+        # The restored checkout entry point serves its own dashboard again.
+        self.assert_prior_dashboard(checkout)
 
 
 # --------------------------------------------------------------------------
@@ -1343,6 +1403,27 @@ class FirstCutoverFallback(RehearsalCase):
         verify_fallback(restored["prefix"])
         self.assertEqual(os.path.realpath(self.shim), str(snapshot / "bin" / "syndicate"))
 
+        # The Chief restarts from the fallback and consumes the preserved
+        # portfolio state through the pinned prefix in its launch context.
+        chief = self.launch_chief("-x", "codex", prefix=entry)
+        chief_launch = chief.ready()
+        workspace = self.home / ".syndicate" / "portfolio" / "workspace"
+        self.assertEqual(chief_launch["project"], str(workspace))
+        pinned = re.search(r"Use this exact executable prefix for every Syndicate command: (.+)",
+                           chief_launch["instructions"])
+        self.assertIsNotNone(pinned, chief_launch["instructions"][-2000:])
+        chief_prefix = shlex.split(pinned.group(1))
+        self.assertEqual(chief_prefix[1:], ["-B", str(snapshot / "bin" / "syndicate")])
+        self.assertNotIn(str(editable), chief_launch["instructions"])
+        self.assertEqual(json.loads(chief.run(chief_prefix + ["--version", "--json"])["out"])["root"], str(snapshot))
+        briefing = json.loads(chief.run(chief_prefix + ["briefing", "--json"])["out"])
+        self.assertIn(decision["id"], [d["id"] for d in briefing["decisions"]])
+        seen = {r["id"]: r for r in json.loads(chief.run(chief_prefix + ["requests", "list", "--all", "--json"])["out"])}
+        self.assertEqual(seen[request["id"]]["session_id"], team_b.session)
+        self.assertEqual(chief.finish(), 0, chief.text())
+        self.assertEqual(read_json(workspace / ".syndicate" / "status.json")["state"], "done")
+        self.stop_monitor(prefix=entry)  # the Chief started the shared monitor from the snapshot
+
         # It consumes the state written during the failed cutover.
         self.assertEqual([d["id"] for d in self.synj("decisions", "list", "--json", prefix=entry)], [decision["id"]])
         self.synj("decisions", "answer", decision["id"], "Not yet", prefix=entry)
@@ -1378,6 +1459,7 @@ class FirstCutoverFallback(RehearsalCase):
 # 7. Legacy context inventory
 # --------------------------------------------------------------------------
 
+@unittest.skipUnless(shutil.which("tmux", path="/usr/bin:/bin"), "tmux is not installed: pane start commands cannot be inventoried")
 class LegacyContextInventory(RehearsalCase):
     def test_inventory_finds_every_seeded_reference_to_the_old_checkout(self):
         seed = self.seed_legacy_home()
@@ -1401,13 +1483,13 @@ class LegacyContextInventory(RehearsalCase):
         sock = self.tmp / "tmux" / "rehearsal.sock"
         subprocess.run(["tmux", "-S", str(sock), "-f", os.devnull, "new-session", "-d", "-s", "the-syndicate",
                         "-n", "alpha", f"exec sleep 300 # {shlex.quote(str(script))} _in-tmux team task"],
-                       env=self.env, check=True, capture_output=True)
+                       env=self.env, check=True, capture_output=True, timeout=30)
         # Unrelated paths are not reported.
         (self.home / "notes.txt").write_text(f"{checkout}-other is a different checkout\n")
 
         roots = [self.home, self.tmp / "config", self.tmp / "codex", self.tmp / "claude", self.tmp / "data home",
                  seed["p1"], seed["p2"]]
-        found = legacy_context_inventory(checkout, roots, [sock])
+        found = legacy_context_inventory(checkout, roots, [sock], env=self.env)
         self.assertEqual(found["entry point"], [str(self.shim)])
         self.assertIn(str(self.home / ".bashrc"), found["shell profile"])
         self.assertIn(str(launcher), found["other"])
@@ -1424,7 +1506,7 @@ class LegacyContextInventory(RehearsalCase):
         self.install("v1.0.0")
         hooks = self.home / ".codex" / "hooks.json"
         self.installer("migrate-codex-hook", "--codex-home", str(hooks.parent))
-        after = legacy_context_inventory(checkout, roots, [sock])
+        after = legacy_context_inventory(checkout, roots, [sock], env=self.env)
         self.assertNotIn("entry point", after)
         self.assertNotIn("codex hook", after)
         self.assertEqual(after["approvals"], found["approvals"])
@@ -1438,14 +1520,49 @@ class LegacyContextInventory(RehearsalCase):
 # 8. Self-hosted: stable source, isolated linked worktree, ignored-file guard
 # --------------------------------------------------------------------------
 
+# The installed release's existing guarded cleanup (syndicate_git.cleanup_pr,
+# the core of `tasks cleanup-pr`), with only the GitHub boundary replaced:
+# `gh pr view` returns the given PR record and the local bare origin stands in
+# for the GitHub repository.
+CLEANUP_PR = r'''
+import json, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import syndicate_git as g
+repo, branch, worktree, pr = Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]), json.loads(sys.argv[5])
+real = g._run
+def run(path, command, expected=(0,), label=None):
+    if command[0] == "gh":
+        return subprocess.CompletedProcess(command, 0, json.dumps(pr), "")
+    return real(path, command, expected, label)
+g._run = run
+g._github_repository = lambda url: "github.com/example/syndicate"
+try:
+    sys.exit(0 if g.cleanup_pr(repo, 7, branch, worktree, print) else 2)
+except g.CleanupError as error:
+    print(f"CleanupError: {error}")
+    sys.exit(1)
+'''
+
+
 class SelfHosted(RehearsalCase):
-    def clean_check(self, release, path):
-        """The existing guarded cleanup preflight (syndicate_git._clean with ignored files)."""
-        code = ("import sys; sys.path.insert(0, sys.argv[1]); import syndicate_git as g\n"
-                "try:\n    g._clean(__import__('pathlib').Path(sys.argv[2]), 'Task worktree', ignored=True)\n"
-                "except g.CleanupError as e:\n    print(e); sys.exit(1)\n")
-        return subprocess.run([PYTHON, "-B", "-c", code, str(release / "bin"), str(path)], env=self.env,
-                              capture_output=True, text=True, timeout=60)
+    branch = "work/self-hosted"
+
+    def cleanup_pr(self, release, source, linked, pr):
+        # cleanup_pr refuses GIT_CONFIG_* overrides; HOME/XDG stay disposable.
+        env = {k: v for k, v in self.env.items() if not k.startswith("GIT_CONFIG")}
+        return subprocess.run([PYTHON, "-B", "-c", CLEANUP_PR, str(release / "bin"), str(source), self.branch,
+                               str(linked), json.dumps(pr)], env=env, cwd=self.tmp / "elsewhere",
+                              capture_output=True, text=True, timeout=120)
+
+    def assert_blocked(self, release, source, linked, pr, origin, tip):
+        result = self.cleanup_pr(release, source, linked, pr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Task worktree is dirty (tracked, untracked or ignored changes)", result.stdout)
+        # Nothing was removed: worktree, local and remote task branch, main.
+        self.assertTrue(linked.is_dir())
+        self.assertEqual(run_git(source, "rev-parse", f"refs/heads/{self.branch}", env=self.env), tip)
+        self.assertEqual(run_git(origin, "rev-parse", f"refs/heads/{self.branch}", env=self.env), tip)
 
     def test_team_on_stable_source_leaves_linked_worktree_free_of_ignored_artifacts(self):
         a = FIXTURE["a"]
@@ -1453,10 +1570,14 @@ class SelfHosted(RehearsalCase):
         self.user_config.write_text("tmux = off\nhandoff = off\ndefault = codex\n")
         self.install("v1.0.0")
         release = self.release_dir(a)
-        # The stable source is a disposable clone of the Syndicate fixture repository.
+        # The stable source is a disposable clone of a per-test copy of the fixture repository.
+        origin = self.tmp / "projects" / "origin.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(FIXTURE["upstream"]), str(origin)], check=True,
+                       env=self.env, capture_output=True, timeout=60)
         source = self.tmp / "projects" / "syndicate source"
-        subprocess.run(["git", "clone", "-q", "-b", "main", str(FIXTURE["upstream"]), str(source)], check=True, env=self.env,
-                       capture_output=True)
+        subprocess.run(["git", "clone", "-q", "-b", "main", str(origin), str(source)], check=True, env=self.env,
+                       capture_output=True, timeout=60)
+        start = run_git(source, "rev-parse", "HEAD", env=self.env)
         linked = self.tmp / "projects" / "linked edit checkout"
         shim = [str(self.shim)]
         team = self.launch_team(source, "self-hosted change")
@@ -1464,7 +1585,7 @@ class SelfHosted(RehearsalCase):
         self.assertEqual(launch["project"], str(source))
         self.assertEqual(launch["env"]["PYTHONDONTWRITEBYTECODE"], "1")
         # The orchestrator edits only an isolated linked worktree of the stable source.
-        team.run(["git", "-C", source, "worktree", "add", "-q", "-b", "work/self-hosted", linked])
+        team.run(["git", "-C", source, "worktree", "add", "-q", "-b", self.branch, linked])
         doc = linked / "docs" / "configuration.md"
         team.run([PYTHON, "-c", f"import pathlib; p = pathlib.Path({str(doc)!r}); "
                                 "p.write_text(p.read_text() + '\\nSelf-hosted edit.\\n')"], cwd=linked)
@@ -1475,6 +1596,8 @@ class SelfHosted(RehearsalCase):
         team.run(["python3", "-m", "unittest", "discover", "-q", "-s", "tests", "-p", "test_completion.py"], cwd=linked)
         team.run(shim + ["--version"], cwd=linked)
         team.run(["git", "-C", linked, "commit", "-qam", "self-hosted edit"])
+        team.run(["git", "-C", linked, "push", "-q", "origin", self.branch])
+        tip = run_git(linked, "rev-parse", "HEAD", env=self.env)
         self.assertEqual(team.finish(), 0)
 
         # Project-local runtime data stays at the stable source, never in the linked worktree.
@@ -1488,24 +1611,45 @@ class SelfHosted(RehearsalCase):
         source_ignored = subprocess.run(["git", "-C", str(source), "status", "--porcelain", "--ignored"],
                                         capture_output=True, text=True, env=self.env).stdout
         self.assertEqual(source_ignored, "!! .syndicate/\n")
-        self.assertEqual(self.clean_check(release, linked).returncode, 0, self.clean_check(release, linked).stdout)
 
-        # The guard is real: known bytecode blocks it, narrow removal unblocks it,
-        # and an unrelated ignored file still blocks and is left intact.
+        # The PR merges upstream (an integrator clone stands in for GitHub's merge).
+        integrator = self.tmp / "projects" / "integrator"
+        subprocess.run(["git", "clone", "-q", "-b", "main", str(origin), str(integrator)], check=True, env=self.env,
+                       capture_output=True, timeout=60)
+        run_git(integrator, "merge", "-q", "--no-ff", "--no-edit", f"origin/{self.branch}", env=self.env)
+        merge = run_git(integrator, "rev-parse", "HEAD", env=self.env)
+        run_git(integrator, "push", "-q", "origin", "main", env=self.env)
+        pr = dict(state="MERGED", url="https://github.com/example/syndicate/pull/7", mergedAt="2026-11-24T10:00:00Z",
+                  mergeCommit={"oid": merge}, headRefName=self.branch, headRefOid=tip, baseRefName="main",
+                  isCrossRepository=False)
+
+        # The guard is real: known bytecode blocks it; an unrelated ignored file
+        # blocks it too and is left intact. Blocked attempts change nothing.
         cache = linked / "bin" / "__pycache__"
         cache.mkdir()
         (cache / "syndicate_git.cpython-312.pyc").write_bytes(b"\x00bytecode")
-        blocked = self.clean_check(release, linked)
-        self.assertEqual(blocked.returncode, 1)
-        self.assertIn("ignored", blocked.stdout)
-        (cache / "syndicate_git.cpython-312.pyc").unlink()
+        self.assert_blocked(release, source, linked, pr, origin, tip)
+        (cache / "syndicate_git.cpython-312.pyc").unlink()  # narrowly authorized removal
         cache.rmdir()
-        self.assertEqual(self.clean_check(release, linked).returncode, 0)
         unrelated = linked / ".syndicate"
         unrelated.mkdir()
         (unrelated / "keep.txt").write_text("user data\n")
-        self.assertEqual(self.clean_check(release, linked).returncode, 1)
+        self.assert_blocked(release, source, linked, pr, origin, tip)
         self.assertEqual((unrelated / "keep.txt").read_text(), "user data\n")
+        shutil.move(str(unrelated), str(self.tmp / "backups" / "linked.syndicate"))  # its owner moves it away
+
+        # With only what the self-hosted run left, the existing safe cleanup proceeds.
+        result = self.cleanup_pr(release, source, linked, pr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"Removed task worktree {linked}.", result.stdout)
+        self.assertFalse(linked.exists())
+        self.assertEqual(run_git(source, "branch", "--list", self.branch, env=self.env), "")
+        self.assertEqual(run_git(origin, "branch", "--list", self.branch, env=self.env), "")
+        self.assertEqual(run_git(source, "rev-parse", "HEAD", env=self.env), merge)
+        self.assertNotEqual(merge, start)
+        # The stable source keeps its runtime metadata through cleanup.
+        self.assertTrue((source / ".syndicate" / "status.json").is_file())
+        self.assertEqual((self.tmp / "backups" / "linked.syndicate" / "keep.txt").read_text(), "user data\n")
 
 
 if __name__ == "__main__":
