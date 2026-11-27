@@ -97,12 +97,16 @@ class ReleaseError(Exception):
 class Paths:
     """Every location the installer touches; all overridable for tests."""
 
-    def __init__(self, root: Path, bin_dir: Path, cache: Path):
+    def __init__(self, root: Path, bin_dir: Path, cache: Path, default_cache: bool = False):
         # Canonical once: the shim, launcher and markers all use the real path,
         # so a symlinked HOME or XDG_DATA_HOME must compare equal to them.
         self.root = Path(os.path.realpath(root))
         self.bin_dir = Path(os.path.abspath(bin_dir))
         self.cache = Path(os.path.abspath(cache))
+        # Only Syndicate's own cache directory ($XDG_CACHE_HOME/syndicate) is
+        # tightened when it already exists; the parent of a --source-cache the
+        # operator chose is checked, never chmodded.
+        self.default_cache = default_cache
 
     @classmethod
     def from_env(cls, root=None, bin_dir=None, cache=None, environ=None) -> "Paths":
@@ -112,7 +116,8 @@ class Paths:
         cache_home = Path(env["XDG_CACHE_HOME"]) if env.get("XDG_CACHE_HOME") else home / ".cache"
         return cls(Path(root).expanduser() if root else data / "syndicate",
                    Path(bin_dir).expanduser() if bin_dir else home / ".local" / "bin",
-                   Path(cache).expanduser() if cache else cache_home / "syndicate" / "source.git")
+                   Path(cache).expanduser() if cache else cache_home / "syndicate" / "source.git",
+                   default_cache=not cache)
 
     releases = property(lambda self: self.root / "releases")
     current = property(lambda self: self.root / "current")
@@ -168,10 +173,13 @@ def git_env() -> dict:
 # graph or runs automatic maintenance.
 CACHE_GIT_OPTIONS = ("--no-replace-objects", "-c", "core.commitGraph=false", "-c", "core.hooksPath=/dev/null",
                      "-c", "fetch.writeCommitGraph=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false")
-# The only configuration a cache may carry: what `git init --bare --template=`
-# and `git remote add` write. Anything else (remote.upstream.uploadpack, proxy
-# or vcs, url.*.insteadOf, core.sshCommand, include.path, ...) could change
-# what a fetch runs or where it reads from.
+# The only configuration a cache may carry, each key at most once: what
+# `git init --bare --template=` and `git remote add` write. Anything else
+# (remote.upstream.uploadpack, proxy or vcs, url.*.insteadOf, core.sshCommand,
+# include.path, ...) could change what a fetch runs or where it reads from.
+# Keys are compared exactly as `git config --list` prints them (section and
+# name lowercased, the subsection as written). Fetches name the recorded URL
+# explicitly rather than the remote, so remote.upstream.* is only a record.
 CACHE_CONFIG = {
     "core.repositoryformatversion": None, "core.filemode": None, "core.bare": ("true",),
     "core.ignorecase": None, "core.precomposeunicode": None, "core.symlinks": None,
@@ -182,6 +190,11 @@ CACHE_CONFIG = {
 # Files that make Git read history other than the objects named: grafts and a
 # shallow list rewrite parents; alternates add object stores.
 CACHE_FORBIDDEN_FILES = ("info/grafts", "shallow", "objects/info/alternates", "objects/info/http-alternates")
+# Entries that point Git at another directory's objects, refs, configuration,
+# grafts, shallow list and alternates: commondir and gitdir (as in a linked
+# worktree's administrative directory), and a .git, which repository discovery
+# prefers to the bare directory itself.
+CACHE_REDIRECT_ENTRIES = ("commondir", "gitdir", ".git")
 DIGITS = re.compile(r"[0-9]+")
 
 
@@ -212,35 +225,66 @@ def tighten(path: Path, mask: int) -> None:
         os.chmod(path, stat.S_IMODE(st.st_mode) & mask)
 
 
-def check_cache(paths: Paths) -> None:
+def check_cache(paths: Paths) -> dict[str, str]:
     """Refuse a release-source cache another account can change, or one whose
-    configuration or history redirection could make it read something other
-    than the fetched objects (replace refs, grafts, a shallow list, alternates,
-    unexpected configuration)."""
+    layout, configuration or history redirection could make it read something
+    other than the fetched objects (an entry redirecting it to another
+    directory, a symlink, replace refs, grafts, a shallow list, alternates,
+    unexpected or repeated configuration). Returns its configuration."""
     cache = paths.cache
+    tighten(cache, 0o700)
     for path in (cache.parent, cache):
-        tighten(path, 0o700 if path == cache else 0o755)
         problem = writable_by_others(path)
         if problem:
             raise ReleaseError(f"release-source cache directory {path} is {problem}; refusing to use it")
+    remove = f"remove the cache ({cache}) and install again"
+    uid = os.getuid()
+    for entry in os.scandir(cache):
+        if entry.name in CACHE_REDIRECT_ENTRIES:
+            raise ReleaseError(f"release-source cache {cache} has {entry.name}, which points Git at another "
+                               f"directory's objects, refs and configuration; {remove}")
+        owner = entry.stat(follow_symlinks=False).st_uid
+        if owner != uid:
+            raise ReleaseError(f"release-source cache entry {entry.path} is owned by uid {owner}, not by you; {remove}")
+    # Git never creates symlinks in a bare repository; one (objects, refs,
+    # info, config, packed-refs, a pack directory, ...) would let content
+    # outside the cache stand in for it.
+    for directory, dirs, names in os.walk(cache):
+        for name in dirs + names:
+            if os.path.islink(os.path.join(directory, name)):
+                raise ReleaseError(f"release-source cache {cache} has a symlink "
+                                   f"{os.path.relpath(os.path.join(directory, name), cache)}; {remove}")
     for name in CACHE_FORBIDDEN_FILES:
         if os.path.lexists(cache / name):
-            raise ReleaseError(f"release-source cache {cache} has {name}, which changes what Git reads; "
-                               f"remove the cache ({cache}) and install again")
+            raise ReleaseError(f"release-source cache {cache} has {name}, which changes what Git reads; {remove}")
     replaced = cache_git(cache, "for-each-ref", "--format=%(refname)", "refs/replace/").stdout.split()
     if replaced or os.path.lexists(cache / "refs" / "replace") and any((cache / "refs" / "replace").iterdir()):
         raise ReleaseError(f"release-source cache {cache} has replace refs ({', '.join(replaced) or 'refs/replace/'}), "
-                           f"which substitute objects; remove the cache ({cache}) and install again")
+                           f"which substitute objects; {remove}")
     listing = cache_git(cache, "config", "--local", "--no-includes", "--list", "-z", binary=True).stdout
+    config: dict[str, str] = {}
     for item in listing.split(b"\0"):
         if not item:
             continue
         key, _, value = item.decode(errors="replace").partition("\n")
-        allowed_values = CACHE_CONFIG.get(key.lower(), ())
-        if key.lower() not in CACHE_CONFIG or (allowed_values is not None and value not in allowed_values):
+        allowed_values = CACHE_CONFIG.get(key, ())
+        if key not in CACHE_CONFIG or (allowed_values is not None and value not in allowed_values):
             raise ReleaseError(f"release-source cache {cache} has unexpected configuration {key}={value!r}; "
                                f"only {', '.join(sorted(CACHE_CONFIG))} (with their default values) are allowed. "
                                f"Remove the cache ({cache}) and install again")
+        if key in config:
+            raise ReleaseError(f"release-source cache {cache} sets {key} more than once, so Git commands could "
+                               f"disagree about its value; {remove}")
+        config[key] = value
+    return config
+
+
+def check_upstream_form(upstream: str) -> None:
+    """An upstream is an absolute path or a URL (scheme:// or scp-like host:path),
+    never something Git could read as an option or a remote name."""
+    if (not upstream or upstream.startswith("-") or any(c in upstream for c in "\n\r\0")
+            or not (upstream.startswith("/") or ":" in upstream)):
+        raise ReleaseError(f"invalid upstream {upstream!r}: use an absolute path or a URL")
 
 
 def local_upstream_path(upstream: str) -> str | None:
@@ -272,38 +316,46 @@ def check_local_upstream(upstream: str) -> None:
 
 
 def ensure_cache(paths: Paths, upstream: str | None, change_upstream: bool = False) -> tuple[str, str | None]:
-    """Create the release-source cache; return (upstream URL, previous URL if it changed)."""
-    if not os.path.lexists(paths.cache / "HEAD"):
+    """Create the release-source cache; return (upstream URL, previous URL if it changed).
+
+    The returned URL is what the caller fetches from, by URL: the operator's
+    --upstream, or the single recorded remote.upstream.url compared exactly."""
+    if upstream is not None:
+        if upstream and os.path.isdir(upstream):
+            upstream = os.path.abspath(upstream)
+        check_upstream_form(upstream)
+    cache = paths.cache
+    if not os.path.lexists(cache / "HEAD"):
         if not upstream:
-            raise ReleaseError(f"no release-source cache at {paths.cache}; pass --upstream URL|PATH")
-        make_private_dir(paths.cache.parent)
+            raise ReleaseError(f"no release-source cache at {cache}; pass --upstream URL|PATH")
+        if os.path.lexists(cache) and (cache.is_symlink() or not cache.is_dir() or any(cache.iterdir())):
+            raise ReleaseError(f"{cache} exists but is not a release-source cache; "
+                               "name a new or empty directory with --source-cache")
         # No template: a configured init.templateDir could add hooks, grafts or config.
         result = subprocess.run(["git", *CACHE_GIT_OPTIONS, "init", "--quiet", "--bare", "--template=",
-                                 str(paths.cache)], capture_output=True, text=True, env=git_env(),
+                                 str(cache)], capture_output=True, text=True, env=git_env(),
                                 stdin=subprocess.DEVNULL)
         if result.returncode:
             raise ReleaseError(f"cannot create release-source cache: {result.stderr.strip()}")
-        os.chmod(paths.cache, 0o700)
-    check_cache(paths)
-    if upstream is not None and (not upstream or upstream.startswith("-") or "\n" in upstream):
-        raise ReleaseError(f"invalid upstream {upstream!r}")
-    configured = cache_git(paths.cache, "config", "--get", f"remote.{REMOTE}.url", check=False).stdout.strip()
+        os.chmod(cache, 0o700)
+    configured = check_cache(paths).get(f"remote.{REMOTE}.url")
     if upstream:
-        if os.path.isdir(upstream):
-            upstream = os.path.abspath(upstream)
         check_local_upstream(upstream)
-        if not configured:
-            cache_git(paths.cache, "remote", "add", REMOTE, upstream)
+        if configured is None:
+            cache_git(cache, "remote", "add", REMOTE, upstream)
         elif configured != upstream:
             if not change_upstream:
-                raise ReleaseError(f"the recorded trusted upstream is {configured}; refusing to switch to {upstream} "
-                                   "without --change-upstream")
+                raise ReleaseError(f"the recorded trusted upstream is {configured!r}; refusing to switch to "
+                                   f"{upstream!r} without --change-upstream")
             log(f"changing trusted upstream from {configured} to {upstream}")
-            cache_git(paths.cache, "remote", "set-url", REMOTE, upstream)
+            cache_git(cache, "remote", "set-url", REMOTE, upstream)
+            check_cache(paths)
             return upstream, configured
+        check_cache(paths)
         return upstream, None
     if not configured:
-        raise ReleaseError(f"release-source cache {paths.cache} has no upstream; pass --upstream URL|PATH")
+        raise ReleaseError(f"release-source cache {cache} has no upstream; pass --upstream URL|PATH")
+    check_upstream_form(configured)
     check_local_upstream(configured)
     return configured, None
 
@@ -360,7 +412,7 @@ def check_retag(paths: Paths, approved: dict, allow_retag: bool) -> None:
 @contextmanager
 def source_lock(paths: Paths):
     """Serialize fetches into the shared release-source cache."""
-    make_private_dir(paths.cache.parent)
+    prepare_cache_parent(paths)
     with open_lock(paths.cache.with_name(paths.cache.name + ".lock")) as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
@@ -375,18 +427,21 @@ def _resolve_approved_tag(paths: Paths, tag: str, upstream: str | None, change_u
     # Forget previous fetch results first so a failed fetch can never fall back to stale refs.
     for ref in (FETCHED_MAIN, tag_ref):
         cache_git(paths.cache, "update-ref", "-d", ref, check=False)
-    # --refmap= : only the refspecs named here are written (no opportunistic
-    # remote-tracking updates through a configured fetch refspec).
+    # Fetch from the trusted URL itself, never through the remote's
+    # configuration, so no cache setting can redirect it. --refmap= : only the
+    # refspecs named here are written.
     fetched = cache_git(paths.cache, "-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--no-tags", "--refmap=",
-                        "--no-write-fetch-head", REMOTE, f"+refs/heads/{MAIN_BRANCH}:{FETCHED_MAIN}", check=False)
+                        "--no-write-fetch-head", "--", url, f"+refs/heads/{MAIN_BRANCH}:{FETCHED_MAIN}", check=False)
     if fetched.returncode:
         raise ReleaseError(f"cannot fetch {MAIN_BRANCH} from upstream {url}: {fetched.stderr.strip()}; "
                            "nothing was installed (a fresh fetch is required)")
     fetched = cache_git(paths.cache, "-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--no-tags", "--refmap=",
-                        "--no-write-fetch-head", REMOTE, f"+refs/tags/{tag}:{tag_ref}", check=False)
+                        "--no-write-fetch-head", "--", url, f"+refs/tags/{tag}:{tag_ref}", check=False)
     if fetched.returncode:
         raise ReleaseError(f"tag {tag} was not found at upstream {url}: {fetched.stderr.strip()}")
-    check_cache(paths)
+    if check_cache(paths).get(f"remote.{REMOTE}.url") != url:
+        raise ReleaseError(f"the release-source cache's recorded upstream changed during the fetch from {url}; "
+                           "nothing was installed")
     kind = cache_git(paths.cache, "cat-file", "-t", tag_ref).stdout.strip()
     peeled = cache_git(paths.cache, "rev-parse", "--verify", "--quiet", f"{tag_ref}^{{commit}}", check=False)
     commit = peeled.stdout.strip()
@@ -695,17 +750,16 @@ def writable_by_others(path: str | os.PathLike) -> str | None:
     return None
 
 
-def redirect_problem(path: str) -> str | None:
+def redirect_problem(path: str, lookups: list[str] | None = None) -> str | None:
     """Why another account could make path name a different file; None when none can.
 
     Follows path one component at a time, through every symlink, and checks each
     directory an entry is looked up in: one another account can write could
-    replace that entry, unless it is sticky and the entry belongs to this user
-    or root (as in /tmp). Then the final file itself must be writable only by
-    this user or root."""
+    replace that entry, unless sticky_protects it (as in /tmp). Then the final
+    file itself must be writable only by this user or root. Each (symlink-free)
+    directory an entry is looked up in is appended to lookups, when given."""
     pending = list(reversed(path.split("/")))
     current, links = "/", 0
-    uid = os.getuid()
     while pending:
         part = pending.pop()
         if part in ("", "."):
@@ -714,15 +768,11 @@ def redirect_problem(path: str) -> str | None:
             current = os.path.dirname(current)
             continue
         entry = os.path.join(current, part)
+        if lookups is not None and current not in lookups:
+            lookups.append(current)
         problem = writable_by_others(current)
-        if problem:
-            sticky = os.stat(current).st_mode & stat.S_ISVTX
-            try:
-                owner = os.lstat(entry).st_uid
-            except OSError:
-                owner = None
-            if not (sticky and owner in (0, uid)):
-                return f"{current} (which holds {entry}) is {problem}"
+        if problem and not sticky_protects(current, entry):
+            return f"{current} (which holds {entry}) is {problem}"
         if os.path.islink(entry):
             links += 1
             if links > 40:
@@ -745,7 +795,7 @@ def is_git_marker(path: Path) -> bool:
     runs, and they must not make every path below them look like a work tree."""
     try:
         if path.is_dir():
-            return (path / "HEAD").exists()
+            return os.path.lexists(path / "HEAD")
         if path.is_file():
             with open(path, "rb") as handle:
                 return handle.read(7) == b"gitdir:"
@@ -779,11 +829,15 @@ def preflight_interpreter(interpreter: str | os.PathLike, explicit: bool = True)
     # Every directory and symlink on the way from the recorded path (which the
     # shim execs, unresolved, so a venv or a package-manager link keeps working)
     # to the real file, not just the real file's own directory.
-    problem = redirect_problem(text)
+    lookups: list[str] = []
+    problem = redirect_problem(text, lookups)
     if problem:
         raise ReleaseError(f"interpreter {text} resolves to {real}, and {problem}; "
                            "use an interpreter only you or root can modify")
-    for path in (os.path.dirname(os.path.abspath(text)), os.path.dirname(real)):
+    # Every directory the path passes through, including the targets of
+    # intermediate symlinks (x/link -> repo/sub makes x/link/bin/python depend
+    # on repo's work tree even when the final file lies outside it).
+    for path in (os.path.dirname(os.path.abspath(text)), os.path.dirname(real), *lookups):
         worktree = inside_git_worktree(path)
         if worktree:
             raise ReleaseError(f"interpreter {text} is inside the Git work tree {worktree}, which agents may edit; "
@@ -897,10 +951,58 @@ def make_dir(path: Path, mode: int) -> None:
     os.chmod(path, mode)
 
 
-def make_private_dir(path: Path) -> None:
-    """A 0700 directory (the release-source cache's parent), parents created as needed."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    make_dir(path, 0o700)
+def make_missing_dirs(path: Path) -> bool:
+    """Create path and any missing ancestors, each with exactly mode 0700 (as
+    the XDG base directory specification asks), whatever the umask. Existing
+    directories are left exactly as they are. True when path was created."""
+    missing = []
+    probe = path
+    while not os.path.lexists(probe):
+        missing.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            continue  # created concurrently; checked like any existing directory
+        os.chmod(directory, 0o700)
+    return path in missing
+
+
+def sticky_protects(directory: str | os.PathLike, entry: str | os.PathLike) -> bool:
+    """True when no other account can rename or replace entry although
+    directory is writable by others: directory is sticky and owned by root or
+    this user (the owner of a sticky directory can still rename any entry), and
+    entry belongs to root or this user."""
+    uid = os.getuid()
+    try:
+        holder = os.stat(directory)
+        owner = os.lstat(entry).st_uid
+    except OSError:
+        return False
+    return bool(holder.st_mode & stat.S_ISVTX) and holder.st_uid in (0, uid) and owner in (0, uid)
+
+
+def prepare_cache_parent(paths: Paths) -> None:
+    """Create the release-source cache's parent 0700 when it is missing. An
+    existing one is tightened to 0700 only when it is Syndicate's own default
+    ($XDG_CACHE_HOME/syndicate); the parent of a --source-cache the operator
+    chose (possibly $HOME) is never chmodded, only refused if another account
+    can write it."""
+    parent = paths.cache.parent
+    try:
+        created = make_missing_dirs(parent)
+        if not created and paths.default_cache:
+            tighten(parent, 0o700)
+    except OSError as error:
+        raise ReleaseError(f"cannot prepare release-source cache directory {parent}: {error}") from None
+    if not parent.is_dir():
+        raise ReleaseError(f"release-source cache directory {parent} is not a directory")
+    problem = writable_by_others(parent)
+    if problem:
+        raise ReleaseError(f"release-source cache directory {parent} is {problem}; refusing to use it")
 
 
 @contextmanager
@@ -913,14 +1015,22 @@ def open_lock(path: Path):
 
 def prepare_root(paths: Paths) -> None:
     """Create the install root, releases/ and interpreters/ with explicit 0755
-    modes (existing ones are only ever tightened); refuse any another account can
-    write (it could replace `current`, a release or a recorded interpreter)."""
+    modes (existing ones are only ever tightened) and missing parents 0700;
+    refuse any another account can write (it could replace `current`, a release
+    or a recorded interpreter), and a parent another account can write unless
+    sticky_protects the root in it."""
+    parent = paths.root.parent
     try:
-        paths.root.parent.mkdir(parents=True, exist_ok=True)
+        make_missing_dirs(parent)
         for path in (paths.root, paths.releases, paths.interpreters):
             make_dir(path, 0o755)
+        # Another account that can write the root's parent could replace the
+        # whole root, unless the parent is sticky (like /tmp) and owned by root or you.
+        problem = writable_by_others(parent)
     except OSError as error:
         raise ReleaseError(f"cannot prepare install root {paths.root}: {error}") from None
+    if problem and not sticky_protects(parent, paths.root):
+        raise ReleaseError(f"install root parent {parent} is {problem}; refusing to activate releases in {paths.root}")
     for path in (paths.root, paths.releases, paths.interpreters):
         problem = writable_by_others(path)
         if problem:
@@ -1417,12 +1527,15 @@ def hook_releases(paths: Paths, codex_home: Path | None) -> set[str]:
 
 
 def remove_stale_markers(paths: Paths) -> None:
-    """Remove in-use markers whose PID is gone, then empty marker directories."""
+    """Remove in-use markers whose PID is gone, then empty marker directories;
+    tighten in-use/ and the remaining commit directories to 0700."""
     if not paths.in_use.is_dir() or paths.in_use.is_symlink():
         return
+    tighten(paths.in_use, 0o700)
     for directory in paths.in_use.iterdir():
         if directory.is_symlink() or not directory.is_dir():
             continue
+        tighten(directory, 0o700)
         for marker in directory.iterdir():
             if DIGITS.fullmatch(marker.name) and not marker.is_dir() and not pid_alive(int(marker.name)):
                 marker.unlink(missing_ok=True)
@@ -1582,9 +1695,10 @@ def migrate_codex_hook(paths: Paths, codex_home: Path, target: str | None = None
     Touches only hooks whose command is exactly one verified Syndicate
     require-review.sh path; preserves every other entry, sibling and field. A
     require-review.sh hook whose provenance cannot be verified (another
-    project's script of the same name, a dirty checkout) is left untouched with
-    a warning; one in a retained release that no longer matches its manifest
-    stops the migration. Runs under the activation lock, so prune cannot remove
+    project's script of the same name, a dirty checkout, a missing file,
+    including one in a release of this install that is no longer retained) is
+    left untouched with a warning; one in a retained release that is missing or
+    no longer matches its manifest stops the migration. Runs under the activation lock, so prune cannot remove
     the target meanwhile.
     """
     with activation_lock(paths):
@@ -1642,8 +1756,15 @@ def _migrate_codex_hook(paths: Paths, codex_home: Path, target: str | None, dry_
             try:
                 provenance[command] = hook_provenance(paths, path)
             except ReleaseError as error:
-                if release_of(paths, command):
+                own = release_of(paths, command)
+                if own and (os.path.lexists(path) or os.path.lexists(paths.release(own))):
                     raise  # this install's own release was changed: stop, change nothing
+                if own:
+                    # A release of this install that is gone (pruned or removed
+                    # by hand): a missing file cannot be verified, so it is left
+                    # as it is, like any other unverifiable hook.
+                    error = ReleaseError(f"release {own} is no longer retained, so {path} is missing and "
+                                         "cannot be verified")
                 skipped.append({"command": command, "reason": str(error)})
                 log(f"warning: leaving Stop hook {command} unchanged: {error}")
                 hooks.append(hook)
@@ -1686,6 +1807,19 @@ def _migrate_codex_hook(paths: Paths, codex_home: Path, target: str | None, dry_
 
 
 # --- status ---------------------------------------------------------------
+
+def install_root_problems(paths: Paths) -> list[str]:
+    """Why another account could change what the install root activates or keeps."""
+    problems = []
+    for path in (paths.root, paths.releases, paths.interpreters, paths.in_use):
+        if path != paths.root and path.is_symlink():
+            problems.append(f"{path} is a symlink")
+        elif path.is_dir():
+            problem = writable_by_others(path)
+            if problem:
+                problems.append(f"{path} is {problem}")
+    return problems
+
 
 def status(paths: Paths) -> dict:
     current = current_commit(paths)
@@ -1816,6 +1950,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "verify":
             release = resolve_release_arg(paths, args.release)
             manifest = verify_release(release)
+            problems = install_root_problems(paths)
+            if problems:
+                raise ReleaseError(f"{release} matches its manifest, but another account could replace releases, "
+                                   f"recorded interpreters or in-use markers: {'; '.join(problems)}")
             emit(args, {"release": str(release), "commit": manifest["commit"], "ok": True,
                         "files": len(manifest["files"])}, f"ok: {release} ({len(manifest['files'])} files)")
         elif args.command == "prune":

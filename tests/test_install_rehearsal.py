@@ -1338,9 +1338,12 @@ class FirstCutoverFallback(RehearsalCase):
         snapshot = self.home / ".local" / "share" / "syndicate-fallback" / verified
         procedure = (
             'mkdir -p "$(dirname "$fallback")"\n'
-            'git clone --quiet --no-checkout "$checkout" "$fallback"\n'
+            'git clone --quiet --no-local --no-checkout "$checkout" "$fallback"\n'
+            'git -C "$fallback" fsck\n'
             'git -C "$fallback" checkout --quiet --detach "$commit"\n'
             'find "$fallback" -path "$fallback/.git" -prune -o -type f -exec chmod a-w {} +\n')
+        documented = (REPO / "docs" / "user-install.md").read_text(encoding="utf-8")
+        self.assertIn("\n".join("     " + line for line in procedure.splitlines()), documented)
         subprocess.run(["sh", "-ec", procedure], check=True, capture_output=True, timeout=120,
                        env=dict(self.env, checkout=str(editable), fallback=str(snapshot), commit=verified))
         for path in (snapshot / "bin" / "syndicate", snapshot / "roles" / "backend-engineer.md"):

@@ -20,8 +20,10 @@ Configuration and state stay where they are today: `~/.config/syndicate/`
   be able to redirect it, so the file it resolves to, and every directory
   that holds a component or symlink on the way there, must be writable only
   by you or root (an entry you or root own in a sticky directory such as
-  `/tmp` is fine); and neither the path you give nor its resolved location
-  may be inside a Git work tree. A virtual
+  `/tmp`, itself owned by root or you, is fine); and neither the path you
+  give, its resolved location, nor any directory it passes through on the
+  way (including the targets of intermediate symlinks) may be inside a Git
+  work tree. A virtual
   environment is refused as the default interpreter (the one running the
   installer), because its contents can change after installation; name a
   stable interpreter with `--python`, or name the virtual environment's
@@ -35,14 +37,14 @@ Configuration and state stay where they are today: `~/.config/syndicate/`
 
 | Path | Contents |
 | --- | --- |
-| `$XDG_DATA_HOME/syndicate/releases/<commit>/` | One immutable release per full commit ID: `bin/`, `roles/`, `skills/`, `hooks/`, `web/`, `docs/`, `resources/`, `portfolio/chief-of-staff.md`, `README.md` and `RELEASE.json`. Files and directories are read-only. The install root and `releases/` are created mode 0755 whatever the umask; an existing directory is only ever tightened (a 0700 root stays 0700), and activation is refused if another account can write either. |
+| `$XDG_DATA_HOME/syndicate/releases/<commit>/` | One immutable release per full commit ID: `bin/`, `roles/`, `skills/`, `hooks/`, `web/`, `docs/`, `resources/`, `portfolio/chief-of-staff.md`, `README.md` and `RELEASE.json`. Files and directories are read-only. The install root and `releases/` are created mode 0755 whatever the umask; an existing directory is only ever tightened (a 0700 root stays 0700), and activation is refused if another account can write either. Missing parents of the root are created mode 0700, and activation is refused if another account can write the root's parent (a sticky directory owned by root or you, such as `/tmp`, is fine). |
 | `$XDG_DATA_HOME/syndicate/current` | Symlink to `releases/<commit>`, replaced atomically on activation. |
 | `$XDG_DATA_HOME/syndicate/interpreters/<commit>` | The absolute interpreter the shim uses for that release. `interpreters/` is mode 0755 and refused, like the root, if another account can write it. |
 | `$XDG_DATA_HOME/syndicate/activations.jsonl` | Append-only activation log. |
 | `$XDG_DATA_HOME/syndicate/entrypoints.jsonl`, `entrypoint-backups/` | What the stable entry point replaced, for recovery. The backup directory is mode 0700. |
 | `$XDG_DATA_HOME/syndicate/activation.lock` | Lock (mode 0600) that serializes publish, activate, rollback, prune and hook migration. |
 | `$XDG_DATA_HOME/syndicate/in-use/<commit>/<pid>` | In-use markers (directories 0700, markers 0600). An installed release writes one for each launcher that starts a session, specialist relay, dashboard or monitor and for each provider CLI it starts, and removes it at exit. A live PID keeps that release from being pruned. |
-| `$XDG_CACHE_HOME/syndicate/source.git` | Bare release-source cache, mode 0700 inside a 0700 `syndicate/` directory. It is the only Git input to a release and lives outside every project worktree. |
+| `$XDG_CACHE_HOME/syndicate/source.git` | Bare release-source cache, mode 0700 inside a 0700 `syndicate/` directory. It is the only Git input to a release and lives outside every project worktree. With `--source-cache DIR`, a missing parent of `DIR` is created 0700, but an existing parent (it may be `$HOME`) is never chmodded; it is refused if another account can write it. `DIR` must be new, empty or an existing cache. |
 | `~/.local/bin/syndicate` | Stable entry point (shim). |
 
 `$XDG_DATA_HOME` defaults to `~/.local/share` and `$XDG_CACHE_HOME` to
@@ -127,15 +129,21 @@ approved when all of these hold:
 
 Fetches run with `fetch.fsckObjects=true`, so malformed objects are
 rejected, and with an empty `--refmap`, so only the two refs above are
-written. Every Git command against the cache runs with
+written. Fetches name the recorded upstream URL explicitly (`git fetch --
+<url> <refspec>`), never the configured remote, so no cache configuration
+can redirect them. Every Git command against the cache runs with
 `--no-replace-objects`, `core.commitGraph=false` and
 `core.hooksPath=/dev/null`, so what is archived is exactly the commit that
 was checked. The cache is created without templates, and before and after
 each fetch the installer refuses a cache that another account can write,
-that has `refs/replace/*`, `info/grafts`, a `shallow` file or object
-alternates, or that carries any configuration beyond what `git init --bare`
-and `git remote add` write (for example `remote.upstream.uploadpack`,
-`proxy`, `vcs`, `url.*.insteadOf` or `include.path`). Remove such a cache
+whose top-level entries are not all yours, that has a `commondir`, `gitdir`
+or `.git` entry (each would point Git at another directory's objects, refs
+and configuration) or a symlink anywhere inside it, that has
+`refs/replace/*`, `info/grafts`, a `shallow` file or object alternates, or
+that carries any configuration beyond what `git init --bare` and `git remote
+add` write (for example `remote.upstream.uploadpack`, `proxy`, `vcs`,
+`url.*.insteadOf` or `include.path`) or sets any key more than once. The
+recorded upstream is compared with `--upstream` exactly. Remove such a cache
 and install again; it is rebuilt from the trusted upstream. The release is built with `git archive --literal-pathspecs` of that
 commit from the cache, while the cache lock is still held, so a concurrent
 install cannot make the approved objects unreachable mid-build. Paths with
@@ -259,6 +267,11 @@ syndicate-install list              # retained releases with current/previous/in
 syndicate-install verify [COMMIT]   # recheck a release (default: current) against RELEASE.json
 ```
 
+`verify` also fails when another account could write the install root,
+`releases/`, `interpreters/` or `in-use/` (or one of the last three is a
+symlink), even if the release itself matches its manifest. `prune` tightens
+`in-use/` and its commit directories to 0700.
+
 Add `--json` for machine-readable output. `syndicate --version` reports the
 running release, as seen from inside Syndicate.
 
@@ -351,10 +364,12 @@ The migration:
   must equal `HEAD:hooks/require-review.sh` of the checkout it lives in, or
   the digest in its retained release's `RELEASE.json`. A `require-review.sh`
   hook that cannot be verified (another project's script with the same name,
-  a checkout with local changes, a missing file) is left exactly as it is,
+  a checkout with local changes, a missing file, including one in a release
+  of this install that is no longer retained) is left exactly as it is,
   with a warning, and reported under `skipped`; verified Syndicate hooks are
-  still migrated. A hook in one of this install's releases that no longer
-  matches its manifest stops the migration and leaves the file unchanged.
+  still migrated. A hook in one of this install's retained releases that is
+  missing or no longer matches its manifest stops the migration and leaves
+  the file unchanged.
 - Never adds a hook when none is registered. Use `syndicate setup-codex-gate`
   for that. It collapses duplicates, so the release command appears once.
 - Refuses a target release whose manifest differs from the one recorded at
@@ -393,14 +408,17 @@ cutover needs the requester's separate approval.
   checkout-backed fallback before changing the entry point.
   1. Clone a verified commit into a preserved directory outside the editable
      checkout, detached at that commit, and make its files read-only. The
-     clone keeps its `.git`, so `--version` reports the commit and whether
-     the snapshot is still clean:
+     clone copies objects through Git's transport (`--no-local`, so no
+     hardlinks or copied files are shared with the checkout's repository) and
+     is checked with `git fsck` before checkout. It keeps its `.git`, so
+     `--version` reports the commit and whether the snapshot is still clean:
 
      ```sh
      checkout=<checkout>  commit=<verified-commit>
      fallback=~/.local/share/syndicate-fallback/$commit
      mkdir -p "$(dirname "$fallback")"
-     git clone --quiet --no-checkout "$checkout" "$fallback"
+     git clone --quiet --no-local --no-checkout "$checkout" "$fallback"
+     git -C "$fallback" fsck
      git -C "$fallback" checkout --quiet --detach "$commit"
      find "$fallback" -path "$fallback/.git" -prune -o -type f -exec chmod a-w {} +
      ```

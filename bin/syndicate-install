@@ -1,6 +1,7 @@
 #!/bin/sh
 ''''exec python3 -I -B -- "$0" "$@" # '''
-"""syndicate-install: install, upgrade, roll back and verify per-user Syndicate releases.
+# The line above is the module's first string, so the docstring is assigned.
+__doc__ = """syndicate-install: install, upgrade, roll back and verify per-user Syndicate releases.
 
 Run it isolated and with bytecode disabled, from a checkout (first install) or
 from an installed release (later upgrades and rollbacks):

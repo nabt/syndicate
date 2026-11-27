@@ -695,13 +695,18 @@ def mark_release_in_use(pid: int | None = None) -> None:
     for _ in range(2):  # a concurrent cleanup may remove the empty directory between mkdir and write
         try:
             # Explicit modes, whatever the umask: in-use/ and its commit
-            # directories 0700, markers 0600 (the data root already exists).
+            # directories 0700 (an existing one of this user's is tightened,
+            # a symlinked one refused), markers 0600 (the data root already exists).
             for path in (in_use, directory):
                 try:
                     path.mkdir(mode=0o700)
                     os.chmod(path, 0o700)
                 except FileExistsError:
-                    pass
+                    st = os.lstat(path)
+                    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+                        raise OSError(f"{path} is not a directory") from None
+                    if st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) & 0o077:
+                        os.chmod(path, 0o700)
             fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(record)

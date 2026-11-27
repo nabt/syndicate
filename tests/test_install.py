@@ -1653,5 +1653,401 @@ class HookFileSafety(InstallCase):
         self.assertIn(FIXTURE["a"], hooks.read_text())
 
 
+
+def with_uid(path, uid):
+    """An os.stat replacement that reports path as owned by uid (ownership cannot be changed here)."""
+    real_stat = os.stat
+    target = os.path.abspath(path)
+
+    def fake(name, *args, **kwargs):
+        result = real_stat(name, *args, **kwargs)
+        if isinstance(name, (str, os.PathLike)) and os.path.abspath(name) == target:
+            values = list(result[:10])
+            values[4] = uid
+            return os.stat_result(values)
+        return result
+
+    return fake
+
+
+class CacheRedirection(InstallCase):
+    """Batch 4: nothing in the cache can redirect the fetch or what Git reads."""
+
+    def setUp(self):
+        super().setUp()
+        self.install("v1.0.0")
+        self.cache = self.paths.cache
+        self.config = self.cache / "config"
+        self.original_config = self.config.read_bytes()
+        self.before = (self.current(), self.release_entries())
+
+    def refused(self, message, *extra):
+        result = self.install("v1.1.0", *extra, ok=False)
+        self.assertIn(message, result.stderr)
+        self.assert_unchanged(*self.before)
+        return result
+
+    def evil_upstream(self):
+        """A bare repository whose main and v1.1.0 name the off-main side commit."""
+        evil = self.tmp / "evil.git"
+        shutil.copytree(FIXTURE["upstream"], evil)
+        run_git(evil, "update-ref", "refs/heads/main", FIXTURE["side"])
+        run_git(evil, "tag", "-f", "v1.1.0", FIXTURE["side"])
+        return evil
+
+    def test_a_duplicate_upstream_url_is_refused_in_either_order(self):
+        evil = self.evil_upstream()
+        good_line = next(line for line in self.config.read_text().splitlines() if line.strip().startswith("url ="))
+        evil_line = f'\turl = "{evil}"'
+        for name, lines in (("evil first", [evil_line, good_line]), ("evil last", [good_line, evil_line])):
+            with self.subTest(order=name):
+                self.config.write_text(self.config.read_text().replace(good_line, "\n".join(lines)))
+                self.refused("sets remote.upstream.url more than once")
+                self.refused("sets remote.upstream.url more than once", "--upstream", str(FIXTURE["upstream"]))
+                self.config.write_bytes(self.original_config)
+        self.install("v1.1.0")
+        self.assertEqual(self.current(), FIXTURE["b"])
+
+    def test_any_repeated_key_or_other_remote_spelling_is_refused(self):
+        for addition, message in (("\tfetch = +refs/heads/*:refs/remotes/upstream/*\n", "remote.upstream.fetch more than once"),
+                                  ("[core]\n\tbare = true\n", "core.bare more than once"),
+                                  (f'[remote "UPSTREAM"]\n\turl = "{self.tmp}/elsewhere"\n', "remote.UPSTREAM.url")):
+            with self.subTest(addition=addition):
+                text = self.original_config.decode()
+                if addition.startswith("\t"):
+                    text = text.replace('[remote "upstream"]\n', '[remote "upstream"]\n' + addition)
+                else:
+                    text += addition
+                self.config.write_text(text)
+                self.refused(message)
+                self.config.write_bytes(self.original_config)
+
+    def test_recorded_upstream_is_compared_exactly_and_must_be_absolute_or_a_url(self):
+        run_git(self.cache, "config", "remote.upstream.url", str(FIXTURE["upstream"]) + " ")
+        self.refused("--change-upstream", "--upstream", str(FIXTURE["upstream"]))
+        self.config.write_bytes(self.original_config)
+        result = self.install("v1.1.0", "--upstream", "upstream", "--change-upstream", ok=False)
+        self.assertIn("absolute path or a URL", result.stderr)
+        run_git(self.cache, "config", "remote.upstream.url", "upstream")
+        result = self.installer("install", "--tag", "v1.1.0", ok=False)
+        self.assertIn("absolute path or a URL", result.stderr)
+        self.assert_unchanged(*self.before)
+        self.config.write_bytes(self.original_config)
+        self.install("v1.1.0")
+
+    def test_fetches_name_the_trusted_url_not_the_remote(self):
+        calls = []
+        real_git = rel.git
+
+        def spy(repo, *args, **kwargs):
+            if "fetch" in args:
+                calls.append(args)
+            return real_git(repo, *args, **kwargs)
+
+        with mock.patch.object(rel, "git", side_effect=spy):
+            approved = rel.resolve_approved_tag(self.paths, "v1.1.0", None)
+        self.assertEqual(approved["commit"], FIXTURE["b"])
+        self.assertEqual(len(calls), 2)
+        for args in calls:
+            index = args.index("--")
+            self.assertEqual(args[index + 1], str(FIXTURE["upstream"]))
+            self.assertNotIn(rel.REMOTE, args)
+
+    def test_commondir_gitdir_and_dot_git_entries_are_refused(self):
+        # A graft in another repository would make the off-main side commit look
+        # like it is on main; the redirecting entry is refused before Git reads it.
+        other = self.tmp / "other.git"
+        shutil.copytree(self.cache, other)
+        run_git(other, "fetch", "-q", str(FIXTURE["upstream"]), "+refs/heads/feature:refs/attacker/feature")
+        (other / "info").mkdir(exist_ok=True)
+        (other / "info" / "grafts").write_text(f"{FIXTURE['c']} {FIXTURE['side']}\n")
+        for name, content in (("commondir", f"{other}\n"), ("gitdir", f"{other}\n"), (".git", f"gitdir: {other}\n")):
+            with self.subTest(name=name):
+                path = self.cache / name
+                path.write_text(content)
+                self.refused(f"has {name}, which points Git at another directory")
+                path.unlink()
+        (self.cache / ".git").mkdir()
+        self.refused("has .git")
+        (self.cache / ".git").rmdir()
+        self.install("v1.1.0")
+
+    def test_symlinks_inside_the_cache_are_refused(self):
+        for name in ("refs", "objects", "config", "HEAD", "objects/pack"):
+            with self.subTest(name=name):
+                path = self.cache / name
+                moved = path.with_name(path.name + "-real")
+                path.rename(moved)
+                path.symlink_to(moved.name)
+                self.refused(f"has a symlink {name}")
+                path.unlink()
+                moved.rename(path)
+        self.install("v1.1.0")
+
+    def test_cache_entries_owned_by_another_account_are_refused(self):
+        real_scandir = os.scandir
+        head = str(self.cache / "HEAD")
+
+        class Entry:
+            def __init__(self, entry):
+                self._entry, self.name, self.path = entry, entry.name, entry.path
+
+            def stat(self, follow_symlinks=True):
+                result = self._entry.stat(follow_symlinks=follow_symlinks)
+                if self.path == head:
+                    values = list(result[:10])
+                    values[4] = 4242
+                    return os.stat_result(values)
+                return result
+
+        def scandir(path="."):
+            return [Entry(e) for e in real_scandir(path)]
+
+        with mock.patch.object(rel.os, "scandir", side_effect=scandir):
+            with self.assertRaisesRegex(rel.ReleaseError, "HEAD is owned by uid 4242"):
+                rel.check_cache(self.paths)
+
+
+class SourceCacheLocation(InstallCase):
+    def test_chosen_cache_parent_is_checked_never_chmodded(self):
+        chosen = self.tmp / "chosen"
+        chosen.mkdir()
+        chosen.chmod(0o750)
+        cache = chosen / "source.git"
+        self.install("v1.0.0", "--source-cache", str(cache))
+        self.assertEqual(stat.S_IMODE(os.stat(chosen).st_mode), 0o750)
+        self.assertEqual(stat.S_IMODE(os.stat(cache).st_mode), 0o700)
+        # Another account could write it: refused, and still not chmodded.
+        chosen.chmod(0o777)
+        self.addCleanup(chosen.chmod, 0o755)
+        result = self.installer("install", "--tag", "v1.1.0", "--source-cache", str(cache), ok=False)
+        self.assertIn(f"{chosen} is world-writable", result.stderr)
+        self.assertEqual(stat.S_IMODE(os.stat(chosen).st_mode), 0o777)
+        self.assertEqual(self.current(), FIXTURE["a"])
+        chosen.chmod(0o750)
+        self.installer("install", "--tag", "v1.1.0", "--source-cache", str(cache))
+        self.assertEqual(self.current(), FIXTURE["b"])
+
+    def test_missing_cache_parents_are_created_private(self):
+        def loose():
+            os.umask(0o002)
+
+        cache = self.tmp / "new" / "deeper" / "source.git"
+        self.install("v1.0.0", "--source-cache", str(cache), preexec_fn=loose)
+        for path in (cache.parent.parent, cache.parent, cache):
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o700, path)
+
+    def test_a_cache_directory_that_is_not_a_cache_is_refused(self):
+        other = self.tmp / "not a cache"
+        other.mkdir()
+        (other / "notes.txt").write_text("mine\n")
+        result = self.install("v1.0.0", "--source-cache", str(other), ok=False)
+        self.assertIn("is not a release-source cache", result.stderr)
+        self.assertEqual(sorted(p.name for p in other.iterdir()), ["notes.txt"])
+
+    def test_a_parent_owned_by_another_account_is_a_clean_error(self):
+        paths = rel.Paths(self.root, self.paths.bin_dir, self.tmp / "theirs" / "source.git")
+        (self.tmp / "theirs").mkdir()
+        with mock.patch.object(rel.os, "stat", side_effect=with_uid(self.tmp / "theirs", 4242)):
+            with self.assertRaisesRegex(rel.ReleaseError, "theirs is owned by uid 4242"):
+                rel.prepare_cache_parent(paths)
+        # Unable to create a missing parent (here: a read-only directory).
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        locked.chmod(0o555)
+        self.addCleanup(locked.chmod, 0o755)
+        paths = rel.Paths(self.root, self.paths.bin_dir, locked / "sub" / "source.git")
+        with self.assertRaisesRegex(rel.ReleaseError, "cannot prepare release-source cache directory"):
+            rel.prepare_cache_parent(paths)
+        result = self.install("v1.0.0", "--source-cache", str(locked / "sub" / "source.git"), ok=False)
+        self.assertIn("cannot prepare release-source cache directory", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+
+class InstallRootParent(InstallCase):
+    def test_root_parent_is_created_private_and_refused_when_others_can_write_it(self):
+        def loose():
+            os.umask(0o002)
+
+        root = self.tmp / "store" / "nested" / "syndicate"
+        self.install("v1.0.0", "--install-root", str(root), preexec_fn=loose)
+        for path in (root.parent.parent, root.parent):
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o700, path)
+        self.assertEqual(stat.S_IMODE(os.stat(root).st_mode), 0o755)
+        root.parent.chmod(0o777)
+        self.addCleanup(root.parent.chmod, 0o755)
+        result = self.install("v1.1.0", "--install-root", str(root), ok=False)
+        self.assertIn(f"install root parent {root.parent} is world-writable", result.stderr)
+        # A sticky directory owned by you (or root), like /tmp, is fine.
+        root.parent.chmod(0o1777)
+        self.install("v1.1.0", "--install-root", str(root))
+        # ...but not one owned by another account, who could rename the root.
+        paths = rel.Paths(root, self.paths.bin_dir, self.paths.cache)
+        with mock.patch.object(rel.os, "stat", side_effect=with_uid(root.parent, 4242)):
+            with self.assertRaisesRegex(rel.ReleaseError, "install root parent .* owned by uid 4242"):
+                rel.prepare_root(paths)
+
+
+class StickyAndWorktreeLookups(InstallCase):
+    def test_sticky_directory_must_be_owned_by_root_or_you(self):
+        sticky = self.tmp / "sticky"
+        sticky.mkdir()
+        sticky.chmod(0o1777)
+        self.addCleanup(sticky.chmod, 0o755)
+        link = sticky / "python3"
+        link.symlink_to(os.path.abspath(sys.executable))
+        self.assertIsNone(rel.redirect_problem(str(link)))
+        self.assertTrue(rel.sticky_protects(sticky, link))
+        # The owner of a sticky directory can rename anyone's entries in it.
+        with mock.patch.object(rel.os, "stat", side_effect=with_uid(sticky, 4242)):
+            self.assertFalse(rel.sticky_protects(sticky, link))
+            with self.assertRaisesRegex(rel.ReleaseError, "sticky .*owned by uid 4242"):
+                rel.preflight_interpreter(str(link))
+
+    def test_worktree_reached_through_an_intermediate_symlink_is_refused(self):
+        shared = self.tmp / "shared bin"
+        shared.mkdir()
+        wrapper = shared / "python3"
+        wrapper.write_text(f"#!/bin/sh\nexec '{os.path.abspath(sys.executable)}' \"$@\"\n")
+        wrapper.chmod(0o755)
+        repo = self.tmp / "repo"
+        (repo / "sub").mkdir(parents=True)
+        (repo / ".git").mkdir()
+        (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        (repo / "sub" / "deeper").symlink_to(shared)
+        (self.tmp / "x").mkdir()
+        (self.tmp / "x" / "link").symlink_to(repo / "sub")
+        path = self.tmp / "x" / "link" / "deeper" / "python3"
+        # Neither the given path's directory nor the resolved file is in a work tree...
+        self.assertIsNone(rel.inside_git_worktree(str(path.parent)))
+        self.assertIsNone(rel.inside_git_worktree(os.path.dirname(os.path.realpath(path))))
+        # ...but resolving it looks entries up in repo/sub, which an agent in repo can change.
+        with self.assertRaisesRegex(rel.ReleaseError, "Git work tree .*repo"):
+            rel.preflight_interpreter(str(path))
+        self.assertEqual(rel.preflight_interpreter(str(wrapper)), str(wrapper))
+
+    def test_git_marker_forms(self):
+        base = self.tmp / "markers"
+        cases = {"empty dir": None, "dir with HEAD": "HEAD", "dir with dangling HEAD symlink": "link",
+                 "gitdir file": b"gitdir: ../.git/worktrees/x\n", "other file": b"not a gitdir\n"}
+        expected = {"empty dir": False, "dir with HEAD": True, "dir with dangling HEAD symlink": True,
+                    "gitdir file": True, "other file": False}
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                marker = base / name / ".git"
+                marker.parent.mkdir(parents=True)
+                if isinstance(content, bytes):
+                    marker.write_bytes(content)
+                else:
+                    marker.mkdir()
+                    if content == "HEAD":
+                        (marker / "HEAD").write_text("ref: refs/heads/main\n")
+                    elif content == "link":
+                        (marker / "HEAD").symlink_to(marker / "missing")
+                self.assertEqual(rel.is_git_marker(marker), expected[name])
+                self.assertEqual(rel.inside_git_worktree(str(marker.parent)) == str(marker.parent), expected[name])
+
+
+class InUseAndVerifyPermissions(InstallCase):
+    def test_launcher_tightens_existing_in_use_directories(self):
+        self.install("v1.0.0")
+        directory = self.paths.in_use / FIXTURE["a"]
+        directory.mkdir(parents=True)
+        self.paths.in_use.chmod(0o777)
+        directory.chmod(0o775)
+        release = Path(os.path.realpath(self.paths.releases / FIXTURE["a"]))
+        code = ("import importlib.machinery, importlib.util, json, os, sys\n"
+                "loader = importlib.machinery.SourceFileLoader('syndicate', sys.argv[1])\n"
+                "spec = importlib.util.spec_from_loader('syndicate', loader)\n"
+                "sy = importlib.util.module_from_spec(spec); loader.exec_module(sy)\n"
+                "sy.mark_release_in_use()\n"
+                "marker = sy._release_markers[0]\n"
+                "print(json.dumps([oct(os.stat(p).st_mode & 0o777) for p in (marker.parent.parent, marker.parent)]))\n")
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(release / "bin" / "syndicate")],
+                                cwd=self.tmp / "elsewhere", env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), ["0o700", "0o700"])
+        # A symlinked in-use/ is refused with a warning, never written through.
+        elsewhere = self.tmp / "elsewhere in-use"
+        elsewhere.mkdir()
+        rel.remove_tree(self.paths.in_use)
+        self.paths.in_use.symlink_to(elsewhere)
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", code.replace("marker = sy._release_markers[0]\n", "")
+                                 .replace("for p in (marker.parent.parent, marker.parent)", "for p in ()"),
+                                 str(release / "bin" / "syndicate")],
+                                cwd=self.tmp / "elsewhere", env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not write release in-use marker", result.stderr)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_prune_tightens_and_verify_checks_the_install_root(self):
+        self.install("v1.0.0")
+        self.assertEqual(self.installer("verify").returncode, 0)
+        directory = self.paths.in_use / FIXTURE["a"]
+        directory.mkdir(parents=True)
+        (directory / str(os.getpid())).touch()
+        for path in (self.root, self.paths.releases, self.paths.interpreters, self.paths.in_use):
+            with self.subTest(path=path):
+                path.chmod(0o777)
+                result = self.installer("verify", ok=False)
+                self.assertIn("matches its manifest, but", result.stderr)
+                self.assertIn(f"{path} is world-writable", result.stderr)
+                path.chmod(0o755)
+        directory.chmod(0o777)
+        self.installer("prune")
+        for path in (self.paths.in_use, directory):
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o700, path)
+        self.assertEqual(self.installer("verify").returncode, 0)
+
+
+class PrunedHookRelease(InstallCase):
+    def setUp(self):
+        super().setUp()
+        self.codex = self.tmp / "codex"
+        self.hooks = self.codex / "hooks.json"
+        self.install("v1.0.0")
+        self.install("v1.1.0")
+        self.old = rel.shlex.quote(str(Path(os.path.realpath(self.paths.releases / FIXTURE["a"]))
+                                       / "hooks" / "require-review.sh"))
+        self.checkout = rel.shlex.quote(str(FIXTURE["src"] / "hooks" / "require-review.sh"))
+
+    def write(self, *commands):
+        self.hooks.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": c}]}
+                                                             for c in commands]}}, indent=2) + "\n")
+        return self.hooks.read_bytes()
+
+    def migrate(self, ok=True):
+        return self.installer("migrate-codex-hook", "--codex-home", str(self.codex), "--json", ok=ok)
+
+    def test_hook_in_a_pruned_release_is_skipped_not_fatal(self):
+        # Prune A while the hook still names it (prune was told about another Codex home).
+        self.installer("install", "--tag", "v1.2.0")
+        self.installer("prune", "--codex-home", str(self.tmp / "other codex"))
+        self.assertFalse((self.paths.releases / FIXTURE["a"]).exists())
+        original = self.write(self.old)
+        result = self.migrate()
+        self.assertIn("no longer retained", result.stderr)
+        data = json.loads(result.stdout)
+        self.assertFalse(data["changed"])
+        self.assertEqual([s["command"] for s in data["skipped"]], [self.old])
+        self.assertEqual(self.hooks.read_bytes(), original)
+        # Beside a verified hook, that one migrates and the missing one is preserved.
+        self.write(self.old, self.checkout)
+        data = json.loads(self.migrate().stdout)
+        self.assertTrue(data["changed"])
+        stop = json.loads(self.hooks.read_text())["hooks"]["Stop"]
+        self.assertEqual([e["hooks"][0]["command"] for e in stop], [self.old, data["command"]])
+
+    def test_missing_hook_in_a_retained_release_still_stops_the_migration(self):
+        hook = Path(rel.shlex.split(self.old)[0])
+        hook.parent.chmod(0o755)
+        hook.unlink()
+        original = self.write(self.old, self.checkout)
+        result = self.migrate(ok=False)
+        self.assertIn("cannot be read", result.stderr)
+        self.assertEqual(self.hooks.read_bytes(), original)
+        self.assertEqual(list(self.codex.glob("hooks.json.syndicate-backup-*")), [])
+
+
 if __name__ == "__main__":
     unittest.main()
