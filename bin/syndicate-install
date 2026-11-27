@@ -1,16 +1,25 @@
-#!/usr/bin/env python3
+#!/bin/sh
+''''exec python3 -I -B -- "$0" "$@" # '''
 """syndicate-install: install, upgrade, roll back and verify per-user Syndicate releases.
 
-Run it with bytecode disabled, from a checkout (first install) or from an
-installed release (later upgrades and rollbacks):
+Run it isolated and with bytecode disabled, from a checkout (first install) or
+from an installed release (later upgrades and rollbacks):
 
     python3 -I -B bin/syndicate-install install --tag vX.Y.Z --upstream URL
+
+Executed directly, the first line (a no-op string to Python) has sh exec the
+PATH's python3 with -I -B. Run by an interpreter without -I, it re-executes
+itself with -I -B before importing anything of its own.
 
 See docs/user-install.md.
 """
 import os
 import sys
 
+if not sys.flags.isolated and sys.executable:
+    # Isolated mode keeps PYTHONPATH, the user site and the current directory
+    # out of the installer's imports.
+    os.execv(sys.executable, [sys.executable, "-I", "-B", "--", os.path.realpath(__file__), *sys.argv[1:]])
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import syndicate_release  # noqa: E402

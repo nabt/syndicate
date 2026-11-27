@@ -416,8 +416,12 @@ def render_claude_result(output):
     return output
 
 
-def run_specialist_process(argv, *, cwd, env=None, reserve=None, claude_text=False, structured_stdout=False):
-    """Forward CLI output, enforcing quota for just this specialist process."""
+def run_specialist_process(argv, *, cwd, env=None, reserve=None, claude_text=False, structured_stdout=False,
+                           on_start=None):
+    """Forward CLI output, enforcing quota for just this specialist process.
+
+    on_start(pid), if given, is called once the CLI child has started (the
+    launcher records a release in-use marker for it)."""
     claude_output = bytearray()
     pending_record = bytearray()
     stderr_tail = b""
@@ -425,6 +429,8 @@ def run_specialist_process(argv, *, cwd, env=None, reserve=None, claude_text=Fal
     with specialist_signals() as check_interrupt, selectors.DefaultSelector() as selector, subprocess.Popen(
             argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, start_new_session=True) as proc:
+        if on_start is not None:
+            on_start(proc.pid)
         for name in ("stdout", "stderr"):
             pipe = getattr(proc, name)
             os.set_blocking(pipe.fileno(), False)

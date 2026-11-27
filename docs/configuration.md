@@ -345,20 +345,21 @@ current directory, `PATH` or a later move of an installed `current` symlink.
 Everything Syndicate starts again (Chief launch context, team inbox and
 backoff commands, relays and their Claude allow rule, Codex relay agents, tmux
 windows, the limits monitor, the Claude status line and the channel MCP
-server) uses the same prefix: the absolute interpreter, `-B`, and that real
+server) uses the same prefix: the absolute interpreter, `-I -B`, and that real
 launcher path. Bundled role and skill commands such as `syndicate tasks close`
 are rendered with that prefix when the prompt is assembled, so a Chief's teams
 and a team's specialists stay on the Chief's release until it restarts.
 `run.json` and the limits monitor's `monitor.json` record the release (`mode`,
 `commit`, `root`, `interpreter`); older records without it are still read.
 An installed release also writes `in-use/<commit>/<pid>` markers under its
-install root for each launcher that starts a session, dashboard or monitor and
-for the provider CLI it supervises, so `syndicate-install prune` keeps that
+install root for each launcher that starts a session, specialist relay,
+dashboard or monitor and for each provider CLI it starts, so `syndicate-install prune` keeps that
 release while they run (see [Prune and retention](user-install.md#prune-and-retention)).
 
 Python never writes bytecode for Syndicate: the launcher disables it before
-importing its modules, every Python child runs with `-B`, and children inherit
-`PYTHONDONTWRITEBYTECODE=1`.
+importing its modules, every Syndicate Python child runs with `-B` and
+`PYTHONDONTWRITEBYTECODE=1`. Provider CLIs and the project tools they run get
+the caller's own `PYTHONDONTWRITEBYTECODE` back (unset if it was unset).
 
 ## Development runs
 

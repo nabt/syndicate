@@ -83,6 +83,9 @@ PYTHON_STEERING_ENV = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERB
 # Passed to the provider CLI of an installed release, so its descendants are
 # attributable to that release (syndicate-install prune scans for it).
 RELEASE_ENV = "SYNDICATE_RELEASE_ROOT"
+# The caller's PYTHONDONTWRITEBYTECODE ("" when unset), saved by the launcher
+# before it sets the variable for its own Python children.
+USER_BYTECODE_ENV = "SYNDICATE_USER_PYTHONDONTWRITEBYTECODE"
 
 
 def python_argv(script: str | os.PathLike) -> list[str]:
@@ -115,9 +118,17 @@ def child_env(env: dict | None = None) -> dict:
 
 def session_env(env: dict) -> dict:
     """Environment for a provider CLI: in an installed release, also names that release
-    (RELEASE_ENV) so the CLI's descendants keep it from being pruned. Other variables,
-    including the user's PYTHONPATH for project tools, pass through unchanged."""
+    (RELEASE_ENV) so the CLI's descendants keep it from being pruned. The caller's own
+    PYTHONDONTWRITEBYTECODE is restored (Syndicate's Python children use -B
+    themselves), so project tools behave as they would outside Syndicate. Other
+    variables, including the user's PYTHONPATH, pass through unchanged."""
     result = dict(env)
+    saved = result.pop(USER_BYTECODE_ENV, None)
+    if saved is not None:
+        if saved:
+            result["PYTHONDONTWRITEBYTECODE"] = saved
+        else:
+            result.pop("PYTHONDONTWRITEBYTECODE", None)
     if mode() == "release" and ROOT.parent.name == "releases":
         result[RELEASE_ENV] = str(ROOT)
     return result

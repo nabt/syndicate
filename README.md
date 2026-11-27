@@ -331,3 +331,6 @@ and [Development runs](docs/configuration.md#development-runs).
 ```sh
 python3 -B -m unittest discover -s tests
 ```
+
+Run it from a Git checkout with a short `TMPDIR`; see
+[Development](docs/user-install.md#development) for the prerequisites.

@@ -349,8 +349,8 @@ def poll(project, seen=None, scheduled=None):
 def channel_server(path):
     """Claude MCP entry for the live channel: pinned interpreter, -B, this module's real path.
 
-    No `env` key: the server inherits the session environment (which already
-    carries PYTHONDONTWRITEBYTECODE=1) rather than a reduced default one."""
+    No `env` key: the server inherits the session environment rather than a
+    reduced default one; -B keeps it from writing bytecode."""
     argv = identity.python_argv(identity.LIVE_MODULE)
     return dict(command=argv[0], args=[*argv[1:], 'channel', str(path)])
 

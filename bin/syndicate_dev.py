@@ -185,6 +185,11 @@ def run(checkout_arg: str, args: list[str], *, home_arg: str | None = None, keep
     launcher = devroot / "checkout" / "bin" / "syndicate"
     print(f"syndicate dev: snapshot {devroot / 'checkout'}, home {home}, tmux session {session}",
           file=sys.stderr)
+    if share_providers:
+        print(f"syndicate dev: warning: --share-provider-config uses the production CODEX_HOME "
+              f"({env['CODEX_HOME']}) and CLAUDE_CONFIG_DIR ({env['CLAUDE_CONFIG_DIR']}); anything this run "
+              "writes there, such as 'setup-codex-gate' Stop hooks pointing into the disposable snapshot, "
+              "changes production provider configuration", file=sys.stderr)
     try:
         result = subprocess.run([*identity.python_argv(launcher), *args], env=env, cwd=home / "work")
         code = result.returncode

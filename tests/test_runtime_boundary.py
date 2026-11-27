@@ -181,7 +181,26 @@ class Pinning(ProjectCase):
                 self.assertEqual(shlex.split(prefix), ["/opt/py thon/bin/python3", "-I", "-B", str(launcher)])
                 self.assertEqual(shlex.split(identity.pinned_command("team", "run-role", "a b")),
                                  ["/opt/py thon/bin/python3", "-I", "-B", str(launcher), "team", "run-role", "a b"])
-                self.assertEqual(sy.relay_allow_rule(), f"Bash({prefix} team run-role *)")
+                # Whitespace inside a quoted path makes a Bash() prefix rule ambiguous: no rule.
+                self.assertIsNone(sy.relay_allow_rule())
+        with tempfile.TemporaryDirectory(prefix="plain-") as tmp:
+            launcher = Path(tmp) / "bin" / "syndicate"
+            launcher.parent.mkdir()
+            launcher.write_text("")
+            with patch.object(identity, "LAUNCHER", launcher), \
+                 patch.object(identity.sys, "executable", "/opt/python/bin/python3"):
+                self.assertEqual(sy.relay_allow_rule(), f"Bash({identity.pinned_prefix()} team run-role *)")
+
+    def test_rule_syntax_characters_in_paths_omit_the_rule(self):
+        for launcher_dir, python in (("bin(x", "/opt/python/bin/python3"), ("bin*", "/opt/python/bin/python3"),
+                                     ("bin", "/opt/py*/bin/python3"), ("bin", "/opt/py\tthon/bin/python3")):
+            with self.subTest(launcher_dir=launcher_dir, python=python), \
+                 tempfile.TemporaryDirectory(prefix="rule-") as tmp:
+                launcher = Path(tmp) / launcher_dir / "syndicate"
+                launcher.parent.mkdir()
+                launcher.write_text("")
+                with patch.object(identity, "LAUNCHER", launcher), patch.object(identity.sys, "executable", python):
+                    self.assertIsNone(sy.relay_allow_rule())
 
     def test_paths_with_a_closing_parenthesis(self):
         # A checkout or dev snapshot can live under a ')' path (the installer refuses
@@ -309,6 +328,21 @@ class Pinning(ProjectCase):
         self.assertEqual(argv, [*identity.pinned_argv(), "_limits-monitor"])
         self.assertEqual(popen.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_provider_cli_environment_gets_the_callers_bytecode_setting(self):
+        for saved, expected in (("", None), ("0", "0"), ("1", "1")):
+            with self.subTest(saved=saved):
+                env = identity.session_env({"PYTHONDONTWRITEBYTECODE": "1", identity.USER_BYTECODE_ENV: saved,
+                                            "PYTHONPATH": "/project/tools"})
+                self.assertEqual(env.get("PYTHONDONTWRITEBYTECODE"), expected)
+                self.assertNotIn(identity.USER_BYTECODE_ENV, env)
+                self.assertEqual(env["PYTHONPATH"], "/project/tools")
+        # Not started by the launcher (nothing saved): left as it is.
+        self.assertEqual(identity.session_env({"PYTHONDONTWRITEBYTECODE": "1"})["PYTHONDONTWRITEBYTECODE"], "1")
+        # The launcher saved the caller's value before setting its own, and tmux windows carry it.
+        self.assertIn(identity.USER_BYTECODE_ENV, os.environ)
+        self.assertEqual(os.environ["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertIn(f"{identity.USER_BYTECODE_ENV}={os.environ[identity.USER_BYTECODE_ENV]}", sy._tmux_env_flags())
 
     def test_channel_mcp_argv(self):
         server = live.channel_server(self.project / "live.json")
@@ -751,7 +785,8 @@ class Version(SubprocessCase):
         self.assertEqual(shlex.split(paths["prefix"]),
                          [os.path.abspath(sys.executable), "-I", "-B", str(release / "bin" / "syndicate")])
         self.assertIn(" ", paths["prefix"])
-        self.assertEqual(paths["rule"], f"Bash({paths['prefix']} team run-role *)")
+        # The fixture release path has a space, so relays ask for approval instead.
+        self.assertIsNone(paths["rule"])
 
 
 class NoBytecode(SubprocessCase):

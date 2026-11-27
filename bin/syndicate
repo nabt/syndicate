@@ -55,7 +55,11 @@ from pathlib import Path
 # assets even after the `current` symlink moves to another release.
 SCRIPT = Path(__file__).resolve()
 sys.path.insert(0, str(SCRIPT.parent))
-os.environ["PYTHONDONTWRITEBYTECODE"] = "1"  # inherited by every child, tmux window and relay
+# Inherited by every Syndicate child, tmux window and relay. The caller's own
+# value is kept aside so provider CLIs (and the project tools they run) get it
+# back (identity.session_env); a nested launcher keeps the outermost value.
+os.environ.setdefault("SYNDICATE_USER_PYTHONDONTWRITEBYTECODE", os.environ.get("PYTHONDONTWRITEBYTECODE", ""))
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 import syndicate_identity as identity
 import syndicate_runtime as runtime
 import syndicate_portfolio as portfolio
@@ -682,15 +686,25 @@ def mark_release_in_use(pid: int | None = None) -> None:
     if info.get("mode") != "release" or not commit or identity.ROOT.parent.name != "releases":
         return
     pid = os.getpid() if pid is None else pid
-    directory = identity.data_root(identity.ROOT) / "in-use" / commit
+    in_use = identity.data_root(identity.ROOT) / "in-use"
+    directory = in_use / commit
     marker = directory / str(pid)
     if marker in _release_markers:
         return
-    record = json.dumps({"pid": pid, "launcher_pid": os.getpid(), "created_at": time.time()}) + "\n"
+    record = (json.dumps({"pid": pid, "launcher_pid": os.getpid(), "created_at": time.time()}) + "\n").encode()
     for _ in range(2):  # a concurrent cleanup may remove the empty directory between mkdir and write
         try:
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            marker.write_text(record)
+            # Explicit modes, whatever the umask: in-use/ and its commit
+            # directories 0700, markers 0600 (the data root already exists).
+            for path in (in_use, directory):
+                try:
+                    path.mkdir(mode=0o700)
+                    os.chmod(path, 0o700)
+                except FileExistsError:
+                    pass
+            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(record)
             break
         except FileNotFoundError:
             continue
@@ -741,17 +755,24 @@ def record_generated_child(pid: int) -> None:
 RELAY_SUBCOMMAND = "team run-role"
 
 
+# Characters a path in Claude's Bash(...) rule must not contain: '(' and ')'
+# delimit the rule, '*' is its wildcard, and whitespace inside a quoted path
+# makes the prefix ambiguous to match.
+RULE_UNSAFE = re.compile(r"[()*\s]")
+
+
 def relay_allow_rule() -> str | None:
     """Claude allow rule for relays. Byte-for-byte the start of every relay_command().
 
-    None when the pinned prefix contains ')': Claude's Bash(...) rule would end
-    at it and grant the wrong command. Relays then ask for normal approval.
-    (syndicate-install refuses such install roots and interpreters; a checkout
-    or dev snapshot can still live under one.)"""
-    prefix = identity.pinned_prefix()
-    if ")" in prefix:
+    None when the interpreter or launcher path contains '(', ')', '*' or
+    whitespace: the Bash(...) rule could end early, widen, or match ambiguously.
+    Relays then ask for normal approval. (syndicate-install refuses install
+    roots and interpreters with '(', ')' or '*' and warns about whitespace; a
+    checkout or dev snapshot can still live under one.)"""
+    argv = identity.pinned_argv()
+    if any(RULE_UNSAFE.search(path) for path in (argv[0], argv[-1])):
         return None
-    return f"Bash({prefix} {RELAY_SUBCOMMAND} *)"
+    return f"Bash({identity.pinned_prefix()} {RELAY_SUBCOMMAND} *)"
 
 
 def relay_command(role: Role, project: Path, *, pin: bool = False) -> str:
@@ -830,8 +851,9 @@ def build_claude(team: Team, headless: bool, rest: list[str]) -> list[str]:
         if rule:
             settings["permissions"] = {"allow": [rule]}
         else:
-            print(f"syndicate: warning: {identity.pinned_prefix()} contains ')', which a Claude Bash() "
-                  "permission rule cannot express; relays will ask for approval", file=sys.stderr)
+            print(f"syndicate: warning: {identity.pinned_prefix()} has a path with '(', ')', '*' or whitespace, "
+                  "which a Claude Bash() permission rule cannot express safely; relays will ask for approval",
+                  file=sys.stderr)
     argv = ["claude", "--agent", "orchestrator", "--agents", json.dumps(agents)]
     if settings:
         path = generated(team.project) / "claude-settings.json"
@@ -1667,7 +1689,7 @@ def _tmux_env_flags():
     # SYNDICATE_RUN_ID is reset too, so a server started inside an earlier run
     # cannot leak a stale run id into this window.
     flags = []
-    for key in ('XDG_CONFIG_HOME', 'SYNDICATE_RUNTIME', 'PATH', runtime.RUN_ENV):
+    for key in ('XDG_CONFIG_HOME', 'SYNDICATE_RUNTIME', 'PATH', runtime.RUN_ENV, identity.USER_BYTECODE_ENV):
         flags += ['-e', f'{key}={os.environ.get(key, "")}']
     flags += ['-e', 'PYTHONDONTWRITEBYTECODE=1']
     if identity.dev_mode():
@@ -3446,6 +3468,7 @@ def hold_role_task(project, owner, role, providers):
 def cmd_run_role(args: argparse.Namespace) -> int:
     # A specialist is part of an existing project, not a new owner. Registry
     # registration requires a host-only lock and is unnecessary here.
+    mark_release_in_use()  # the relay launcher; launch_role marks the specialist CLI
     project = execution_project(args.dir)
     team = resolve_team(project)
     role = team.roles.get(args.role)
@@ -3725,8 +3748,9 @@ def launch_role(project: Path, team: Team, role: Role, brief: str, *, reserve: f
             config = {**config, "claude-output-format": "json"}
         argv += cli_options('claude', config) + ['--', brief]
         return runtime.run_specialist_process(
-            argv, cwd=project, reserve=reserve, claude_text=claude_text,
-            structured_stdout=claude_text or configured_format in ("json", "stream-json"))
+            argv, cwd=project, env=identity.session_env(dict(os.environ)), reserve=reserve, claude_text=claude_text,
+            structured_stdout=claude_text or configured_format in ("json", "stream-json"),
+            on_start=mark_release_in_use)
     else:
         # Keep reviewers' repository read-only while allowing test fixtures and
         # bytecode in a disposable workspace outside the repository. Native
@@ -3756,8 +3780,11 @@ def launch_role(project: Path, team: Team, role: Role, brief: str, *, reserve: f
             if role.can_write:
                 argv += ["--add-dir", str(REGISTRY_PATH.parent / "portfolio")]
             argv += cli_options('codex', team.config) + ['--', brief]
-            env = dict(os.environ, TMPDIR=scratch, PYTHONDONTWRITEBYTECODE="1")
-            return runtime.run_specialist_process(argv, cwd=cwd, env=env, reserve=reserve)
+            # Bytecode from tests the role runs lands in this disposable scratch
+            # workspace, not the repository, so the CLI gets the caller's setting.
+            env = identity.session_env(dict(os.environ, TMPDIR=scratch))
+            return runtime.run_specialist_process(argv, cwd=cwd, env=env, reserve=reserve,
+                                                  on_start=mark_release_in_use)
 
 
 def forget_reading(provider: str) -> int:

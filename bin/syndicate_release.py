@@ -162,8 +162,31 @@ def git_env() -> dict:
     return env
 
 
-def git(repo: Path, *args: str, binary: bool = False, check: bool = True):
-    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, env=git_env(),
+# Every command against the release-source cache: object replacement
+# (refs/replace/*), the commit-graph and hooks are ignored, so what ls-tree and
+# archive read is exactly the object rev-parse names; nothing writes a commit
+# graph or runs automatic maintenance.
+CACHE_GIT_OPTIONS = ("--no-replace-objects", "-c", "core.commitGraph=false", "-c", "core.hooksPath=/dev/null",
+                     "-c", "fetch.writeCommitGraph=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false")
+# The only configuration a cache may carry: what `git init --bare --template=`
+# and `git remote add` write. Anything else (remote.upstream.uploadpack, proxy
+# or vcs, url.*.insteadOf, core.sshCommand, include.path, ...) could change
+# what a fetch runs or where it reads from.
+CACHE_CONFIG = {
+    "core.repositoryformatversion": None, "core.filemode": None, "core.bare": ("true",),
+    "core.ignorecase": None, "core.precomposeunicode": None, "core.symlinks": None,
+    "core.logallrefupdates": None, "extensions.objectformat": ("sha1",),
+    "extensions.refstorage": ("files", "reftable"),
+    f"remote.{REMOTE}.url": None, f"remote.{REMOTE}.fetch": (f"+refs/heads/*:refs/remotes/{REMOTE}/*",),
+}
+# Files that make Git read history other than the objects named: grafts and a
+# shallow list rewrite parents; alternates add object stores.
+CACHE_FORBIDDEN_FILES = ("info/grafts", "shallow", "objects/info/alternates", "objects/info/http-alternates")
+DIGITS = re.compile(r"[0-9]+")
+
+
+def git(repo: Path, *args: str, binary: bool = False, check: bool = True, options: tuple = ()):
+    result = subprocess.run(["git", *options, "-C", str(repo), *args], capture_output=True, env=git_env(),
                             stdin=subprocess.DEVNULL)
     if check and result.returncode != 0:
         detail = result.stderr.decode(errors="replace").strip()
@@ -173,6 +196,51 @@ def git(repo: Path, *args: str, binary: bool = False, check: bool = True):
         return result
     result.stdout = result.stdout.decode(errors="replace")
     return result
+
+
+def cache_git(cache: Path, *args: str, **kwargs):
+    """git against the release-source cache, with CACHE_GIT_OPTIONS."""
+    return git(cache, *args, options=CACHE_GIT_OPTIONS, **kwargs)
+
+
+def tighten(path: Path, mask: int) -> None:
+    """Remove permission bits outside mask from a directory this user owns; never add any."""
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        raise ReleaseError(f"{path} is a symlink; refusing to use it")
+    if st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) & ~mask:
+        os.chmod(path, stat.S_IMODE(st.st_mode) & mask)
+
+
+def check_cache(paths: Paths) -> None:
+    """Refuse a release-source cache another account can change, or one whose
+    configuration or history redirection could make it read something other
+    than the fetched objects (replace refs, grafts, a shallow list, alternates,
+    unexpected configuration)."""
+    cache = paths.cache
+    for path in (cache.parent, cache):
+        tighten(path, 0o700 if path == cache else 0o755)
+        problem = writable_by_others(path)
+        if problem:
+            raise ReleaseError(f"release-source cache directory {path} is {problem}; refusing to use it")
+    for name in CACHE_FORBIDDEN_FILES:
+        if os.path.lexists(cache / name):
+            raise ReleaseError(f"release-source cache {cache} has {name}, which changes what Git reads; "
+                               f"remove the cache ({cache}) and install again")
+    replaced = cache_git(cache, "for-each-ref", "--format=%(refname)", "refs/replace/").stdout.split()
+    if replaced or os.path.lexists(cache / "refs" / "replace") and any((cache / "refs" / "replace").iterdir()):
+        raise ReleaseError(f"release-source cache {cache} has replace refs ({', '.join(replaced) or 'refs/replace/'}), "
+                           f"which substitute objects; remove the cache ({cache}) and install again")
+    listing = cache_git(cache, "config", "--local", "--no-includes", "--list", "-z", binary=True).stdout
+    for item in listing.split(b"\0"):
+        if not item:
+            continue
+        key, _, value = item.decode(errors="replace").partition("\n")
+        allowed_values = CACHE_CONFIG.get(key.lower(), ())
+        if key.lower() not in CACHE_CONFIG or (allowed_values is not None and value not in allowed_values):
+            raise ReleaseError(f"release-source cache {cache} has unexpected configuration {key}={value!r}; "
+                               f"only {', '.join(sorted(CACHE_CONFIG))} (with their default values) are allowed. "
+                               f"Remove the cache ({cache}) and install again")
 
 
 def local_upstream_path(upstream: str) -> str | None:
@@ -205,29 +273,33 @@ def check_local_upstream(upstream: str) -> None:
 
 def ensure_cache(paths: Paths, upstream: str | None, change_upstream: bool = False) -> tuple[str, str | None]:
     """Create the release-source cache; return (upstream URL, previous URL if it changed)."""
-    if not (paths.cache / "HEAD").is_file():
+    if not os.path.lexists(paths.cache / "HEAD"):
         if not upstream:
             raise ReleaseError(f"no release-source cache at {paths.cache}; pass --upstream URL|PATH")
-        paths.cache.parent.mkdir(parents=True, exist_ok=True)
-        result = subprocess.run(["git", "init", "--quiet", "--bare", str(paths.cache)],
-                                capture_output=True, text=True, env=git_env())
+        make_private_dir(paths.cache.parent)
+        # No template: a configured init.templateDir could add hooks, grafts or config.
+        result = subprocess.run(["git", *CACHE_GIT_OPTIONS, "init", "--quiet", "--bare", "--template=",
+                                 str(paths.cache)], capture_output=True, text=True, env=git_env(),
+                                stdin=subprocess.DEVNULL)
         if result.returncode:
             raise ReleaseError(f"cannot create release-source cache: {result.stderr.strip()}")
+        os.chmod(paths.cache, 0o700)
+    check_cache(paths)
     if upstream is not None and (not upstream or upstream.startswith("-") or "\n" in upstream):
         raise ReleaseError(f"invalid upstream {upstream!r}")
-    configured = git(paths.cache, "config", "--get", f"remote.{REMOTE}.url", check=False).stdout.strip()
+    configured = cache_git(paths.cache, "config", "--get", f"remote.{REMOTE}.url", check=False).stdout.strip()
     if upstream:
         if os.path.isdir(upstream):
             upstream = os.path.abspath(upstream)
         check_local_upstream(upstream)
         if not configured:
-            git(paths.cache, "remote", "add", REMOTE, upstream)
+            cache_git(paths.cache, "remote", "add", REMOTE, upstream)
         elif configured != upstream:
             if not change_upstream:
                 raise ReleaseError(f"the recorded trusted upstream is {configured}; refusing to switch to {upstream} "
                                    "without --change-upstream")
             log(f"changing trusted upstream from {configured} to {upstream}")
-            git(paths.cache, "remote", "set-url", REMOTE, upstream)
+            cache_git(paths.cache, "remote", "set-url", REMOTE, upstream)
             return upstream, configured
         return upstream, None
     if not configured:
@@ -288,8 +360,8 @@ def check_retag(paths: Paths, approved: dict, allow_retag: bool) -> None:
 @contextmanager
 def source_lock(paths: Paths):
     """Serialize fetches into the shared release-source cache."""
-    paths.cache.parent.mkdir(parents=True, exist_ok=True)
-    with open(paths.cache.with_name(paths.cache.name + ".lock"), "a") as handle:
+    make_private_dir(paths.cache.parent)
+    with open_lock(paths.cache.with_name(paths.cache.name + ".lock")) as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             yield
@@ -302,23 +374,26 @@ def _resolve_approved_tag(paths: Paths, tag: str, upstream: str | None, change_u
     tag_ref = FETCHED_TAGS + tag
     # Forget previous fetch results first so a failed fetch can never fall back to stale refs.
     for ref in (FETCHED_MAIN, tag_ref):
-        git(paths.cache, "update-ref", "-d", ref, check=False)
-    fetched = git(paths.cache, "-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--no-tags",
-                  "--no-write-fetch-head", REMOTE, f"+refs/heads/{MAIN_BRANCH}:{FETCHED_MAIN}", check=False)
+        cache_git(paths.cache, "update-ref", "-d", ref, check=False)
+    # --refmap= : only the refspecs named here are written (no opportunistic
+    # remote-tracking updates through a configured fetch refspec).
+    fetched = cache_git(paths.cache, "-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--no-tags", "--refmap=",
+                        "--no-write-fetch-head", REMOTE, f"+refs/heads/{MAIN_BRANCH}:{FETCHED_MAIN}", check=False)
     if fetched.returncode:
         raise ReleaseError(f"cannot fetch {MAIN_BRANCH} from upstream {url}: {fetched.stderr.strip()}; "
                            "nothing was installed (a fresh fetch is required)")
-    fetched = git(paths.cache, "-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--no-tags",
-                  "--no-write-fetch-head", REMOTE, f"+refs/tags/{tag}:{tag_ref}", check=False)
+    fetched = cache_git(paths.cache, "-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--no-tags", "--refmap=",
+                        "--no-write-fetch-head", REMOTE, f"+refs/tags/{tag}:{tag_ref}", check=False)
     if fetched.returncode:
         raise ReleaseError(f"tag {tag} was not found at upstream {url}: {fetched.stderr.strip()}")
-    kind = git(paths.cache, "cat-file", "-t", tag_ref).stdout.strip()
-    peeled = git(paths.cache, "rev-parse", "--verify", "--quiet", f"{tag_ref}^{{commit}}", check=False)
+    check_cache(paths)
+    kind = cache_git(paths.cache, "cat-file", "-t", tag_ref).stdout.strip()
+    peeled = cache_git(paths.cache, "rev-parse", "--verify", "--quiet", f"{tag_ref}^{{commit}}", check=False)
     commit = peeled.stdout.strip()
     if peeled.returncode or not COMMIT_PATTERN.match(commit):
         raise ReleaseError(f"tag {tag} does not point at a commit")
-    main = git(paths.cache, "rev-parse", "--verify", f"{FETCHED_MAIN}^{{commit}}").stdout.strip()
-    reachable = git(paths.cache, "merge-base", "--is-ancestor", commit, main, check=False)
+    main = cache_git(paths.cache, "rev-parse", "--verify", f"{FETCHED_MAIN}^{{commit}}").stdout.strip()
+    reachable = cache_git(paths.cache, "merge-base", "--is-ancestor", commit, main, check=False)
     if reachable.returncode == 1:
         raise ReleaseError(f"tag {tag} ({commit}) is not reachable from upstream {MAIN_BRANCH} ({main}); "
                            "only tags on upstream main are installable")
@@ -341,7 +416,7 @@ def allowed(path: str) -> bool:
 
 def tree_entries(cache: Path, commit: str) -> dict[str, tuple[str, str]]:
     """{path: (mode, blob id)} for allowlisted paths at the commit."""
-    out = git(cache, "ls-tree", "-r", "-z", "--full-tree", commit, binary=True).stdout
+    out = cache_git(cache, "ls-tree", "-r", "-z", "--full-tree", commit, binary=True).stdout
     entries = {}
     for record in out.split(b"\0"):
         if not record:
@@ -378,14 +453,25 @@ def executable_rule(path: str) -> bool:
 
 def build_archive(cache: Path, commit: str, entries: dict) -> bytes:
     # Literal pathspecs: a shipped name with glob characters selects only itself.
-    result = git(cache, "--literal-pathspecs", "archive", "--format=tar", commit, "--", *sorted(entries),
-                 binary=True)
+    result = cache_git(cache, "--literal-pathspecs", "archive", "--format=tar", commit, "--", *sorted(entries),
+                       binary=True)
     return result.stdout
 
 
 def extract(archive: bytes, entries: dict, stage: Path) -> dict[str, str]:
     """Extract exactly the expected regular files; return {path: sha256}."""
     files = {}
+    try:
+        _extract(archive, entries, stage, files)
+    except tarfile.TarError as error:
+        raise ReleaseError(f"the release archive is not a valid tar file: {error}") from None
+    missing = sorted(set(entries) - set(files))
+    if missing:
+        raise ReleaseError(f"archive is missing {', '.join(missing)} (export-ignore attributes are not supported)")
+    return files
+
+
+def _extract(archive: bytes, entries: dict, stage: Path, files: dict) -> None:
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
         for member in tar:
             name = member.name.rstrip("/")
@@ -408,10 +494,6 @@ def extract(archive: bytes, entries: dict, stage: Path) -> dict[str, str]:
                 os.fsync(handle.fileno())
             os.chmod(target, 0o755 if mode == "100755" else 0o644)
             files[name] = sha256_bytes(data)
-    missing = sorted(set(entries) - set(files))
-    if missing:
-        raise ReleaseError(f"archive is missing {', '.join(missing)} (export-ignore attributes are not supported)")
-    return files
 
 
 def manifest_bytes(commit: str, files: dict) -> bytes:
@@ -550,6 +632,8 @@ def read_manifest(release: Path) -> tuple[dict, bytes]:
 
 def verify_release(release: Path, commit: str | None = None) -> dict:
     """Recheck a release directory against its RELEASE.json. Returns the manifest."""
+    if release.is_symlink():
+        raise ReleaseError(f"{release} is a symlink, not a release directory")
     data, raw = read_manifest(release)
     if commit and data["commit"] != commit:
         raise ReleaseError(f"{release} holds commit {data['commit']}, expected {commit}")
@@ -611,6 +695,48 @@ def writable_by_others(path: str | os.PathLike) -> str | None:
     return None
 
 
+def redirect_problem(path: str) -> str | None:
+    """Why another account could make path name a different file; None when none can.
+
+    Follows path one component at a time, through every symlink, and checks each
+    directory an entry is looked up in: one another account can write could
+    replace that entry, unless it is sticky and the entry belongs to this user
+    or root (as in /tmp). Then the final file itself must be writable only by
+    this user or root."""
+    pending = list(reversed(path.split("/")))
+    current, links = "/", 0
+    uid = os.getuid()
+    while pending:
+        part = pending.pop()
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = os.path.dirname(current)
+            continue
+        entry = os.path.join(current, part)
+        problem = writable_by_others(current)
+        if problem:
+            sticky = os.stat(current).st_mode & stat.S_ISVTX
+            try:
+                owner = os.lstat(entry).st_uid
+            except OSError:
+                owner = None
+            if not (sticky and owner in (0, uid)):
+                return f"{current} (which holds {entry}) is {problem}"
+        if os.path.islink(entry):
+            links += 1
+            if links > 40:
+                return f"{path} has too many levels of symbolic links"
+            target = os.readlink(entry)
+            if target.startswith("/"):
+                current = "/"
+            pending.extend(reversed(target.split("/")))
+            continue
+        current = entry
+    problem = writable_by_others(current)
+    return f"{current} is {problem}" if problem else None
+
+
 def inside_git_worktree(path: str) -> str | None:
     """The Git work tree (or repository) directory containing path, if any."""
     directory = Path(path)
@@ -633,11 +759,13 @@ def preflight_interpreter(interpreter: str | os.PathLike, explicit: bool = True)
     if not (os.path.isfile(text) and os.access(text, os.X_OK)):
         raise ReleaseError(f"interpreter {text} is not an executable file")
     real = os.path.realpath(text)
-    for path in (real, os.path.dirname(real)):
-        problem = writable_by_others(path)
-        if problem:
-            raise ReleaseError(f"interpreter {text} resolves to {real}, and {path} is {problem}; "
-                               "use an interpreter only you or root can modify")
+    # Every directory and symlink on the way from the recorded path (which the
+    # shim execs, unresolved, so a venv or a package-manager link keeps working)
+    # to the real file, not just the real file's own directory.
+    problem = redirect_problem(text)
+    if problem:
+        raise ReleaseError(f"interpreter {text} resolves to {real}, and {problem}; "
+                           "use an interpreter only you or root can modify")
     for path in (os.path.dirname(os.path.abspath(text)), os.path.dirname(real)):
         worktree = inside_git_worktree(path)
         if worktree:
@@ -667,12 +795,16 @@ def preflight_interpreter(interpreter: str | os.PathLike, explicit: bool = True)
     return text
 
 
+# The only inherited variables a smoke test sees; everything else (Syndicate,
+# tmux, Python, Git, provider and unrelated variables) is dropped.
+SMOKE_ENV_KEEP = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "USER", "LOGNAME", "TERM")
+
+
 def disposable_env(base: Path) -> dict:
     """A child environment whose HOME, XDG, Codex, Claude, tmp and tmux locations are
-    disposable directories, with no inherited Syndicate, tmux, Python, Git or provider
-    variables. This redirects well-behaved code; it is not a sandbox."""
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("SYNDICATE_", "TMUX", "PYTHON", "GIT_", "CODEX_", "CLAUDE_"))}
+    disposable directories, inheriting only SMOKE_ENV_KEEP. This redirects
+    well-behaved code; it is not a sandbox."""
+    env = {k: v for k, v in os.environ.items() if k in SMOKE_ENV_KEEP}
     for name in ("home", "config", "data", "cache", "codex", "claude", "tmp", "tmux"):
         (base / name).mkdir(mode=0o700)
     env.update(HOME=str(base / "home"), XDG_CONFIG_HOME=str(base / "config"), XDG_DATA_HOME=str(base / "data"),
@@ -737,17 +869,42 @@ def step(message: str) -> None:
     STEPS.append(message)
 
 
-def prepare_root(paths: Paths) -> None:
-    """Create the install root and releases/ with explicit 0755 modes; refuse a
-    root another account can write (it could replace `current` or a release)."""
+def make_dir(path: Path, mode: int) -> None:
+    """Create path with exactly mode (whatever the umask), or tighten an existing
+    directory to at most mode; never loosen it (a 0700 root stays 0700)."""
     try:
-        paths.root.mkdir(parents=True, exist_ok=True)
-        os.chmod(paths.root, 0o755)
-        paths.releases.mkdir(exist_ok=True)
-        os.chmod(paths.releases, 0o755)
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        tighten(path, mode)
+        return
+    os.chmod(path, mode)
+
+
+def make_private_dir(path: Path) -> None:
+    """A 0700 directory (the release-source cache's parent), parents created as needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    make_dir(path, 0o700)
+
+
+@contextmanager
+def open_lock(path: Path):
+    """A 0600 lock file, never followed through a symlink."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "r+b") as handle:
+        yield handle
+
+
+def prepare_root(paths: Paths) -> None:
+    """Create the install root, releases/ and interpreters/ with explicit 0755
+    modes (existing ones are only ever tightened); refuse any another account can
+    write (it could replace `current`, a release or a recorded interpreter)."""
+    try:
+        paths.root.parent.mkdir(parents=True, exist_ok=True)
+        for path in (paths.root, paths.releases, paths.interpreters):
+            make_dir(path, 0o755)
     except OSError as error:
         raise ReleaseError(f"cannot prepare install root {paths.root}: {error}") from None
-    for path in (paths.root, paths.releases):
+    for path in (paths.root, paths.releases, paths.interpreters):
         problem = writable_by_others(path)
         if problem:
             raise ReleaseError(f"install root {path} is {problem}; refusing to activate releases there")
@@ -765,7 +922,7 @@ def check_bin_dir(paths: Paths) -> None:
 @contextmanager
 def activation_lock(paths: Paths):
     prepare_root(paths)
-    with open(paths.lock, "a") as handle:
+    with open_lock(paths.lock) as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -810,7 +967,8 @@ def read_jsonl(path: Path, strict: bool = False) -> list[dict]:
 
 
 def atomic_write(path: Path, data: bytes, mode: int = 0o644) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Replace path atomically. Its directory must already exist (callers create
+    it with an explicit mode)."""
     fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -855,7 +1013,8 @@ def render_shim(paths: Paths) -> str:
 # Stable Syndicate entry point. It resolves the active release once, then
 # execs that release's recorded interpreter, so later activations never change
 # a running invocation. -I keeps PYTHONPATH, PYTHONHOME, the user site and the
-# current directory out of the release's imports. Regenerate with:
+# current directory out of the release's imports; -B writes no bytecode (the
+# launcher sets PYTHONDONTWRITEBYTECODE for its own children). Regenerate with:
 # syndicate-install install-shim
 root={root}
 release=$(CDPATH= cd -P -- "$root/current" 2>/dev/null && pwd -P) || {{
@@ -868,8 +1027,6 @@ if [ -z "$interpreter" ]; then
   echo "syndicate: no interpreter recorded for $release" >&2
   exit 127
 fi
-PYTHONDONTWRITEBYTECODE=1
-export PYTHONDONTWRITEBYTECODE
 exec "$interpreter" -I -B "$release/bin/syndicate" "$@"
 """
 
@@ -955,6 +1112,7 @@ def restore_entrypoint(paths: Paths) -> dict:
     shim = paths.shim
     if (shim.exists() or shim.is_symlink()) and not is_managed_shim(shim):
         raise ReleaseError(f"{shim} is not the managed shim; refusing to overwrite it")
+    ensure_bin_dir(paths)
     kind = record.get("kind")
     if kind == "symlink":
         target = record.get("target")
@@ -1012,10 +1170,15 @@ def stage_release(paths: Paths, approved: dict, entries: dict, archive: bytes,
 def publish(paths: Paths, stage: Path, manifest: dict) -> tuple[Path, bool]:
     """Move a verified stage into releases/<commit>, or reuse an identical one. Caller holds the lock."""
     target = paths.release(manifest["commit"])
-    if target.exists() or target.is_symlink():
+    if target.is_symlink():
+        raise ReleaseError(f"{target} is a symlink, not a release directory; remove it after investigation")
+    if target.exists():
         existing = verify_release(target, manifest["commit"])
-        if existing["files"] != manifest["files"]:
-            raise ReleaseError(f"{target} exists with different contents; remove it after investigation")
+        if (existing["files"] != manifest["files"]
+                or existing["manifest_sha256"] != manifest["manifest_sha256"]):
+            raise ReleaseError(f"{target} exists with different contents (RELEASE.json sha256 "
+                               f"{existing['manifest_sha256']}, expected {manifest['manifest_sha256']}); "
+                               "remove it after investigation")
         remove_tree(stage)
         return target, True
     os.rename(stage, target)
@@ -1048,17 +1211,28 @@ def activate(paths: Paths, commit: str, interpreter: str, record: dict, *, shim:
     return entry
 
 
+# Characters Claude's Bash(...) rule syntax gives meaning to. The launcher
+# omits the relay allow rule for such paths (relays then ask for approval).
+RULE_SYNTAX = "()*"
+
+
 def check_rule_paths(paths: Paths, interpreter: str) -> None:
     """Refuse paths that cannot appear in Claude's relay allow rule.
 
     Sessions grant relays with `Bash(<interpreter> -I -B <release>/bin/syndicate team run-role *)`;
-    a ')' in either path would end that rule early, so relays would be denied or
-    the rule would match the wrong command."""
+    a '(', ')' or '*' in either path would end that rule early or widen it, so
+    relays would be denied or the rule would match the wrong command. Whitespace
+    is allowed but warned about: the launcher then omits the rule and relays ask
+    for approval each time."""
     for label, value in (("install root", str(paths.root)), ("install root", os.path.realpath(paths.root)),
                          ("interpreter", interpreter)):
-        if ")" in value:
-            raise ReleaseError(f"{label} {value} contains ')', which Claude's Bash() permission rule for "
-                               "Syndicate relays cannot express; choose a path without ')'")
+        for char in RULE_SYNTAX:
+            if char in value:
+                raise ReleaseError(f"{label} {value} contains {char!r}, which Claude's Bash() permission rule for "
+                                   f"Syndicate relays cannot express; choose a path without {RULE_SYNTAX!r}")
+        if any(char.isspace() for char in value):
+            log(f"warning: {label} {value} contains whitespace; Claude sessions will not pre-approve Syndicate "
+                "relays, so each relay asks for approval")
 
 
 def check_recorded_manifest(paths: Paths, commit: str, manifest: dict) -> None:
@@ -1182,14 +1356,14 @@ def scan_in_use(paths: Paths) -> tuple[dict[str, str], bool, bool]:
     markers = False
     if paths.in_use.is_dir():
         for marker in paths.in_use.glob("*/*"):
-            if (COMMIT_PATTERN.match(marker.parent.name) and marker.name.isdigit()
+            if (COMMIT_PATTERN.match(marker.parent.name) and DIGITS.fullmatch(marker.name)
                     and pid_alive(int(marker.name))):
                 markers = True
                 used.setdefault(marker.parent.name, f"in-use marker pid {marker.name}")
     scanned = PROC.is_dir() and (PROC / str(os.getpid())).is_dir()
     if scanned:
         for entry in PROC.iterdir():
-            if not entry.name.isdigit():
+            if not DIGITS.fullmatch(entry.name):
                 continue
             try:
                 cmdline = (entry / "cmdline").read_bytes()
@@ -1233,7 +1407,7 @@ def remove_stale_markers(paths: Paths) -> None:
         if directory.is_symlink() or not directory.is_dir():
             continue
         for marker in directory.iterdir():
-            if marker.name.isdigit() and not marker.is_dir() and not pid_alive(int(marker.name)):
+            if DIGITS.fullmatch(marker.name) and not marker.is_dir() and not pid_alive(int(marker.name)):
                 marker.unlink(missing_ok=True)
         try:
             directory.rmdir()
@@ -1251,10 +1425,14 @@ def prune(paths: Paths, dry_run: bool = False, codex_home: Path | None = None, f
         if not dry_run:
             remove_stale_markers(paths)
         used, markers, scanned = scan_in_use(paths)
-        unverified = not scanned and not markers
+        # Markers are written only by launchers that know to; without /proc a
+        # session with no marker (an older release, a CLI the launcher exec'd
+        # into) is invisible, so another session's live marker proves nothing.
+        unverified = not scanned
         if unverified and not dry_run and not force:
-            raise ReleaseError("cannot tell which releases live sessions use: /proc is unavailable and no live "
-                               "in-use marker exists; refusing to prune without --force")
+            raise ReleaseError("cannot tell which releases live sessions use: /proc is unavailable, and in-use "
+                               "markers alone cannot show every live session; refusing to prune without --force "
+                               "(releases with live markers are kept even then)")
         current = current_commit(paths)
         previous = next(iter([c for c in known_good(paths, current) if paths.release(c).is_dir()]), None)
         hooked = hook_releases(paths, codex_home)
@@ -1268,7 +1446,7 @@ def prune(paths: Paths, dry_run: bool = False, codex_home: Path | None = None, f
                 continue
             if name.startswith(STAGING_PREFIX):
                 pid = name[len(STAGING_PREFIX):].split("-", 1)[0]
-                if not (pid.isdigit() and pid_alive(int(pid))):
+                if not (DIGITS.fullmatch(pid) and pid_alive(int(pid))):
                     stale.append(name)
                     if not dry_run:
                         remove_tree(entry)
@@ -1342,14 +1520,15 @@ def hook_provenance(paths: Paths, path: Path) -> str:
     try:
         content = path.read_bytes()
     except OSError as error:
-        raise ReleaseError(f"registered hook {path} cannot be read ({error}); "
-                           "its provenance cannot be verified, so hooks.json was not changed") from None
+        raise ReleaseError(f"registered hook {path} cannot be read ({error}), "
+                           "so its provenance cannot be verified") from None
     commit = release_of(paths, shlex.quote(str(path)))
     if commit:
         manifest, _ = read_manifest(paths.release(commit))
         if manifest["commit"] == commit and manifest["files"].get("hooks/require-review.sh") == sha256_bytes(content):
             return f"release {commit} manifest"
-        raise ReleaseError(f"registered hook {path} does not match its release manifest")
+        raise ReleaseError(f"registered hook {path} does not match its release manifest; the release was changed "
+                           "after installation, so hooks.json was not changed")
     checkout = path.parent.parent
     top = git(checkout, "rev-parse", "--show-toplevel", check=False)
     if top.returncode == 0 and os.path.realpath(top.stdout.strip()) == os.path.realpath(checkout):
@@ -1357,10 +1536,8 @@ def hook_provenance(paths: Paths, path: Path) -> str:
         committed = git(checkout, "cat-file", "blob", "HEAD:hooks/require-review.sh", binary=True, check=False)
         if committed.returncode == 0 and committed.stdout == content:
             return f"checkout {checkout} HEAD {head}"
-        raise ReleaseError(f"registered hook {path} differs from {checkout} HEAD:hooks/require-review.sh; "
-                           "hooks.json was not changed")
-    raise ReleaseError(f"registered hook {path} is neither in a Git checkout nor in a retained release; "
-                       "hooks.json was not changed")
+        raise ReleaseError(f"registered hook {path} differs from {checkout} HEAD:hooks/require-review.sh")
+    raise ReleaseError(f"registered hook {path} is neither in a Git checkout nor in a retained release")
 
 
 def load_json_strict(raw: bytes, label: str):
@@ -1386,8 +1563,12 @@ def migrate_codex_hook(paths: Paths, codex_home: Path, target: str | None = None
     """Point the registered Syndicate Stop hook at a release's gate script.
 
     Touches only hooks whose command is exactly one verified Syndicate
-    require-review.sh path; preserves every other entry, sibling and field.
-    Runs under the activation lock, so prune cannot remove the target meanwhile.
+    require-review.sh path; preserves every other entry, sibling and field. A
+    require-review.sh hook whose provenance cannot be verified (another
+    project's script of the same name, a dirty checkout) is left untouched with
+    a warning; one in a retained release that no longer matches its manifest
+    stops the migration. Runs under the activation lock, so prune cannot remove
+    the target meanwhile.
     """
     with activation_lock(paths):
         return _migrate_codex_hook(paths, codex_home, target, dry_run)
@@ -1418,7 +1599,7 @@ def _migrate_codex_hook(paths: Paths, codex_home: Path, target: str | None, dry_
     stop = data.get("hooks", {}).get("Stop") if isinstance(data, dict) and isinstance(data.get("hooks"), dict) else None
     if not isinstance(stop, list):
         return {"changed": False, "reason": "no Stop hooks are registered"}
-    changes, provenance = [], {}
+    changes, provenance, skipped = [], {}, []
     seen_new = False
     new_stop = []
     for entry in stop:
@@ -1441,7 +1622,15 @@ def _migrate_codex_hook(paths: Paths, codex_home: Path, target: str | None, dry_
                 seen_new = True
                 hooks.append(hook)
                 continue
-            provenance[command] = hook_provenance(paths, path)
+            try:
+                provenance[command] = hook_provenance(paths, path)
+            except ReleaseError as error:
+                if release_of(paths, command):
+                    raise  # this install's own release was changed: stop, change nothing
+                skipped.append({"command": command, "reason": str(error)})
+                log(f"warning: leaving Stop hook {command} unchanged: {error}")
+                hooks.append(hook)
+                continue
             touched = True
             if seen_new:
                 changes.append({"removed": command, "provenance": provenance[command]})
@@ -1453,10 +1642,14 @@ def _migrate_codex_hook(paths: Paths, codex_home: Path, target: str | None, dry_
             continue  # the entry held only the replaced Syndicate hook, now carried elsewhere
         new_stop.append({**entry, "hooks": hooks} if touched else entry)
     if not changes:
-        reason = "already registered" if seen_new else "no Syndicate Stop hook is registered (not adding one)"
-        return {"changed": False, "reason": reason, "command": new_command}
+        reason = ("already registered" if seen_new else
+                  "no verifiable Syndicate Stop hook is registered (not adding one)" if skipped else
+                  "no Syndicate Stop hook is registered (not adding one)")
+        if skipped:
+            reason += f"; left {len(skipped)} unverifiable require-review.sh hook(s) unchanged"
+        return {"changed": False, "reason": reason, "command": new_command, "skipped": skipped}
     result = {"changed": not dry_run, "dry_run": dry_run, "changes": changes, "command": new_command,
-              "path": str(hooks_link)}
+              "path": str(hooks_link), "skipped": skipped}
     if hooks_path != hooks_link:
         result["resolved_path"] = str(hooks_path)
     if dry_run:
@@ -1544,7 +1737,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--codex-home", help="also keep releases registered in this CODEX_HOME's hooks.json")
     p.add_argument("--force", action="store_true",
-                   help="prune even when liveness cannot be checked (no /proc and no in-use markers)")
+                   help="prune even when liveness cannot be fully checked (no /proc); live markers still keep releases")
     p = sub.add_parser("install-shim", parents=[common], help="(re)write the stable entry point")
     p.add_argument("--force", action="store_true",
                    help="replace a managed entry point that belongs to another install root")
@@ -1617,7 +1810,7 @@ def main(argv: list[str] | None = None) -> int:
                                          + [f"stale staging: {s}" for s in result["stale_staging"]]
                                          + [f"interrupted prune leftover: {s}" for s in result["stale_trash"]]
                                          + [f"ignored (not a release directory): {s}" for s in result["ignored"]]
-                                         + (["warning: liveness unverified (no /proc, no in-use markers)"]
+                                         + (["warning: liveness unverified (no /proc; only in-use markers checked)"]
                                             if result["liveness_unverified"] else [])))
         elif args.command == "install-shim":
             with activation_lock(paths):
@@ -1631,11 +1824,14 @@ def main(argv: list[str] | None = None) -> int:
             codex_home = Path(args.codex_home) if args.codex_home else codex_default
             result = migrate_codex_hook(paths, codex_home, args.target, args.dry_run)
             lines = [f"{'would change' if args.dry_run else 'changed'}: {c}" for c in result.get("changes", [])]
+            lines += [f"left unchanged (unverified): {s['command']}: {s['reason']}" for s in result.get("skipped", [])]
             if result.get("backup"):
                 lines.append(f"backup: {result['backup']}")
             if result.get("changes") and not args.dry_run:
                 lines.append("Open 'codex' and approve the changed hook in the normal hook review prompt.")
-            emit(args, result, "\n".join(lines) or result.get("reason", "nothing to do"))
+            if not result.get("changes"):
+                lines.insert(0, result.get("reason", "nothing to do"))
+            emit(args, result, "\n".join(lines))
     except ReleaseError as error:
         report_failure(args.command, str(error))
         return 1

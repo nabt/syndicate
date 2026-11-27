@@ -1058,8 +1058,13 @@ class MonitorTransition(RehearsalCase):
         def running():
             owners = self.monitor_lock_owners()
             procs = self.monitor_processes()
+            # monitor.json must be the lock owner's own record: a restarted monitor
+            # holds the lock before it rewrites the record its predecessor left
+            # (which can name the same release).
+            state = read_json(self.limits / "monitor.json", {}) or {}
             if (self.monitor_lock_state() == "held" and len(owners) == 1 and set(owners) == set(procs)
-                    and not set(owners) & set(exclude) and self.monitor_release().get("commit") == commit):
+                    and not set(owners) & set(exclude) and state.get("pid") in owners
+                    and (state.get("release") or {}).get("commit") == commit):
                 return owners
             return None
         owners = self.wait_for(running, f"monitor of release {commit}", timeout=60)
@@ -1326,20 +1331,21 @@ class FirstCutoverFallback(RehearsalCase):
         project = self.make_project("delta")
 
         # Record a fallback pinned to a verified commit, in a preserved snapshot
-        # outside the editable checkout (its own clone, detached at the commit).
+        # outside the editable checkout: exactly the documented procedure
+        # (docs/user-install.md, first cutover), run as shell commands.
         verified = run_git(editable, "rev-parse", "HEAD", env=self.env)
         self.assertEqual(verified, a)
         snapshot = self.home / ".local" / "share" / "syndicate-fallback" / verified
-        snapshot.parent.mkdir(parents=True)
-        subprocess.run(["git", "clone", "-q", "--no-checkout", str(editable), str(snapshot)], check=True,
-                       env=self.env, capture_output=True)
-        run_git(snapshot, "checkout", "-q", "--detach", verified, env=self.env)
-        for directory, dirs, files in os.walk(snapshot):
-            dirs[:] = [d for d in dirs if d != ".git"]
-            for name in files:
-                path = Path(directory) / name
-                path.chmod(stat.S_IMODE(path.stat().st_mode) & ~0o222)
-        fallback_prefix = [PYTHON, "-B", str(snapshot / "bin" / "syndicate")]
+        procedure = (
+            'mkdir -p "$(dirname "$fallback")"\n'
+            'git clone --quiet --no-checkout "$checkout" "$fallback"\n'
+            'git -C "$fallback" checkout --quiet --detach "$commit"\n'
+            'find "$fallback" -path "$fallback/.git" -prune -o -type f -exec chmod a-w {} +\n')
+        subprocess.run(["sh", "-ec", procedure], check=True, capture_output=True, timeout=120,
+                       env=dict(self.env, checkout=str(editable), fallback=str(snapshot), commit=verified))
+        for path in (snapshot / "bin" / "syndicate", snapshot / "roles" / "backend-engineer.md"):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode) & 0o222, 0)
+        fallback_prefix = [PYTHON, "-I", "-B", str(snapshot / "bin" / "syndicate")]
         record = dict(commit=verified, prefix=fallback_prefix,
                       assets={name: str(snapshot / name) for name in ("roles", "skills", "web",
                                                                        "hooks/require-review.sh")},
