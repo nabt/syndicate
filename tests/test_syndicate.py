@@ -16,6 +16,11 @@ import unittest.mock
 from pathlib import Path
 
 sys.dont_write_bytecode = True
+# The suite runs with bytecode disabled, and so do its children: stand-in
+# provider CLIs are Python scripts that import this checkout's modules without
+# -B. Set before the launcher loads, so it records this as the caller's own
+# setting, which provider CLI children get back (identity.session_env).
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 BIN = Path(__file__).resolve().parent.parent / "bin" / "syndicate"
 loader = importlib.machinery.SourceFileLoader("syndicate", str(BIN))
 spec = importlib.util.spec_from_loader("syndicate", loader)

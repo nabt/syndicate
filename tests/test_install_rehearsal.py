@@ -1391,7 +1391,7 @@ class FirstCutoverFallback(RehearsalCase):
         self.assertTrue(rel.is_managed_shim(self.shim))
         restored = json.loads(record_path.read_text())
         temp = self.shim.with_name(".syndicate.fallback")
-        temp.symlink_to(Path(restored["prefix"][2]))
+        temp.symlink_to(Path(restored["prefix"][-1]))
         os.replace(temp, self.shim)
 
         # Now the editable checkout moves on: a new commit and a dirty launcher edit.

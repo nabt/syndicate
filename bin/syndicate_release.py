@@ -737,11 +737,28 @@ def redirect_problem(path: str) -> str | None:
     return f"{current} is {problem}" if problem else None
 
 
+def is_git_marker(path: Path) -> bool:
+    """True when path is a real .git: a directory with HEAD, or a 'gitdir:' file.
+
+    An empty .git directory is not a repository; Codex's sandbox creates such
+    placeholders (for example /tmp/.git) on the host while a sandboxed command
+    runs, and they must not make every path below them look like a work tree."""
+    try:
+        if path.is_dir():
+            return (path / "HEAD").exists()
+        if path.is_file():
+            with open(path, "rb") as handle:
+                return handle.read(7) == b"gitdir:"
+    except OSError:
+        return True  # unreadable: assume it is one
+    return False
+
+
 def inside_git_worktree(path: str) -> str | None:
     """The Git work tree (or repository) directory containing path, if any."""
     directory = Path(path)
     for candidate in (directory, *directory.parents):
-        if os.path.lexists(candidate / ".git"):
+        if is_git_marker(candidate / ".git"):
             return str(candidate)
     return None
 

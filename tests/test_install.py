@@ -1412,12 +1412,17 @@ class InterpreterTrust(InstallCase):
         project = self.tmp / "project"
         (project / ".venv" / "bin").mkdir(parents=True)
         (project / ".git").mkdir()
+        (project / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
         inside = project / ".venv" / "bin" / "python3"
         inside.symlink_to(wrapper)
         with self.assertRaisesRegex(rel.ReleaseError, "Git work tree"):
             rel.preflight_interpreter(str(inside))
         result = self.install("v1.0.0", "--python", str(inside), ok=False)
         self.assertIn("Git work tree", result.stderr)
+        # An empty .git placeholder (Codex's sandbox leaves them on the host) is not a work tree.
+        (self.tmp / ".git").mkdir()
+        self.assertEqual(rel.preflight_interpreter(str(wrapper)), str(wrapper))
+        (self.tmp / ".git").rmdir()
 
 
 class EnvironmentIsolation(InstallCase):
