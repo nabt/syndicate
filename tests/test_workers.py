@@ -192,6 +192,32 @@ class Workers(ProjectCase):
         self.assertEqual(bound[-2:], ['detach-client', 'send-keys F12'])
         self.assertIn('#{session_name},the-syndicate', bound[8])
 
+    def test_leaving_tmux_clears_mouse_tracking(self):
+        class Tty:
+            def __init__(self):
+                self.buffer = io.BytesIO()
+
+            def isatty(self):
+                return True
+
+            def fileno(self):
+                return 0
+
+        fake = Tty()
+        saved = ['original']
+        environment = {key: value for key, value in sy.os.environ.items() if key != 'TMUX'}
+        with patch.object(sy, '_arm_detach_binding'), \
+             patch.object(sy.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run, \
+             patch.object(sy.sys, 'stdin', fake), \
+             patch.object(sy.sys, 'stdout', fake), \
+             patch.object(sy.runtime.termios, 'tcgetattr', return_value=saved), \
+             patch.object(sy.runtime.termios, 'tcsetattr') as restore, \
+             patch.dict(sy.os.environ, environment, clear=True):
+            self.assertEqual(sy.focus_target('the-syndicate:example'), 0)
+        restore.assert_called_once_with(fake, sy.runtime.termios.TCSADRAIN, saved)
+        self.assertEqual(fake.buffer.getvalue(), sy.runtime.TERMINAL_MODES_OFF)
+        self.assertEqual(run.call_args.args[0], ['tmux', 'attach-session', '-t', 'the-syndicate:example'])
+
 
 class WorkerIntegration(ProjectCase):
     def socket(self):

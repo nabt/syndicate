@@ -1615,7 +1615,7 @@ class DetachedWorkers(unittest.TestCase):
                         os.kill(pid, signal.SIGKILL)
 
 class TerminalIntegration(unittest.TestCase):
-    def test_interactive_cli_receives_terminal_and_input(self):
+    def run_pty(self, cli, send=None, ready=None, interrupt_on=None, timeout=8):
         import pty
         import select
         with tempfile.TemporaryDirectory() as tmp:
@@ -1625,7 +1625,6 @@ class TerminalIntegration(unittest.TestCase):
                 try:
                     rt.STATE = project / 'limits'
                     rt.save_observation('claude', {'rate_limits': {'five_hour': {'used_percentage': 20}}})
-                    cli = "import sys; assert sys.stdin.isatty(); print('CLI_READY', flush=True); print('ANSWER='+input(), flush=True)"
                     result, handoff = rt.supervise([sys.executable, '-c', cli], project,
                                                   {'claude'}, 10, 'task', 'claude')
                     os._exit(0 if result == 0 and handoff is None else 1)
@@ -1633,9 +1632,10 @@ class TerminalIntegration(unittest.TestCase):
                     os._exit(2)
             output = b''
             sent = False
+            interrupted = False
             status = None
             try:
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
                     readable, _, _ = select.select([master], [], [], .1)
                     if readable:
@@ -1644,21 +1644,89 @@ class TerminalIntegration(unittest.TestCase):
                         except OSError:
                             chunk = b''
                         output += chunk
-                        if b'CLI_READY' in output and not sent:
-                            os.write(master, b'hello\n')
+                        if send and ready and ready in output and not sent:
+                            os.write(master, send)
                             sent = True
+                        if interrupt_on and interrupt_on in output and not interrupted:
+                            os.kill(pid, signal.SIGINT)
+                            interrupted = True
                     waited, child_status = os.waitpid(pid, os.WNOHANG)
                     if waited:
                         status = child_status
                         break
-                self.assertIsNotNone(status, 'supervisor did not exit')
-                self.assertEqual(os.waitstatus_to_exitcode(status), 0, output)
-                self.assertIn(b'ANSWER=hello', output)
+                else:
+                    self.fail(f'supervisor did not exit: {output!r}')
+                # Exit can race the last write (the mouse-tracking cleanup).
+                while True:
+                    readable, _, _ = select.select([master], [], [], .2)
+                    if not readable:
+                        break
+                    try:
+                        chunk = os.read(master, 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    output += chunk
+                return os.waitstatus_to_exitcode(status), output
             finally:
                 if status is None:
                     os.kill(pid, signal.SIGTERM)
                     os.waitpid(pid, 0)
                 os.close(master)
+
+    def assert_mouse_tracking_released(self, output):
+        enabled = output.rfind(b'\x1b[?1006h')
+        released = output.rfind(b'\x1b[?1006l')
+        self.assertGreaterEqual(enabled, 0, output)
+        self.assertGreater(released, enabled, output)
+        for token in (b'\x1b[?1000l', b'\x1b[?1002l', b'\x1b[?1003l', b'\x1b[?1006l'):
+            self.assertIn(token, output)
+
+    def test_interactive_cli_receives_terminal_and_input(self):
+        cli = "import sys; assert sys.stdin.isatty(); print('CLI_READY', flush=True); print('ANSWER='+input(), flush=True)"
+        code, output = self.run_pty(cli, send=b'hello\n', ready=b'CLI_READY')
+        self.assertEqual(code, 0, output)
+        self.assertIn(b'ANSWER=hello', output)
+        for token in (b'\x1b[?1000l', b'\x1b[?1003l', b'\x1b[?1006l'):
+            self.assertIn(token, output)
+
+    def test_clean_exit_disables_mouse_tracking(self):
+        cli = "import sys; sys.stdout.write('\\x1b[?1000h\\x1b[?1003h\\x1b[?1006h'); sys.stdout.flush()"
+        code, output = self.run_pty(cli)
+        self.assertEqual(code, 0, output)
+        self.assert_mouse_tracking_released(output)
+
+    def test_killed_cli_disables_mouse_tracking(self):
+        cli = (
+            "import signal,sys,time; "
+            "signal.signal(signal.SIGINT, signal.SIG_IGN); "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "sys.stdout.write('\\x1b[?1000h\\x1b[?1003h\\x1b[?1006h'); "
+            "sys.stdout.flush(); "
+            "time.sleep(30)"
+        )
+        code, output = self.run_pty(cli, interrupt_on=b'\x1b[?1006h', timeout=15)
+        self.assertEqual(code, 1, output)
+        self.assert_mouse_tracking_released(output)
+
+    def test_release_skips_a_pipe(self):
+        class Pipe:
+            def __init__(self):
+                self.buffer = io.BytesIO()
+                self.writes = 0
+
+            def isatty(self):
+                return False
+
+            def write(self, data):
+                self.writes += 1
+                return len(data)
+
+        pipe = Pipe()
+        rt.release_terminal_modes(pipe)
+        self.assertEqual(pipe.buffer.getvalue(), b'')
+        self.assertEqual(pipe.writes, 0)
 
 
 class LaunchChoice(ProjectCase):
