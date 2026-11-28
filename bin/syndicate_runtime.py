@@ -1251,6 +1251,63 @@ def stop_group(proc, known=None):
     proc.wait()
 
 
+# Private modes a full-screen CLI turns on. They are not termios state, so
+# restoring the tty with tcsetattr leaves them set. A handoff signal, a normal
+# exit, or the tmux server stopping can all drop the CLI before its own
+# disable sequence reaches the outer terminal; tmux then keeps mouse tracking
+# on until the tty is reset. Disabling a mode that is already off is a no-op.
+TERMINAL_MODES_OFF = (
+    b"\x1b[?1000l"   # normal mouse tracking
+    b"\x1b[?1002l"   # button-event tracking
+    b"\x1b[?1003l"   # any-event tracking
+    b"\x1b[?1005l"   # UTF-8 mouse tracking
+    b"\x1b[?1006l"   # SGR mouse tracking
+    b"\x1b[?1015l"   # urxvt mouse tracking
+    b"\x1b[?1004l"   # focus reporting
+    b"\x1b[?2004l"   # bracketed paste
+    b"\x1b[?2026l"   # synchronized output
+    b"\x1b[?1049l"   # leave the alternate screen
+    b"\x1b[?25h"     # show the cursor
+    b"\x1b[>0u"      # kitty keyboard protocol off
+    b"\x1b[>4;0m"    # xterm modifyOtherKeys off
+)
+
+
+def terminal_modes():
+    """termios attributes to restore, or None when stdin is not a tty."""
+    if not sys.stdin.isatty():
+        return None
+    return termios.tcgetattr(sys.stdin)
+
+
+def release_terminal_modes(stream=None):
+    """Turn off mouse tracking and the other modes a CLI may have left on."""
+    stream = sys.stdout if stream is None else stream
+    try:
+        if not stream.isatty():
+            return
+        buffer = stream.buffer if hasattr(stream, "buffer") else stream
+        buffer.write(TERMINAL_MODES_OFF)
+        buffer.flush()
+    except (OSError, ValueError):
+        return
+
+
+def restore_terminal(saved):
+    """Restore termios and clear mouse tracking left behind by a CLI or tmux.
+
+    saved is a termios snapshot from before the child changed the tty, or None
+    when this process did not take the tty. Mouse tracking survives tcsetattr,
+    so the disable sequence is always sent when there is a snapshot.
+    """
+    if saved is None:
+        return
+    try:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
+    finally:
+        release_terminal_modes()
+
+
 def write_run_record(project, task, host, threshold, task_owner):
     run_id = time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     record = {"id": run_id, "task": task, "provider": host,
@@ -1357,6 +1414,27 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
     def interrupted(*_):
         raise KeyboardInterrupt
     old_signals = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    log_path = local / "runs" / f"{run_id}.log"
+
+    def drain(log):
+        """Forward CLI bytes already sitting in the pipe or pty."""
+        for key in list(sel.get_map().values()):
+            if key.data == "input":
+                continue
+            os.set_blocking(key.fd, False)
+            while True:
+                try:
+                    chunk = os.read(key.fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                log.write(chunk)
+                log.flush()
+                output = sys.stderr if key.data == "error" else sys.stdout
+                output.buffer.write(chunk)
+                output.buffer.flush()
+
     reason = None
     workers = {}
     lease_failed = False  # warn once while lease evaluation itself breaks; reset on recovery
@@ -1384,7 +1462,7 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
                 print(f"syndicate: could not record the CLI owner: {error}", file=sys.stderr)
         if interactive:
             tty.setraw(sys.stdin)
-        with (local / "runs" / f"{run_id}.log").open("wb") as log:
+        with log_path.open("wb") as log:
             while proc.poll() is None:
                 for key, _ in sel.select(0.25):
                     try:
@@ -1456,27 +1534,23 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
                     delivery.tick(now)
             # Drain bytes already written by a fast-exiting CLI. Do not wait
             # for worker-held descriptors after the leader exits.
-            for key in list(sel.get_map().values()):
-                if key.data == "input":
-                    continue
-                os.set_blocking(key.fd, False)
-                while True:
-                    try:
-                        chunk = os.read(key.fd, 65536)
-                    except OSError:
-                        break
-                    if not chunk:
-                        break
-                    log.write(chunk)
-                    output = sys.stderr if key.data == "error" else sys.stdout
-                    output.buffer.write(chunk)
-                    output.buffer.flush()
+            drain(log)
     except KeyboardInterrupt:
         reason = "Interrupted by user"
     finally:
+        # A handoff stops the CLI with a signal. Mouse-tracking cleanup is
+        # written only as it dies, after the loop has already drained, so read
+        # the pty once more before closing it. Then clear tracking ourselves:
+        # SIGKILL never lets the CLI write those sequences, and termios
+        # restore does not turn them off.
         stop_group(proc, workers)
         if delivery:
             delivery.close()
+        try:
+            with log_path.open("ab") as log:
+                drain(log)
+        except OSError:
+            pass
         sel.close()
         if master is not None:
             os.close(master)
@@ -1486,8 +1560,7 @@ def supervise(argv, project, providers, threshold, task, host, headless=False, l
         signal.signal(signal.SIGWINCH, old_winch)
         for sig, handler in old_signals.items():
             signal.signal(sig, handler)
-        if old_terminal is not None:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_terminal)
+        restore_terminal(old_terminal)
     if reason is None and proc.returncode != 0:
         reason = f"{host} exited with status {proc.returncode}; verify interrupted work"
     if reason:

@@ -1488,6 +1488,21 @@ def _release_replaced_windows(name, socket=None):
             raise SyndicateError(removed.stderr.strip() or f'could not replace tmux window {name}')
 
 
+def _attach_tmux(attach):
+    """Attach, then leave this tty usable when the client returns.
+
+    The tmux client turns on mouse tracking for the outer terminal. A handoff
+    or a finished task can stop the server before that client disables it, so
+    the shell comes back with tracking still on and needs a full tty reset.
+    Snapshot termios before attach and clear the modes termios does not cover.
+    """
+    saved = runtime.terminal_modes()
+    try:
+        return subprocess.run(attach).returncode
+    finally:
+        runtime.restore_terminal(saved)
+
+
 def launch_tmux(argv, directory, name, headless=False, socket=None):
     """Run the launcher in one window of the shared `the-syndicate` session.
 
@@ -1512,7 +1527,7 @@ def launch_tmux(argv, directory, name, headless=False, socket=None):
               f'{shlex.join(["syndicate", "show", name])}')
         if sys.stdin.isatty() and sys.stdout.isatty() and not os.environ.get('TMUX'):
             _arm_detach_binding(socket)
-            return subprocess.run(attach).returncode
+            return _attach_tmux(attach)
         return 0
     with tempfile.TemporaryDirectory(prefix='syndicate-tmux-') as tmp:
         output, errors, code = (Path(tmp) / part for part in ('stdout', 'stderr', 'exit'))
@@ -1734,7 +1749,7 @@ def focus_target(target, socket=None):
     if socket:
         attach += ['-L', socket]
     attach += ['attach-session', '-t', target]
-    return subprocess.run(attach).returncode
+    return _attach_tmux(attach)
 
 
 def open_worker_view(names, socket=None):
