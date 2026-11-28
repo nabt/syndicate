@@ -2051,3 +2051,268 @@ class PrunedHookRelease(InstallCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UpstreamForms(InstallCase):
+    """Batch 5: only absolute paths, allowed URL schemes and scp-like forms; local upstreams exactly as named."""
+
+    def setUp(self):
+        super().setUp()
+        self.before = (None, [])
+
+    def refused(self, message, *args):
+        result = self.installer("install", "--tag", "v1.0.0", *args, ok=False)
+        self.assertIn(message, result.stderr)
+        self.assert_unchanged(*self.before)
+        return result
+
+    def test_accepted_and_refused_forms(self):
+        for upstream in ("/srv/git/syndicate.git", "https://github.com/nabt/syndicate.git",
+                         "ssh://git@example.com:2222/nabt/syndicate.git", "ssh://[::1]/srv/syndicate.git",
+                         "git://example.com/syndicate.git", "file:///srv/git/syndicate.git",
+                         "git@github.com:nabt/syndicate.git", "example.com:syndicate.git",
+                         "host:path/with:colon"):
+            with self.subTest(accepted=upstream):
+                rel.check_upstream_form(upstream)
+        for upstream, message in (
+                ("upstream", "absolute path"), ("../../chk:z", "absolute path"), ("./x:y", "absolute path"),
+                ("relative/dir", "absolute path"), ("-upload-pack=x", "absolute path"), ("", "absolute path"),
+                ("http://example.com/x.git", "absolute path"), ("ftp://example.com/x.git", "absolute path"),
+                ("HTTPS://example.com/x.git", "absolute path"), ("file://relative/x.git", "file://"),
+                ("file:///srv/%2e%2e/x.git", "file://"), ("file://", "file://"),
+                ("ext::sh -c touch% /tmp/pwned", "<transport>::"), ("fd::0", "<transport>::"),
+                ("fd::0,1", "<transport>::"), ("https::example.com/x", "<transport>::"),
+                ("host::path", "absolute path"), ("u@-oProxyCommand=x:path", "absolute path"),
+                ("[::1]:path", "absolute path"), ("/srv/x\n", "absolute path")):
+            with self.subTest(refused=upstream):
+                with self.assertRaisesRegex(rel.ReleaseError, message.replace("(", r"\(")):
+                    rel.check_upstream_form(upstream)
+
+    def test_a_relative_existing_directory_is_made_absolute(self):
+        copy = self.tmp / "relative upstream.git"
+        shutil.copytree(FIXTURE["upstream"], copy)
+        self.installer("install", "--tag", "v1.0.0", "--upstream", "../relative upstream.git")
+        self.assertEqual(self.current(), FIXTURE["a"])
+        self.assertEqual(self.records()[-1]["upstream"], str(copy))
+        self.assertEqual(run_git(self.paths.cache, "config", "remote.upstream.url"), str(copy))
+
+    def test_suffix_probing_and_colon_paths_are_refused(self):
+        # A checkout at chk.git (so Git would find chk.git/.git for "chk"), and
+        # a bare repository holding a .git (which upload-pack would prefer).
+        run_git(self.tmp, "clone", "-q", str(FIXTURE["upstream"]), str(self.tmp / "chk.git"))
+        holder = self.tmp / "holder.git"
+        shutil.copytree(FIXTURE["upstream"], holder)
+        run_git(self.tmp, "clone", "-q", str(FIXTURE["upstream"]), str(holder / ".git-src"))
+        (holder / ".git").write_text(f"gitdir: {holder / '.git-src' / '.git'}\n")
+        for upstream, message in ((str(self.tmp / "chk"), "does not exist as a directory"),
+                                  (f"file://{self.tmp / 'chk'}", "does not exist as a directory"),
+                                  (str(self.tmp / "chk.git"), "not a bare repository"),
+                                  (f"file://{self.tmp / 'chk.git'}", "not a bare repository"),
+                                  (str(holder), "not a bare repository"),
+                                  ("../../chk:z", "absolute path")):
+            with self.subTest(upstream=upstream):
+                self.refused(message, "--upstream", upstream)
+        # A file:// URL naming a bare repository exactly works.
+        self.installer("install", "--tag", "v1.0.0", "--upstream", f"file://{FIXTURE['upstream']}")
+        self.assertEqual(self.current(), FIXTURE["a"])
+
+    def test_recorded_upstream_gets_the_same_checks(self):
+        self.install("v1.0.0")
+        self.before = (self.current(), self.release_entries())
+        run_git(self.tmp, "clone", "-q", str(FIXTURE["upstream"]), str(self.tmp / "chk.git"))
+        for recorded in (str(self.tmp / "chk"), f"file://{self.tmp / 'chk'}", "../../chk:z", "fd::0"):
+            with self.subTest(recorded=recorded):
+                run_git(self.paths.cache, "config", "remote.upstream.url", recorded)
+                result = self.refused("no longer acceptable")
+                self.assertIn("--upstream ABSOLUTE-PATH|URL --change-upstream", result.stderr)
+        self.installer("install", "--tag", "v1.1.0", "--upstream", str(FIXTURE["upstream"]), "--change-upstream")
+        self.assertEqual(self.current(), FIXTURE["b"])
+
+    def test_insteadof_rewrites_are_refused(self):
+        self.install("v1.0.0")
+        self.before = (self.current(), self.release_entries())
+        evil = self.tmp / "evil.git"
+        shutil.copytree(FIXTURE["upstream"], evil)
+        run_git(evil, "update-ref", "refs/heads/main", FIXTURE["side"])
+        run_git(evil, "tag", "-f", "v1.1.0", FIXTURE["side"])
+        global_config = self.tmp / "gitconfig"
+        for text in (f'[url "{evil}"]\n\tinsteadOf = {FIXTURE["upstream"]}\n',
+                     f'[remote "{FIXTURE["upstream"]}"]\n\turl = {evil}\n'):
+            with self.subTest(config=text):
+                global_config.write_text(text)
+                self.env["GIT_CONFIG_GLOBAL"] = str(global_config)
+                result = self.installer("install", "--tag", "v1.1.0", ok=False)
+                self.assertIn("rewrites upstream", result.stderr)
+                self.assert_unchanged(*self.before)
+        self.env["GIT_CONFIG_GLOBAL"] = os.devnull
+        self.install("v1.1.0")
+        self.assertEqual(self.current(), FIXTURE["b"])
+
+    def test_network_git_calls_pin_protocols_and_are_bounded(self):
+        self.install("v1.0.0")
+        calls = []
+        real_git = rel.git
+
+        def spy(repo, *args, **kwargs):
+            if "fetch" in args or "ls-remote" in args:
+                calls.append((args, kwargs, kwargs.get("options", ())))
+            return real_git(repo, *args, **kwargs)
+
+        with mock.patch.object(rel, "git", side_effect=spy):
+            rel.resolve_approved_tag(self.paths, "v1.1.0", None)
+        self.assertEqual(sorted(sum(("fetch" in a, "ls-remote" in a) for a, _, _ in calls)
+                                if False else ["fetch" if "fetch" in a else "ls-remote" for a, _, _ in calls]),
+                         ["fetch", "fetch", "ls-remote"])
+        for args, kwargs, options in calls:
+            command = [*options, *args]
+            start = command.index("protocol.allow=never") - 1
+            self.assertEqual(command[start:start + len(rel.PROTOCOL_OPTIONS)], list(rel.PROTOCOL_OPTIONS))
+            self.assertEqual(kwargs.get("timeout"), rel.GIT_NETWORK_TIMEOUT)
+            self.assertIn("safe.directory=", options)
+
+
+class ObjectPoisoning(InstallCase):
+    """Batch 5: content substituted under a genuine object id in the cache is refused."""
+
+    def setUp(self):
+        super().setUp()
+        self.install("v1.0.0")
+        self.cache = self.paths.cache
+        self.before = (self.current(), self.release_entries())
+        # Explode every pack into loose objects, as a cache that only ever fetched little would be.
+        packs = self.cache / "objects" / "pack"
+        for pack in sorted(packs.glob("*.pack")):
+            moved = self.tmp / pack.name
+            shutil.move(pack, moved)
+            pack.with_suffix(".idx").unlink()
+            for other in pack.parent.glob(pack.stem + ".*"):
+                other.unlink()
+            with open(moved, "rb") as handle:
+                subprocess.run(["git", "-C", str(self.cache), "unpack-objects", "-q"], stdin=handle, check=True,
+                               env=FIXTURE["env"])
+
+    def loose(self, oid):
+        return self.cache / "objects" / oid[:2] / oid[2:]
+
+    def forge(self, oid, kind, content):
+        import zlib
+        path = self.loose(oid)
+        self.assertTrue(path.is_file(), path)
+        path.chmod(0o644)
+        path.write_bytes(zlib.compress(b"%s %d\0" % (kind, len(content)) + content))
+
+    def test_a_forged_subtree_under_the_genuine_id_is_refused(self):
+        b = FIXTURE["b"]
+        bin_tree = run_git(self.cache, "rev-parse", f"{b}:bin")
+        evil_blob = subprocess.run(["git", "-C", str(self.cache), "hash-object", "-w", "--stdin"],
+                                   input=b"#!/bin/sh\necho forged\n", capture_output=True, check=True,
+                                   env=FIXTURE["env"]).stdout.decode().strip()
+        listing = run_git(self.cache, "ls-tree", f"{b}:bin")
+        forged_listing = "\n".join(line.rsplit(" ", 1)[0].rsplit(" ", 1)[0] + f" blob {evil_blob}\tsyndicate"
+                                   if line.endswith("\tsyndicate") else line for line in listing.splitlines())
+        forged_tree = subprocess.run(["git", "-C", str(self.cache), "mktree"], input=forged_listing + "\n",
+                                     capture_output=True, text=True, check=True, env=FIXTURE["env"]).stdout.strip()
+        with open(self.loose(forged_tree), "rb") as handle:
+            import zlib
+            raw = zlib.decompress(handle.read())
+        self.forge(bin_tree, b"tree", raw.split(b"\0", 1)[1])
+        # Plain Git now reads the forged script under the genuine commit.
+        self.assertEqual(run_git(self.cache, "rev-parse", f"{b}:bin/syndicate"), evil_blob)
+        result = self.install("v1.1.0", ok=False)
+        self.assertIn(f"object {bin_tree} in the release-source cache does not hash to its id", result.stderr)
+        self.assert_unchanged(*self.before)
+
+    def test_forged_commits_and_blobs_are_refused(self):
+        b, c = FIXTURE["b"], FIXTURE["c"]
+        for oid, kind, mutate in ((c, b"commit", lambda d: d.replace(b"release C", b"release X")),
+                                  (run_git(self.cache, "rev-parse", f"{b}:README.md"), b"blob",
+                                   lambda d: d + b"forged\n")):
+            with self.subTest(kind=kind):
+                original = self.loose(oid).read_bytes()
+                import zlib
+                content = zlib.decompress(original).split(b"\0", 1)[1]
+                self.forge(oid, kind, mutate(content))
+                result = self.install("v1.1.0", ok=False)
+                self.assertIn(f"object {oid} in the release-source cache does not hash to its id", result.stderr)
+                self.assert_unchanged(*self.before)
+                self.loose(oid).write_bytes(original)
+        self.install("v1.1.0")
+        self.assertEqual(self.current(), b)
+
+    def test_verified_listing_matches_ls_tree(self):
+        approved = rel.resolve_approved_tag(self.paths, "v1.1.0", None)
+        verified = rel.verify_objects(self.cache, "sha1", approved["commit"],
+                                      run_git(self.cache, "rev-parse", rel.FETCHED_MAIN),
+                                      run_git(self.cache, "rev-parse", rel.FETCHED_TAGS + "v1.1.0"))
+        entries = rel.tree_entries(self.cache, approved["commit"])
+        self.assertEqual(entries, {p: e for p, e in verified.items() if rel.allowed(p)})
+        with self.assertRaisesRegex(rel.ReleaseError, "not reachable from upstream main"):
+            rel.verify_objects(self.cache, "sha1", FIXTURE["c"], FIXTURE["b"], FIXTURE["c"])
+
+
+class Batch5Permissions(InstallCase):
+    def test_validation_precedes_tightening_of_a_chosen_cache(self):
+        project = self.tmp / "project"
+        run_git(self.tmp, "init", "-q", str(project))
+        git_dir = project / ".git"
+        git_dir.chmod(0o755)
+        result = self.install("v1.0.0", "--source-cache", str(git_dir), ok=False)
+        self.assertIn("unexpected configuration", result.stderr)
+        self.assertEqual(stat.S_IMODE(os.stat(git_dir).st_mode), 0o755)
+
+    def test_verify_checks_the_root_parent_and_names_the_fix(self):
+        self.install("v1.0.0")
+        parent = self.root.parent
+        parent.chmod(0o777)
+        self.addCleanup(parent.chmod, 0o755)
+        result = self.installer("verify", ok=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"install root parent {parent} is world-writable", result.stderr)
+        self.assertIn(f"chmod go-w '{parent}'", result.stderr)
+        parent.chmod(0o1777)
+        self.assertEqual(self.installer("verify").returncode, 0)
+        parent.chmod(0o755)
+        self.paths.releases.chmod(0o775)
+        result = self.installer("verify", ok=False)
+        self.assertIn(f"chmod go-w '{self.paths.releases}'", result.stderr)
+
+    def test_launcher_refuses_in_use_directories_of_another_account(self):
+        self.install("v1.0.0")
+        directory = self.paths.in_use / FIXTURE["a"]
+        directory.mkdir(parents=True, mode=0o700)
+        release = Path(os.path.realpath(self.paths.releases / FIXTURE["a"]))
+        for target in (self.paths.in_use, directory):
+            with self.subTest(target=target):
+                code = ("import importlib.machinery, importlib.util, os, sys\n"
+                        "real = os.lstat\n"
+                        "def fake(p, *a, **k):\n"
+                        "    r = real(p, *a, **k)\n"
+                        "    if os.path.abspath(p) == sys.argv[2]:\n"
+                        "        v = list(r[:10]); v[4] = 4242; return os.stat_result(v)\n"
+                        "    return r\n"
+                        "os.lstat = fake\n"
+                        "loader = importlib.machinery.SourceFileLoader('syndicate', sys.argv[1])\n"
+                        "spec = importlib.util.spec_from_loader('syndicate', loader)\n"
+                        "sy = importlib.util.module_from_spec(spec); loader.exec_module(sy)\n"
+                        "sy.mark_release_in_use()\n"
+                        "print(len(sy._release_markers))\n")
+                result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(release / "bin" / "syndicate"),
+                                         str(target)], cwd=self.tmp / "elsewhere", env=self.env,
+                                        capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("is owned by uid 4242, not by you", result.stderr)
+                self.assertEqual(result.stdout.strip(), "0")
+                self.assertEqual(list(directory.iterdir()), [])
+
+    def test_installer_docstring(self):
+        code = ("import importlib.machinery, importlib.util, sys\n"
+                "loader = importlib.machinery.SourceFileLoader('syndicate_install', sys.argv[1])\n"
+                "spec = importlib.util.spec_from_loader('syndicate_install', loader)\n"
+                "module = importlib.util.module_from_spec(spec); loader.exec_module(module)\n"
+                "print(module.__doc__)\n")
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(INSTALLER)], cwd=self.tmp / "elsewhere",
+                                env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith("syndicate-install: install, upgrade, roll back"), result.stdout)
+        self.assertIn("docs/user-install.md", result.stdout)
+        self.assertIn("vX.Y.Z", rel.__doc__ + result.stdout)

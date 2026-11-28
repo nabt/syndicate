@@ -696,7 +696,8 @@ def mark_release_in_use(pid: int | None = None) -> None:
         try:
             # Explicit modes, whatever the umask: in-use/ and its commit
             # directories 0700 (an existing one of this user's is tightened,
-            # a symlinked one refused), markers 0600 (the data root already exists).
+            # a symlinked one or another account's refused), markers 0600 (the data
+            # root already exists).
             for path in (in_use, directory):
                 try:
                     path.mkdir(mode=0o700)
@@ -705,7 +706,11 @@ def mark_release_in_use(pid: int | None = None) -> None:
                     st = os.lstat(path)
                     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
                         raise OSError(f"{path} is not a directory") from None
-                    if st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) & 0o077:
+                    # Another account's directory: it controls the markers
+                    # there (it could remove ours), so never write into it.
+                    if st.st_uid != os.getuid():
+                        raise OSError(f"{path} is owned by uid {st.st_uid}, not by you") from None
+                    if stat.S_IMODE(st.st_mode) & 0o077:
                         os.chmod(path, 0o700)
             fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
             with os.fdopen(fd, "wb") as handle:

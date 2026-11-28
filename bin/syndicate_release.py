@@ -171,8 +171,11 @@ def git_env() -> dict:
 # (refs/replace/*), the commit-graph and hooks are ignored, so what ls-tree and
 # archive read is exactly the object rev-parse names; nothing writes a commit
 # graph or runs automatic maintenance.
+# safe.directory= empties the list of trusted foreign-owned repositories (a
+# global safe.directory=* included); the cache is always this user's own.
 CACHE_GIT_OPTIONS = ("--no-replace-objects", "-c", "core.commitGraph=false", "-c", "core.hooksPath=/dev/null",
-                     "-c", "fetch.writeCommitGraph=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false")
+                     "-c", "fetch.writeCommitGraph=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+                     "-c", "safe.directory=")
 # The only configuration a cache may carry, each key at most once: what
 # `git init --bare --template=` and `git remote add` write. Anything else
 # (remote.upstream.uploadpack, proxy or vcs, url.*.insteadOf, core.sshCommand,
@@ -198,9 +201,10 @@ CACHE_REDIRECT_ENTRIES = ("commondir", "gitdir", ".git")
 DIGITS = re.compile(r"[0-9]+")
 
 
-def git(repo: Path, *args: str, binary: bool = False, check: bool = True, options: tuple = ()):
+def git(repo: Path, *args: str, binary: bool = False, check: bool = True, options: tuple = (),
+        timeout: float | None = None):
     result = subprocess.run(["git", *options, "-C", str(repo), *args], capture_output=True, env=git_env(),
-                            stdin=subprocess.DEVNULL)
+                            stdin=subprocess.DEVNULL, timeout=timeout)
     if check and result.returncode != 0:
         detail = result.stderr.decode(errors="replace").strip()
         name = next((a for a in args if not a.startswith("-") and "=" not in a), args[0])
@@ -216,13 +220,23 @@ def cache_git(cache: Path, *args: str, **kwargs):
     return git(cache, *args, options=CACHE_GIT_OPTIONS, **kwargs)
 
 
-def tighten(path: Path, mask: int) -> None:
-    """Remove permission bits outside mask from a directory this user owns; never add any."""
+def tighten(path: Path, mask: int) -> bool:
+    """Remove permission bits outside mask from a directory this user owns; never
+    add any. True when the mode changed."""
     st = os.lstat(path)
     if stat.S_ISLNK(st.st_mode):
         raise ReleaseError(f"{path} is a symlink; refusing to use it")
     if st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) & ~mask:
         os.chmod(path, stat.S_IMODE(st.st_mode) & mask)
+        return True
+    return False
+
+
+def fix_hint(path: str | os.PathLike, problem: str) -> str:
+    """How to fix a writable_by_others problem, as a sentence to append."""
+    if problem in ("world-writable", "group-writable"):
+        return f" (fix: chmod go-w {shlex.quote(str(path))})"
+    return " (fix: move it aside and recreate it as yourself, or use another location)"
 
 
 def check_cache(paths: Paths) -> dict[str, str]:
@@ -232,11 +246,32 @@ def check_cache(paths: Paths) -> dict[str, str]:
     directory, a symlink, replace refs, grafts, a shallow list, alternates,
     unexpected or repeated configuration). Returns its configuration."""
     cache = paths.cache
-    tighten(cache, 0o700)
-    for path in (cache.parent, cache):
-        problem = writable_by_others(path)
-        if problem:
-            raise ReleaseError(f"release-source cache directory {path} is {problem}; refusing to use it")
+    if cache.is_symlink() or not cache.is_dir():
+        raise ReleaseError(f"release-source cache {cache} is a symlink or not a directory; refusing to use it")
+    problem = writable_by_others(cache.parent)
+    if problem:
+        raise ReleaseError(f"release-source cache directory {cache.parent} is {problem}; refusing to use it"
+                           f"{fix_hint(cache.parent, problem)}")
+    problem = redirect_problem(str(cache.parent))
+    if problem:
+        raise ReleaseError(f"release-source cache {cache} could be replaced: {problem}; refusing to use it")
+    owner = os.lstat(cache).st_uid
+    if owner != os.getuid():
+        raise ReleaseError(f"release-source cache {cache} is owned by uid {owner}, not by you; refusing to use it")
+    # Validate before tightening, so a directory that is refused (a project's
+    # .git named by mistake) is never chmodded; validate again if tightening
+    # changed anything, as another account could write it until then.
+    config = _check_cache_contents(cache)
+    if tighten(cache, 0o700):
+        config = _check_cache_contents(cache)
+    problem = writable_by_others(cache)
+    if problem:
+        raise ReleaseError(f"release-source cache directory {cache} is {problem}; refusing to use it"
+                           f"{fix_hint(cache, problem)}")
+    return config
+
+
+def _check_cache_contents(cache: Path) -> dict[str, str]:
     remove = f"remove the cache ({cache}) and install again"
     uid = os.getuid()
     for entry in os.scandir(cache):
@@ -279,40 +314,113 @@ def check_cache(paths: Paths) -> dict[str, str]:
     return config
 
 
+UPSTREAM_SCHEMES = ("https", "ssh", "git", "file")
+# Git's `<transport>::<address>` syntax (ext::, fd::, a remote helper), as
+# transport_get() recognizes it: URL-scheme characters, then "::".
+TRANSPORT_SYNTAX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+.-]*::")
+SCHEME_URL = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
+# [user@]host:path with no '/' before the first ':', which Git reads as ssh.
+SCP_LIKE = re.compile(r"^(?:[^/:@]+@)?[^-/:@\[\]][^/:@\[\]]*:[^:]")
+# Restricts every fetch or ls-remote to the protocols an upstream may name, so
+# no configuration or URL spelling can reach ext::, fd:: or a remote helper.
+PROTOCOL_OPTIONS = ("-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+                    "-c", "protocol.ssh.allow=always", "-c", "protocol.file.allow=always",
+                    "-c", "protocol.git.allow=always")
+# Network git calls get stdin from /dev/null and this bound, so a stalled
+# transport fails instead of hanging the installer.
+GIT_NETWORK_TIMEOUT = 900
+
+
 def check_upstream_form(upstream: str) -> None:
-    """An upstream is an absolute path or a URL (scheme:// or scp-like host:path),
-    never something Git could read as an option or a remote name."""
-    if (not upstream or upstream.startswith("-") or any(c in upstream for c in "\n\r\0")
-            or not (upstream.startswith("/") or ":" in upstream)):
-        raise ReleaseError(f"invalid upstream {upstream!r}: use an absolute path or a URL")
+    """An upstream is an absolute path, a https://, ssh://, git:// or file:// URL,
+    or an scp-like [user@]host:path (no '/' before the first ':'); never a
+    relative path, a remote name, an option, or Git's <transport>::<address> syntax."""
+    invalid = f"invalid upstream {upstream!r}: use an absolute path, a {', '.join(s + '://' for s in UPSTREAM_SCHEMES)} " \
+              "URL, or [user@]host:path"
+    if not upstream or upstream.startswith("-") or any(c in upstream for c in "\n\r\0"):
+        raise ReleaseError(invalid)
+    if upstream.startswith("/"):
+        return
+    if TRANSPORT_SYNTAX.match(upstream):
+        raise ReleaseError(f"invalid upstream {upstream!r}: Git's <transport>::<address> syntax runs a transport "
+                           "helper or command and is never accepted")
+    scheme = SCHEME_URL.match(upstream)
+    if scheme:
+        if scheme.group(1) not in UPSTREAM_SCHEMES:
+            raise ReleaseError(invalid)
+        if scheme.group(1) == "file" and not file_url_path(upstream):
+            raise ReleaseError(f"invalid upstream {upstream!r}: a file:// upstream is file:// followed by an "
+                               "absolute path, without percent-encoding, a query or a fragment")
+        return
+    if "::" in upstream or not SCP_LIKE.match(upstream):
+        raise ReleaseError(invalid)
+
+
+def file_url_path(upstream: str) -> str | None:
+    """The absolute path of a plain file:///abs/path URL, else None."""
+    path = upstream[len("file://"):] if upstream.startswith("file://") else None
+    if not path or not path.startswith("/") or any(c in path for c in "%?#"):
+        return None
+    return path
 
 
 def local_upstream_path(upstream: str) -> str | None:
-    """The filesystem path of a local upstream (a path or file:// URL), else None."""
-    if upstream.startswith("file://"):
-        return upstream[len("file://"):] or None
-    if "://" not in upstream and os.path.exists(upstream):
+    """The filesystem path of a local upstream (an absolute path or a file:// URL),
+    whether or not it exists; None for a remote URL."""
+    if upstream.startswith("/"):
         return upstream
+    if upstream.startswith("file://"):
+        return file_url_path(upstream) or upstream[len("file://"):]
     return None
 
 
 def check_local_upstream(upstream: str) -> None:
-    """A local upstream must be a bare repository with no linked worktrees.
+    """A local upstream must be, at exactly the path named, an existing bare
+    repository with no linked worktrees.
 
-    A working repository (or one with linked worktrees) has a checked-out main
-    and tags that agents working in it can move, so it is not a trusted source."""
+    Git's upload-pack also tries <path>/.git, <path>.git/.git and <path>.git, so
+    a path that is not itself a bare repository could resolve to a checkout;
+    one that is but holds a .git would be read through it. A working repository
+    (or one with linked worktrees) has a checked-out main and tags that agents
+    working in it can move, so it is not a trusted source."""
     path = local_upstream_path(upstream)
     if path is None:
         return
-    bare = git(Path(path), "rev-parse", "--is-bare-repository", check=False)
-    if bare.returncode or bare.stdout.strip() != "true":
-        raise ReleaseError(f"local upstream {upstream} is not a bare repository; agents working in a checkout "
-                           "can move its main and tags. Use a bare mirror or the remote URL")
-    common = git(Path(path), "rev-parse", "--git-common-dir", check=False).stdout.strip()
+    not_bare = (f"local upstream {upstream} is not a bare repository; agents working in a checkout "
+                "can move its main and tags. Use a bare mirror or the remote URL")
+    if not os.path.isdir(path):
+        raise ReleaseError(f"local upstream {upstream} does not exist as a directory; name the bare repository "
+                           "itself (Git would otherwise try <path>.git or <path>/.git, which may be a checkout)")
+    if os.path.lexists(os.path.join(path, ".git")):
+        raise ReleaseError(not_bare)
+    # --git-dir: no repository discovery, so only the directory named is read.
+    bare = subprocess.run(["git", f"--git-dir={path}", "rev-parse", "--is-bare-repository",
+                           "--git-common-dir"], capture_output=True, text=True, env=git_env(),
+                          stdin=subprocess.DEVNULL, timeout=GIT_NETWORK_TIMEOUT)
+    lines = bare.stdout.splitlines()
+    if bare.returncode or not lines or lines[0].strip() != "true":
+        raise ReleaseError(not_bare)
+    common = lines[1].strip() if len(lines) > 1 else ""
     worktrees = Path(path, common or ".", "worktrees")
     if worktrees.is_dir() and any(worktrees.iterdir()):
         raise ReleaseError(f"local upstream {upstream} has linked worktrees ({worktrees}); "
                            "their branches and tags can move under agents' hands. Use a bare mirror without worktrees")
+
+
+def check_upstream_url(cache: Path, url: str) -> None:
+    """Refuse when Git configuration (url.<base>.insteadOf, or a configured
+    remote named like the URL) would make a fetch from url read somewhere else,
+    and so be recorded under the wrong upstream."""
+    try:
+        result = cache_git(cache, *PROTOCOL_OPTIONS, "ls-remote", "--get-url", "--", url, check=False,
+                           timeout=GIT_NETWORK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise ReleaseError(f"git ls-remote --get-url timed out for upstream {url}") from None
+    resolved = result.stdout.rstrip("\n")
+    if result.returncode or resolved != url:
+        raise ReleaseError(f"Git configuration rewrites upstream {url} to {resolved or result.stderr.strip()!r} "
+                           "(url.<base>.insteadOf or a remote of that name in your global or system Git "
+                           "configuration); remove the rewrite or name the rewritten URL as --upstream")
 
 
 def ensure_cache(paths: Paths, upstream: str | None, change_upstream: bool = False) -> tuple[str, str | None]:
@@ -341,6 +449,7 @@ def ensure_cache(paths: Paths, upstream: str | None, change_upstream: bool = Fal
     configured = check_cache(paths).get(f"remote.{REMOTE}.url")
     if upstream:
         check_local_upstream(upstream)
+        check_upstream_url(cache, upstream)
         if configured is None:
             cache_git(cache, "remote", "add", REMOTE, upstream)
         elif configured != upstream:
@@ -355,8 +464,13 @@ def ensure_cache(paths: Paths, upstream: str | None, change_upstream: bool = Fal
         return upstream, None
     if not configured:
         raise ReleaseError(f"release-source cache {cache} has no upstream; pass --upstream URL|PATH")
-    check_upstream_form(configured)
-    check_local_upstream(configured)
+    try:
+        check_upstream_form(configured)
+        check_local_upstream(configured)
+    except ReleaseError as error:
+        raise ReleaseError(f"the recorded trusted upstream is no longer acceptable: {error}. Name a valid one "
+                           "with --upstream ABSOLUTE-PATH|URL --change-upstream") from None
+    check_upstream_url(cache, configured)
     return configured, None
 
 
@@ -376,7 +490,7 @@ def resolve_approved_tag(paths: Paths, tag: str, upstream: str | None, change_up
     """
     check_tag_name(tag)
     with source_lock(paths):
-        return _resolve_approved_tag(paths, tag, upstream, change_upstream)
+        return _resolve_approved_tag(paths, tag, upstream, change_upstream)[0]
 
 
 def fetch_release_source(paths: Paths, tag: str, upstream: str | None, change_upstream: bool = False,
@@ -388,9 +502,14 @@ def fetch_release_source(paths: Paths, tag: str, upstream: str | None, change_up
     commit's objects unreachable, and so collectable, while it is read."""
     check_tag_name(tag)
     with source_lock(paths):
-        approved = _resolve_approved_tag(paths, tag, upstream, change_upstream)
+        approved, verified = _resolve_approved_tag(paths, tag, upstream, change_upstream)
         check_retag(paths, approved, allow_retag)
         entries = tree_entries(paths.cache, approved["commit"])
+        # ls-tree must list exactly the hash-verified tree; _extract then checks
+        # every archived file against these verified blob ids.
+        if entries != {path: entry for path, entry in verified.items() if allowed(path)}:
+            raise ReleaseError(f"the release-source cache's tree for {approved['commit']} changed after it was "
+                               f"verified; remove the cache ({paths.cache}) and install again")
         archive = build_archive(paths.cache, approved["commit"], entries)
     return approved, entries, archive
 
@@ -421,25 +540,37 @@ def source_lock(paths: Paths):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def _resolve_approved_tag(paths: Paths, tag: str, upstream: str | None, change_upstream: bool = False) -> dict:
+def fetch(cache: Path, url: str, refspec: str):
+    """Fetch one refspec from the trusted URL itself, never through the remote's
+    configuration, so no cache setting can redirect it; only the protocols in
+    PROTOCOL_OPTIONS, with no stdin and a time bound. --refmap= : only the
+    refspec named here is written."""
+    try:
+        return cache_git(cache, *PROTOCOL_OPTIONS, "-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--no-tags",
+                         "--refmap=", "--no-write-fetch-head", "--", url, refspec, check=False,
+                         timeout=GIT_NETWORK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise ReleaseError(f"fetching {refspec} from upstream {url} timed out after {GIT_NETWORK_TIMEOUT}s; "
+                           "nothing was installed") from None
+
+
+def _resolve_approved_tag(paths: Paths, tag: str, upstream: str | None,
+                          change_upstream: bool = False) -> tuple[dict, dict[str, tuple[str, str]]]:
+    """(approved, {path: (mode, blob id)} of the approved commit's hash-verified tree)."""
     url, previous_url = ensure_cache(paths, upstream, change_upstream)
     tag_ref = FETCHED_TAGS + tag
     # Forget previous fetch results first so a failed fetch can never fall back to stale refs.
     for ref in (FETCHED_MAIN, tag_ref):
         cache_git(paths.cache, "update-ref", "-d", ref, check=False)
-    # Fetch from the trusted URL itself, never through the remote's
-    # configuration, so no cache setting can redirect it. --refmap= : only the
-    # refspecs named here are written.
-    fetched = cache_git(paths.cache, "-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--no-tags", "--refmap=",
-                        "--no-write-fetch-head", "--", url, f"+refs/heads/{MAIN_BRANCH}:{FETCHED_MAIN}", check=False)
+    fetched = fetch(paths.cache, url, f"+refs/heads/{MAIN_BRANCH}:{FETCHED_MAIN}")
     if fetched.returncode:
         raise ReleaseError(f"cannot fetch {MAIN_BRANCH} from upstream {url}: {fetched.stderr.strip()}; "
                            "nothing was installed (a fresh fetch is required)")
-    fetched = cache_git(paths.cache, "-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--no-tags", "--refmap=",
-                        "--no-write-fetch-head", "--", url, f"+refs/tags/{tag}:{tag_ref}", check=False)
+    fetched = fetch(paths.cache, url, f"+refs/tags/{tag}:{tag_ref}")
     if fetched.returncode:
         raise ReleaseError(f"tag {tag} was not found at upstream {url}: {fetched.stderr.strip()}")
-    if check_cache(paths).get(f"remote.{REMOTE}.url") != url:
+    config = check_cache(paths)
+    if config.get(f"remote.{REMOTE}.url") != url:
         raise ReleaseError(f"the release-source cache's recorded upstream changed during the fetch from {url}; "
                            "nothing was installed")
     kind = cache_git(paths.cache, "cat-file", "-t", tag_ref).stdout.strip()
@@ -454,11 +585,139 @@ def _resolve_approved_tag(paths: Paths, tag: str, upstream: str | None, change_u
                            "only tags on upstream main are installable")
     if reachable.returncode:
         raise ReleaseError(f"cannot check that {commit} is on upstream {MAIN_BRANCH}: {reachable.stderr.strip()}")
+    # The fetch transfers nothing the cache already has, so objects already in
+    # it (loose files, packs, indexes) are only trusted once their content
+    # hashes to their ids: every commit on main, the tag and the approved tree.
+    verified = verify_objects(paths.cache, config.get("extensions.objectformat") or "sha1", commit,
+                              cache_git(paths.cache, "rev-parse", "--verify", FETCHED_MAIN).stdout.strip(),
+                              cache_git(paths.cache, "rev-parse", "--verify", tag_ref).stdout.strip())
     approved = {"tag": tag, "commit": commit, "upstream": url, "source_ref": f"refs/tags/{tag}",
                 "tag_kind": "annotated" if kind == "tag" else "lightweight", "upstream_main": main}
     if previous_url:
         approved["upstream_changed_from"] = previous_url
-    return approved
+    return approved, verified
+
+
+class ObjectReader:
+    """One `git cat-file --batch` over the cache, returning each object's type
+    and content only after re-hashing it against the id it was asked for."""
+
+    def __init__(self, cache: Path, algorithm: str):
+        if algorithm not in ("sha1", "sha256"):
+            raise ReleaseError(f"release-source cache {cache} uses object format {algorithm!r}; "
+                               "only sha1 and sha256 can be verified")
+        self.cache, self.algorithm = cache, algorithm
+        self.width = hashlib.new(algorithm).digest_size
+        self.process = subprocess.Popen(["git", *CACHE_GIT_OPTIONS, "-C", str(cache), "cat-file", "--batch"],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                        env=git_env())
+
+    def close(self) -> None:
+        self.process.stdin.close()
+        self.process.stdout.close()
+        self.process.wait()
+
+    def read(self, oid: str, expect: str | None = None) -> tuple[str, bytes]:
+        damaged = f"remove the cache ({self.cache}) and install again"
+        if not re.fullmatch(r"[0-9a-f]{%d}" % (self.width * 2), oid):
+            raise ReleaseError(f"release-source cache returned a malformed object id {oid!r}; {damaged}")
+        try:
+            self.process.stdin.write(oid.encode() + b"\n")
+            self.process.stdin.flush()
+            header = self.process.stdout.readline().decode(errors="replace").split()
+            if len(header) != 3 or header[0] != oid or not DIGITS.fullmatch(header[2]):
+                raise ReleaseError(f"object {oid} is missing from the release-source cache "
+                                   f"({' '.join(header) or 'no answer'}); {damaged}")
+            kind, size = header[1], int(header[2])
+            data = self.process.stdout.read(size)
+            trailer = self.process.stdout.read(1)
+        except OSError as error:
+            raise ReleaseError(f"cannot read object {oid} from the release-source cache: {error}") from None
+        if len(data) != size or trailer != b"\n":
+            raise ReleaseError(f"object {oid} could not be read completely from the release-source cache; {damaged}")
+        if hashlib.new(self.algorithm, b"%s %d\0" % (kind.encode(), size) + data).hexdigest() != oid:
+            raise ReleaseError(f"object {oid} in the release-source cache does not hash to its id: its content "
+                               f"was altered (a rewritten loose object, pack or index); {damaged}")
+        if expect and kind != expect:
+            raise ReleaseError(f"object {oid} in the release-source cache is a {kind}, not a {expect}; {damaged}")
+        return kind, data
+
+
+def object_headers(data: bytes, name: bytes) -> list[str]:
+    """The values of a commit's or tag's header lines called name."""
+    head = data.split(b"\n\n", 1)[0]
+    prefix = name + b" "
+    return [line[len(prefix):].decode("ascii", errors="replace") for line in head.split(b"\n")
+            if line.startswith(prefix)]
+
+
+def verify_objects(cache: Path, algorithm: str, commit: str, main_ref: str,
+                   tag_ref: str) -> dict[str, tuple[str, str]]:
+    """Hash-verify, reading each object exactly once, everything approval and
+    the release depend on: the tag ref's object chain down to commit, every
+    commit reachable from main's ref (so the parent links the ancestry check
+    walks are genuine, and commit is among them), and commit's tree with all its
+    subtrees and blobs. Return {path: (mode, blob id)} for the tree's files."""
+    reader = ObjectReader(cache, algorithm)
+    try:
+        def peel(oid: str) -> tuple[str, bytes]:
+            for _ in range(32):
+                kind, data = reader.read(oid)
+                if kind == "commit":
+                    return oid, data
+                if kind != "tag":
+                    break
+                targets = object_headers(data, b"object")
+                if len(targets) != 1:
+                    raise ReleaseError(f"tag object {oid} in the release-source cache is malformed")
+                oid = targets[0]
+            raise ReleaseError(f"{oid} in the release-source cache does not peel to a commit")
+
+        tagged, commit_data = peel(tag_ref)
+        if tagged != commit:
+            raise ReleaseError(f"the verified tag names {tagged}, but Git resolved it to {commit}; "
+                               f"remove the cache ({cache}) and install again")
+        head, _ = peel(main_ref)
+        seen, pending = set(), [head]
+        while pending:
+            oid = pending.pop()
+            if oid in seen:
+                continue
+            seen.add(oid)
+            _, data = reader.read(oid, "commit")
+            pending.extend(object_headers(data, b"parent"))
+        if commit not in seen:
+            raise ReleaseError(f"{commit} is not reachable from upstream {MAIN_BRANCH} through verified commits")
+        trees = object_headers(commit_data, b"tree")
+        if len(trees) != 1:
+            raise ReleaseError(f"commit {commit} in the release-source cache is malformed")
+        files: dict[str, tuple[str, str]] = {}
+        pending_trees = [("", trees[0])]
+        while pending_trees:
+            prefix, oid = pending_trees.pop()
+            _, data = reader.read(oid, "tree")
+            index = 0
+            while index < len(data):
+                space = data.index(b" ", index)
+                nul = data.index(b"\0", space)
+                mode = data[index:space].decode("ascii")
+                name = data[space + 1:nul].decode("utf-8", errors="surrogateescape")
+                child = data[nul + 1:nul + 1 + reader.width].hex()
+                if len(child) != reader.width * 2:
+                    raise ReleaseError(f"tree {oid} in the release-source cache is truncated")
+                index = nul + 1 + reader.width
+                path = prefix + name
+                if mode == "40000":
+                    pending_trees.append((path + "/", child))
+                elif mode != "160000":  # a submodule's commit is not in this repository
+                    reader.read(child, "blob")
+                    files[path] = (mode.zfill(6), child)
+        return files
+    except ValueError:
+        raise ReleaseError(f"a tree in the release-source cache is malformed; "
+                           f"remove the cache ({cache}) and install again") from None
+    finally:
+        reader.close()
 
 
 # --- artifact ------------------------------------------------------------
@@ -772,7 +1031,7 @@ def redirect_problem(path: str, lookups: list[str] | None = None) -> str | None:
             lookups.append(current)
         problem = writable_by_others(current)
         if problem and not sticky_protects(current, entry):
-            return f"{current} (which holds {entry}) is {problem}"
+            return f"{current} (which holds {entry}) is {problem}{fix_hint(current, problem)}"
         if os.path.islink(entry):
             links += 1
             if links > 40:
@@ -784,7 +1043,7 @@ def redirect_problem(path: str, lookups: list[str] | None = None) -> str | None:
             continue
         current = entry
     problem = writable_by_others(current)
-    return f"{current} is {problem}" if problem else None
+    return f"{current} is {problem}{fix_hint(current, problem)}" if problem else None
 
 
 def is_git_marker(path: Path) -> bool:
@@ -1002,7 +1261,8 @@ def prepare_cache_parent(paths: Paths) -> None:
         raise ReleaseError(f"release-source cache directory {parent} is not a directory")
     problem = writable_by_others(parent)
     if problem:
-        raise ReleaseError(f"release-source cache directory {parent} is {problem}; refusing to use it")
+        raise ReleaseError(f"release-source cache directory {parent} is {problem}; refusing to use it"
+                           f"{fix_hint(parent, problem)}")
 
 
 @contextmanager
@@ -1030,11 +1290,13 @@ def prepare_root(paths: Paths) -> None:
     except OSError as error:
         raise ReleaseError(f"cannot prepare install root {paths.root}: {error}") from None
     if problem and not sticky_protects(parent, paths.root):
-        raise ReleaseError(f"install root parent {parent} is {problem}; refusing to activate releases in {paths.root}")
+        raise ReleaseError(f"install root parent {parent} is {problem}; refusing to activate releases in {paths.root}"
+                           f"{fix_hint(parent, problem)}")
     for path in (paths.root, paths.releases, paths.interpreters):
         problem = writable_by_others(path)
         if problem:
-            raise ReleaseError(f"install root {path} is {problem}; refusing to activate releases there")
+            raise ReleaseError(f"install root {path} is {problem}; refusing to activate releases there"
+                               f"{fix_hint(path, problem)}")
 
 
 def check_bin_dir(paths: Paths) -> None:
@@ -1043,7 +1305,8 @@ def check_bin_dir(paths: Paths) -> None:
         problem = writable_by_others(paths.bin_dir)
         if problem:
             raise ReleaseError(f"entry point directory {paths.bin_dir} is {problem}; refusing to install the "
-                               "stable entry point there (pass --no-shim to skip it)")
+                               f"stable entry point there{fix_hint(paths.bin_dir, problem)} (or pass --no-shim to "
+                               "skip it)")
 
 
 @contextmanager
@@ -1811,13 +2074,20 @@ def _migrate_codex_hook(paths: Paths, codex_home: Path, target: str | None, dry_
 def install_root_problems(paths: Paths) -> list[str]:
     """Why another account could change what the install root activates or keeps."""
     problems = []
+    parent = paths.root.parent
+    if parent.is_dir():
+        # As in prepare_root: another account that can write the parent could
+        # replace the whole root, unless the parent is sticky and protects it.
+        problem = writable_by_others(parent)
+        if problem and not sticky_protects(parent, paths.root):
+            problems.append(f"install root parent {parent} is {problem}{fix_hint(parent, problem)}")
     for path in (paths.root, paths.releases, paths.interpreters, paths.in_use):
         if path != paths.root and path.is_symlink():
             problems.append(f"{path} is a symlink")
         elif path.is_dir():
             problem = writable_by_others(path)
             if problem:
-                problems.append(f"{path} is {problem}")
+                problems.append(f"{path} is {problem}{fix_hint(path, problem)}")
     return problems
 
 

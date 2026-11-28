@@ -28,6 +28,20 @@ Configuration and state stay where they are today: `~/.config/syndicate/`
   installer), because its contents can change after installation; name a
   stable interpreter with `--python`, or name the virtual environment's
   interpreter explicitly with `--python` to accept it.
+
+  Which interpreters pass the work-tree check: a python.org framework build
+  (`/Library/Frameworks/Python.framework/Versions/3.x/bin/python3`), a
+  uv-managed Python (`~/.local/share/uv/python/...`) and a distribution's
+  Python (`/usr/bin/python3`) all work. Homebrew on Apple Silicon is
+  refused: `/opt/homebrew` is itself a Git checkout (it has a `.git` with
+  `HEAD`), so every interpreter under it, including the
+  `/opt/homebrew/bin/python3` link and the Cellar it resolves into, is inside
+  a Git work tree. The same applies to pyenv (`~/.pyenv` is a Git clone) and
+  asdf (`~/.asdf`), and to any interpreter kept under a Git checkout.
+  Anything in a Git work tree can be changed by `git pull` or by an agent
+  working in that checkout after the interpreter was recorded, so this check
+  is not relaxed for them; install one of the interpreters above (for
+  example `uv python install 3.12`) and pass it with `--python`.
 - Git, used by the installer to fetch and archive releases.
 - A POSIX `sh`, used by the stable entry point.
 - Depending on which features you use: the `claude` and/or `codex` CLIs,
@@ -126,16 +140,34 @@ approved when all of these hold:
    the log records which kind it was.
 4. `git merge-base --is-ancestor <commit> <fetched upstream main>` succeeds.
    The commit must be on upstream `main` as fetched by this same invocation.
+5. Every object this depends on hashes to its id. A fetch transfers nothing
+   the cache already has, so before anything is archived the installer reads
+   the tag object, every commit reachable from fetched `main`, and the
+   approved commit's tree with all its subtrees and blobs through one `git
+   cat-file --batch`, re-hashes each (`sha1("<type> <size>\0" + content)`,
+   or sha256 for a sha256 repository), and refuses on any mismatch. It also
+   checks the approved commit among the verified ancestors of `main`, and
+   that `git ls-tree` lists exactly the verified tree. A rewritten loose
+   object, pack, pack index or multi-pack index therefore cannot substitute
+   content under a genuine id. This adds well under a second for this
+   repository.
 
 Fetches run with `fetch.fsckObjects=true`, so malformed objects are
 rejected, and with an empty `--refmap`, so only the two refs above are
 written. Fetches name the recorded upstream URL explicitly (`git fetch --
 <url> <refspec>`), never the configured remote, so no cache configuration
-can redirect them. Every Git command against the cache runs with
-`--no-replace-objects`, `core.commitGraph=false` and
-`core.hooksPath=/dev/null`, so what is archived is exactly the commit that
-was checked. The cache is created without templates, and before and after
-each fetch the installer refuses a cache that another account can write,
+can redirect them. They allow only the `https`, `ssh`, `git` and `file`
+protocols (`protocol.allow=never` plus an explicit allow for each), read
+stdin from `/dev/null`, and time out after 15 minutes. Before fetching, `git
+ls-remote --get-url` must return the upstream unchanged: a
+`url.<base>.insteadOf` rewrite, or a remote named like the URL, in your
+global or system Git configuration is refused rather than fetched from and
+recorded under the wrong name. Every Git command against the cache runs with
+`--no-replace-objects`, `core.commitGraph=false`,
+`core.hooksPath=/dev/null` and an empty `safe.directory` list, so what is
+archived is exactly the commit that was checked. The cache is created without templates, and before and after
+each fetch the installer refuses a cache that another account can write (or
+whose path another account could redirect),
 whose top-level entries are not all yours, that has a `commondir`, `gitdir`
 or `.git` entry (each would point Git at another directory's objects, refs
 and configuration) or a symlink anywhere inside it, that has
@@ -143,8 +175,10 @@ and configuration) or a symlink anywhere inside it, that has
 that carries any configuration beyond what `git init --bare` and `git remote
 add` write (for example `remote.upstream.uploadpack`, `proxy`, `vcs`,
 `url.*.insteadOf` or `include.path`) or sets any key more than once. The
-recorded upstream is compared with `--upstream` exactly. Remove such a cache
-and install again; it is rebuilt from the trusted upstream. The release is built with `git archive --literal-pathspecs` of that
+recorded upstream is compared with `--upstream` exactly. These checks run
+before an existing cache is tightened to 0700, so a directory that is
+refused (for example a project's `.git` passed as `--source-cache`) is never
+chmodded. Remove such a cache and install again; it is rebuilt from the trusted upstream. The release is built with `git archive --literal-pathspecs` of that
 commit from the cache, while the cache lock is still held, so a concurrent
 install cannot make the approved objects unreachable mid-build. Paths with
 an empty, `.`, `..` or `.git` component, and paths that are not UTF-8, are
@@ -157,8 +191,20 @@ The trusted upstream is set once with `--upstream URL|PATH` and remembered in
 the cache. For this project that is `https://github.com/nabt/syndicate.git`.
 To switch to a different upstream later, pass the new `--upstream` together
 with `--change-upstream`; the activation log records `upstream_changed_from`.
-A local upstream (a path or `file://` URL) must be a bare repository without
-linked worktrees: in a working checkout, agents can move `main` and the tags.
+An upstream is one of: an absolute path; a `https://`, `ssh://`, `git://` or
+`file:///absolute/path` URL; or an scp-like `[user@]host:path` with no `/`
+before the first `:`. A relative path to an existing directory is made
+absolute first. Anything else is refused, including other relative paths
+(Git would resolve them against the cache), remote names, and Git's
+`<transport>::<address>` syntax (`ext::`, `fd::` and remote helpers). A local
+upstream (an absolute path or `file://` URL, whether or not it exists) must
+be, at exactly the path named, an existing bare repository without linked
+worktrees and without a `.git` inside it. Git's upload-pack would otherwise
+also try `<path>/.git`, `<path>.git/.git` and `<path>.git`, which may be a
+checkout, where agents can move `main` and the tags. The same checks apply
+to the recorded upstream when `--upstream` is omitted; if it no longer
+passes, name a valid one with `--upstream ABSOLUTE-PATH|URL
+--change-upstream`.
 
 A tag name is expected to keep naming one commit. If an earlier activation
 recorded the tag at a different commit (the tag was moved upstream), the
@@ -267,10 +313,19 @@ syndicate-install list              # retained releases with current/previous/in
 syndicate-install verify [COMMIT]   # recheck a release (default: current) against RELEASE.json
 ```
 
-`verify` also fails when another account could write the install root,
-`releases/`, `interpreters/` or `in-use/` (or one of the last three is a
-symlink), even if the release itself matches its manifest. `prune` tightens
-`in-use/` and its commit directories to 0700.
+`verify` also fails, exiting 1, when another account could write the
+install root, its parent (unless the parent is sticky and protects the root,
+as `/tmp` does), `releases/`, `interpreters/` or `in-use/` (or one of the last
+three is a symlink), even if the release itself matches its manifest.
+`prune` tightens `in-use/` and its commit directories to 0700. A launcher
+refuses, with a warning, to write in-use markers into an `in-use/` or commit
+directory that another account owns.
+
+Every refusal for a group- or world-writable directory (install root, its
+parent, `releases/`, `interpreters/`, `in-use/`, the entry point directory,
+the release-source cache and its parent, the interpreter's path) names the
+fix, for example `chmod go-w /path/to/dir`. One owned by another account has
+to be moved aside and recreated as you, or a different location used.
 
 Add `--json` for machine-readable output. `syndicate --version` reports the
 running release, as seen from inside Syndicate.
